@@ -1,20 +1,21 @@
 //! Embedded official `yt-dlp-ejs` 0.8.0 challenge solver running in-process on `quickjs-jit`.
 //!
-//! Fetches and caches YouTube's official `tv-player-ias.js` bundle (`_DEFAULT_PLAYER_JS_VARIANT = 'tv'`),
-//! preprocesses it once via `yt.solver.lib.min.js` (`meriyah` + `astring`) and `yt.solver.core.min.js`
-//! (`jsc`), persists the preprocessed player to `<cache_dir>/yt-ejs-player.json` when available,
-//! and batch-solves `sig` (`signatureCipher`) and `n` throttle challenges with zero external runtimes.
+//! Supports all upstream `yt-dlp` `_PLAYER_JS_VARIANT_MAP` variants (`tv`, `main`, `es5`, `es6`,
+//! `tv_es6`, `tcc`, `tce`, `es6_tcc`, `es6_tce`, `phone`), defaulting to `"tv"` with automatic
+//! fallback (`tv` -> `tv_es6` -> `es5`) and `/embed/{video_id}` discovery fallback when
+//! `/iframe_api` fails. Caches preprocessed players in memory and on disk keyed by
+//! `(player_id, variant)`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use rquickjs::{CatchResultExt, CaughtError, Context, Function, Runtime};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::installer::atomic_write;
 
@@ -27,6 +28,7 @@ const IFRAME_API_URL: &str = "https://www.youtube.com/iframe_api";
 const PLAYER_FETCH_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
 const PLAYER_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 const PLAYER_CACHE_FILE: &str = "yt-ejs-player.json";
+pub const DEFAULT_PLAYER_JS_VARIANT: &str = "tv";
 
 const EJS_STACK_SIZE: usize = 16 * 1024 * 1024;
 const EJS_MEMORY_LIMIT: usize = 512 * 1024 * 1024;
@@ -34,13 +36,43 @@ const EJS_JS_STACK_SIZE: usize = 8 * 1024 * 1024;
 const EJS_COLD_DEADLINE_MS: u64 = 30_000;
 const EJS_WARM_DEADLINE_MS: u64 = 8_000;
 
-/// Fetched or cached YouTube `tv-player-ias.js` metadata and script payload.
+/// Full upstream `yt-dlp/yt-dlp/master` `_PLAYER_JS_VARIANT_MAP` (10 YouTube player variants).
+pub const PLAYER_JS_VARIANT_MAP: &[(&str, &str)] = &[
+    ("tv", "tv-player-ias.vflset/tv-player-ias.js"),
+    ("main", "player_ias.vflset/en_US/base.js"),
+    ("es5", "player_es5.vflset/en_US/base.js"),
+    ("es6", "player_es6.vflset/en_US/base.js"),
+    ("tv_es6", "tv-player-es6.vflset/tv-player-es6.js"),
+    ("tcc", "player_ias_tcc.vflset/en_US/base.js"),
+    ("tce", "player_ias_tce.vflset/en_US/base.js"),
+    ("es6_tcc", "player_es6_tcc.vflset/en_US/base.js"),
+    ("es6_tce", "player_es6_tce.vflset/en_US/base.js"),
+    ("phone", "player-plasma-ias-phone-en_US.vflset/base.js"),
+];
+
+/// Resolves an upstream `player_js_variant` name into its relative YouTube `/s/player/<id>/` path.
+pub fn player_js_variant_path(variant: &str) -> Option<&'static str> {
+    let norm = variant.trim().to_ascii_lowercase();
+    PLAYER_JS_VARIANT_MAP
+        .iter()
+        .find(|(k, _)| *k == norm)
+        .map(|(_, path)| *path)
+}
+
+/// Fetched or cached YouTube player JS metadata and script payload.
 #[derive(Debug, Clone)]
 pub struct TvPlayerBundle {
     pub player_id: String,
+    pub variant: String,
     pub sts: u32,
     pub raw_player: Option<String>,
     pub preprocessed_player: Option<String>,
+}
+
+impl TvPlayerBundle {
+    pub fn cache_key(&self) -> String {
+        format!("{}:{}", self.player_id, self.variant)
+    }
 }
 
 /// Solved `sig` and `n` challenge mappings returned by [`solve_challenges`].
@@ -52,28 +84,41 @@ pub struct EjsSolveResult {
     pub elapsed_ms: u64,
 }
 
+fn default_variant_string() -> String {
+    DEFAULT_PLAYER_JS_VARIANT.to_owned()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DiskPlayerCache {
     player_id: String,
+    #[serde(default = "default_variant_string")]
+    variant: String,
     sts: u32,
     preprocessed_player: String,
 }
 
 #[derive(Debug, Clone)]
-struct MemPlayerCache {
+struct MemPlayerEntry {
     player_id: String,
+    variant: String,
     sts: u32,
     raw_player: Option<String>,
     preprocessed_player: Option<String>,
     fetched_at: Instant,
 }
 
-fn player_mem_cache() -> &'static Mutex<Option<MemPlayerCache>> {
-    static CACHE: OnceLock<Mutex<Option<MemPlayerCache>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(None))
+#[derive(Default)]
+struct MemCacheState {
+    latest_player_id: Option<(String, Instant)>,
+    bundles: HashMap<(String, String), MemPlayerEntry>,
 }
 
-/// Extracts the YouTube player hash ID (typically 8 hex chars) from `/iframe_api` JS.
+fn player_mem_cache() -> &'static Mutex<MemCacheState> {
+    static CACHE: OnceLock<Mutex<MemCacheState>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(MemCacheState::default()))
+}
+
+/// Extracts the YouTube player hash ID (typically 8 hex chars) from `/iframe_api` or `/embed/` HTML/JS.
 /// Matches both `/s/player/<hex>/` and escaped `player\/<hex>\/`.
 pub fn extract_player_id_from_iframe_api(js: &str) -> Option<String> {
     for needle in ["/s/player/", r"player\/"] {
@@ -93,7 +138,7 @@ pub fn extract_player_id_from_iframe_api(js: &str) -> Option<String> {
     None
 }
 
-/// Extracts `signatureTimestamp` (`sts`) from `tv-player-ias.js` (`signatureTimestamp[:=](\d+)`).
+/// Extracts `signatureTimestamp` (`sts`) from player JS (`signatureTimestamp[:=](\d+)`).
 pub fn extract_sts_from_player_js(js: &str) -> Option<u32> {
     let needle = "signatureTimestamp";
     let mut search = js;
@@ -123,19 +168,33 @@ fn disk_cache_path(cache_dir: &Path) -> PathBuf {
     cache_dir.join(PLAYER_CACHE_FILE)
 }
 
-fn load_disk_cache(cache_dir: &Path, expected_player_id: &str) -> Option<DiskPlayerCache> {
+fn load_disk_cache(
+    cache_dir: &Path,
+    expected_player_id: &str,
+    expected_variant: &str,
+) -> Option<DiskPlayerCache> {
     let raw = std::fs::read_to_string(disk_cache_path(cache_dir)).ok()?;
     let parsed: DiskPlayerCache = serde_json::from_str(&raw).ok()?;
-    if parsed.player_id == expected_player_id && !parsed.preprocessed_player.is_empty() {
+    if parsed.player_id == expected_player_id
+        && parsed.variant == expected_variant
+        && !parsed.preprocessed_player.is_empty()
+    {
         Some(parsed)
     } else {
         None
     }
 }
 
-fn save_disk_cache(cache_dir: &Path, player_id: &str, sts: u32, preprocessed_player: &str) {
+fn save_disk_cache(
+    cache_dir: &Path,
+    player_id: &str,
+    variant: &str,
+    sts: u32,
+    preprocessed_player: &str,
+) {
     let payload = DiskPlayerCache {
         player_id: player_id.to_owned(),
+        variant: variant.to_owned(),
         sts,
         preprocessed_player: preprocessed_player.to_owned(),
     };
@@ -152,48 +211,43 @@ fn save_disk_cache(cache_dir: &Path, player_id: &str, sts: u32, preprocessed_pla
 
 fn update_cached_preprocessed(
     player_id: &str,
+    variant: &str,
     sts: u32,
     preprocessed: &str,
     cache_dir: Option<&Path>,
 ) {
     if let Ok(mut guard) = player_mem_cache().lock() {
-        *guard = Some(MemPlayerCache {
-            player_id: player_id.to_owned(),
-            sts,
-            raw_player: None,
-            preprocessed_player: Some(preprocessed.to_owned()),
-            fetched_at: Instant::now(),
-        });
+        guard.bundles.insert(
+            (player_id.to_owned(), variant.to_owned()),
+            MemPlayerEntry {
+                player_id: player_id.to_owned(),
+                variant: variant.to_owned(),
+                sts,
+                raw_player: None,
+                preprocessed_player: Some(preprocessed.to_owned()),
+                fetched_at: Instant::now(),
+            },
+        );
     }
     if let Some(dir) = cache_dir {
-        save_disk_cache(dir, player_id, sts, preprocessed);
+        save_disk_cache(dir, player_id, variant, sts, preprocessed);
     }
 }
 
-/// Fetches or reuses a cached YouTube `tv-player-ias.js` bundle (`player_id`, `sts`, and
-/// either `preprocessed_player` or `raw_player`).
-pub async fn fetch_or_cached_tv_player(
+async fn discover_player_id(
     client: &reqwest::Client,
-    cache_dir: Option<&Path>,
+    video_id: Option<&str>,
     timeout: Duration,
-) -> Result<TvPlayerBundle, String> {
-    // 1. Fast path: in-memory cache within 30-min TTL.
+) -> Result<String, String> {
     if let Ok(guard) = player_mem_cache().lock()
-        && let Some(ref cached) = *guard
-        && cached.fetched_at.elapsed() < PLAYER_CACHE_TTL
-        && (cached.preprocessed_player.is_some() || cached.raw_player.is_some())
+        && let Some((ref pid, at)) = guard.latest_player_id
+        && at.elapsed() < PLAYER_CACHE_TTL
     {
-        return Ok(TvPlayerBundle {
-            player_id: cached.player_id.clone(),
-            sts: cached.sts,
-            raw_player: cached.raw_player.clone(),
-            preprocessed_player: cached.preprocessed_player.clone(),
-        });
+        return Ok(pid.clone());
     }
 
-    // 2. Discover current `player_id` from `/iframe_api`.
     let api_timeout = timeout.min(Duration::from_secs(8));
-    let iframe_resp = tokio::time::timeout(
+    let primary_err = match tokio::time::timeout(
         api_timeout,
         client
             .get(IFRAME_API_URL)
@@ -202,118 +256,250 @@ pub async fn fetch_or_cached_tv_player(
             .send(),
     )
     .await
-    .map_err(|_| "iframe_api request timed out".to_owned())?
-    .map_err(|e| format!("iframe_api request failed: {e}"))?;
+    {
+        Ok(Ok(resp)) if resp.status().is_success() => {
+            if let Ok(Ok(iframe_js)) = tokio::time::timeout(api_timeout, resp.text()).await
+                && let Some(pid) = extract_player_id_from_iframe_api(&iframe_js)
+            {
+                if let Ok(mut guard) = player_mem_cache().lock() {
+                    guard.latest_player_id = Some((pid.clone(), Instant::now()));
+                }
+                return Ok(pid);
+            }
+            "could not extract player_id from youtube iframe_api".to_owned()
+        }
+        Ok(Ok(resp)) => format!("iframe_api HTTP {}", resp.status()),
+        Ok(Err(e)) => format!("iframe_api request failed: {e}"),
+        Err(_) => "iframe_api request timed out".to_owned(),
+    };
 
-    if !iframe_resp.status().is_success() {
-        return Err(format!("iframe_api HTTP {}", iframe_resp.status()));
-    }
-    let iframe_js = tokio::time::timeout(api_timeout, iframe_resp.text())
+    // Fallback: discover player_id from `https://www.youtube.com/embed/{video_id}`.
+    if let Some(vid) = video_id.filter(|v| !v.is_empty()) {
+        let embed_url = format!("https://www.youtube.com/embed/{vid}");
+        log::warn!(
+            target: "nsh_music_plugin",
+            "yt-ejs iframe_api failed ({primary_err}); trying embed fallback for video={vid}"
+        );
+        if let Ok(Ok(resp)) = tokio::time::timeout(
+            api_timeout,
+            client
+                .get(&embed_url)
+                .header("user-agent", PLAYER_FETCH_UA)
+                .timeout(api_timeout)
+                .send(),
+        )
         .await
-        .map_err(|_| "iframe_api body timed out".to_owned())?
-        .map_err(|e| format!("iframe_api read failed: {e}"))?;
-
-    let player_id = extract_player_id_from_iframe_api(&iframe_js)
-        .ok_or_else(|| "could not extract player_id from youtube iframe_api".to_owned())?;
-
-    // 3. Re-check memory cache by `player_id` (refresh TTL if unchanged).
-    if let Ok(mut guard) = player_mem_cache().lock()
-        && let Some(ref mut cached) = *guard
-        && cached.player_id == player_id
-        && (cached.preprocessed_player.is_some() || cached.raw_player.is_some())
-    {
-        cached.fetched_at = Instant::now();
-        return Ok(TvPlayerBundle {
-            player_id: cached.player_id.clone(),
-            sts: cached.sts,
-            raw_player: cached.raw_player.clone(),
-            preprocessed_player: cached.preprocessed_player.clone(),
-        });
+            && resp.status().is_success()
+            && let Ok(Ok(html)) = tokio::time::timeout(api_timeout, resp.text()).await
+            && let Some(pid) = extract_player_id_from_iframe_api(&html)
+        {
+            if let Ok(mut guard) = player_mem_cache().lock() {
+                guard.latest_player_id = Some((pid.clone(), Instant::now()));
+            }
+            return Ok(pid);
+        }
     }
 
-    // 4. Check disk cache (`<cache_dir>/yt-ejs-player.json`) for matching `player_id`.
-    if let Some(dir) = cache_dir
-        && let Some(disk) = load_disk_cache(dir, &player_id)
+    Err(primary_err)
+}
+
+/// Fetches or reuses the default `"tv"` YouTube player bundle (`tv-player-ias.js`).
+#[allow(dead_code)]
+pub async fn fetch_or_cached_tv_player(
+    client: &reqwest::Client,
+    cache_dir: Option<&Path>,
+    timeout: Duration,
+) -> Result<TvPlayerBundle, String> {
+    fetch_or_cached_tv_player_with_options(client, cache_dir, timeout, None, None, None).await
+}
+
+/// Fetches or reuses a cached YouTube player JS bundle with optional `variant` override
+/// (any key in [`PLAYER_JS_VARIANT_MAP`]), `version_override` (`player_id`), and `video_id`
+/// for `/embed/{video_id}` fallback discovery. Automatically falls back `tv` -> `tv_es6` -> `es5`
+/// when downloading or extracting `sts` from `tv` fails.
+pub async fn fetch_or_cached_tv_player_with_options(
+    client: &reqwest::Client,
+    cache_dir: Option<&Path>,
+    timeout: Duration,
+    variant: Option<&str>,
+    version_override: Option<&str>,
+    video_id: Option<&str>,
+) -> Result<TvPlayerBundle, String> {
+    let requested_variant = variant
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty());
+
+    let variant_chain: Vec<&'static str> = match requested_variant.as_deref() {
+        Some(v) if v != DEFAULT_PLAYER_JS_VARIANT => {
+            if let Some((canonical, _)) = PLAYER_JS_VARIANT_MAP.iter().find(|(k, _)| *k == v) {
+                vec![canonical]
+            } else {
+                vec!["tv", "tv_es6", "es5"]
+            }
+        }
+        _ => vec!["tv", "tv_es6", "es5"],
+    };
+
+    let player_id = if let Some(ov) = version_override
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
     {
+        ov.to_owned()
+    } else {
+        discover_player_id(client, video_id, timeout).await?
+    };
+
+    // 1. Check in-memory cache keyed by `(player_id, variant)`.
+    if let Ok(mut guard) = player_mem_cache().lock() {
+        for &var in &variant_chain {
+            let key = (player_id.clone(), var.to_owned());
+            if let Some(entry) = guard.bundles.get_mut(&key)
+                && (entry.preprocessed_player.is_some() || entry.raw_player.is_some())
+            {
+                entry.fetched_at = Instant::now();
+                return Ok(TvPlayerBundle {
+                    player_id: entry.player_id.clone(),
+                    variant: entry.variant.clone(),
+                    sts: entry.sts,
+                    raw_player: entry.raw_player.clone(),
+                    preprocessed_player: entry.preprocessed_player.clone(),
+                });
+            }
+        }
+    }
+
+    // 2. Check disk cache (`<cache_dir>/yt-ejs-player.json`) keyed by `(player_id, variant)`.
+    if let Some(dir) = cache_dir {
+        for &var in &variant_chain {
+            if let Some(disk) = load_disk_cache(dir, &player_id, var) {
+                log::info!(
+                    target: "nsh_music_plugin",
+                    "yt-ejs loaded preprocessed player from disk cache player_id={} variant={} sts={} bytes={}",
+                    disk.player_id,
+                    disk.variant,
+                    disk.sts,
+                    disk.preprocessed_player.len()
+                );
+                if let Ok(mut guard) = player_mem_cache().lock() {
+                    guard.bundles.insert(
+                        (disk.player_id.clone(), disk.variant.clone()),
+                        MemPlayerEntry {
+                            player_id: disk.player_id.clone(),
+                            variant: disk.variant.clone(),
+                            sts: disk.sts,
+                            raw_player: None,
+                            preprocessed_player: Some(disk.preprocessed_player.clone()),
+                            fetched_at: Instant::now(),
+                        },
+                    );
+                }
+                return Ok(TvPlayerBundle {
+                    player_id: disk.player_id,
+                    variant: disk.variant,
+                    sts: disk.sts,
+                    raw_player: None,
+                    preprocessed_player: Some(disk.preprocessed_player),
+                });
+            }
+        }
+    }
+
+    // 3. Download player JS following `variant_chain` (`tv` -> `tv_es6` -> `es5`, or explicit variant).
+    let fetch_timeout = timeout.min(Duration::from_secs(15));
+    let mut last_err = String::new();
+    for &var in &variant_chain {
+        let Some(rel_path) = player_js_variant_path(var) else {
+            continue;
+        };
+        let player_url = format!("https://www.youtube.com/s/player/{player_id}/{rel_path}");
+        let dl_start = Instant::now();
+        let resp = match tokio::time::timeout(
+            fetch_timeout,
+            client
+                .get(&player_url)
+                .header("user-agent", PLAYER_FETCH_UA)
+                .timeout(fetch_timeout)
+                .send(),
+        )
+        .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                last_err = format!("player {var} request failed: {e}");
+                log::warn!(target: "nsh_music_plugin", "yt-ejs {last_err}");
+                continue;
+            }
+            Err(_) => {
+                last_err = format!("player {var} request timed out");
+                log::warn!(target: "nsh_music_plugin", "yt-ejs {last_err}");
+                continue;
+            }
+        };
+
+        if !resp.status().is_success() {
+            last_err = format!("player {var} HTTP {}", resp.status());
+            log::warn!(target: "nsh_music_plugin", "yt-ejs {last_err}");
+            continue;
+        }
+        let raw_player = match tokio::time::timeout(fetch_timeout, resp.text()).await {
+            Ok(Ok(t)) => t,
+            Ok(Err(e)) => {
+                last_err = format!("player {var} read failed: {e}");
+                log::warn!(target: "nsh_music_plugin", "yt-ejs {last_err}");
+                continue;
+            }
+            Err(_) => {
+                last_err = format!("player {var} body timed out");
+                log::warn!(target: "nsh_music_plugin", "yt-ejs {last_err}");
+                continue;
+            }
+        };
+
+        let Some(sts) = extract_sts_from_player_js(&raw_player) else {
+            last_err = format!("could not extract signatureTimestamp from player {player_id} ({var})");
+            log::warn!(target: "nsh_music_plugin", "yt-ejs {last_err}");
+            continue;
+        };
+
         log::info!(
             target: "nsh_music_plugin",
-            "yt-ejs loaded preprocessed player from disk cache player_id={} sts={} bytes={}",
-            disk.player_id,
-            disk.sts,
-            disk.preprocessed_player.len()
+            "yt-ejs fetched player_id={player_id} variant={var} sts={sts} bytes={} in {}ms",
+            raw_player.len(),
+            dl_start.elapsed().as_millis()
         );
+
         if let Ok(mut guard) = player_mem_cache().lock() {
-            *guard = Some(MemPlayerCache {
-                player_id: disk.player_id.clone(),
-                sts: disk.sts,
-                raw_player: None,
-                preprocessed_player: Some(disk.preprocessed_player.clone()),
-                fetched_at: Instant::now(),
-            });
+            guard.bundles.insert(
+                (player_id.clone(), var.to_owned()),
+                MemPlayerEntry {
+                    player_id: player_id.clone(),
+                    variant: var.to_owned(),
+                    sts,
+                    raw_player: Some(raw_player.clone()),
+                    preprocessed_player: None,
+                    fetched_at: Instant::now(),
+                },
+            );
         }
+
         return Ok(TvPlayerBundle {
-            player_id: disk.player_id,
-            sts: disk.sts,
-            raw_player: None,
-            preprocessed_player: Some(disk.preprocessed_player),
-        });
-    }
-
-    // 5. Download `tv-player-ias.js` (official yt-dlp `_DEFAULT_PLAYER_JS_VARIANT = 'tv'`).
-    let player_url =
-        format!("https://www.youtube.com/s/player/{player_id}/tv-player-ias.vflset/tv-player-ias.js");
-    let fetch_timeout = timeout.min(Duration::from_secs(15));
-    let dl_start = Instant::now();
-    let player_resp = tokio::time::timeout(
-        fetch_timeout,
-        client
-            .get(&player_url)
-            .header("user-agent", PLAYER_FETCH_UA)
-            .timeout(fetch_timeout)
-            .send(),
-    )
-    .await
-    .map_err(|_| "tv-player-ias.js request timed out".to_owned())?
-    .map_err(|e| format!("tv-player-ias.js request failed: {e}"))?;
-
-    if !player_resp.status().is_success() {
-        return Err(format!("tv-player-ias.js HTTP {}", player_resp.status()));
-    }
-    let raw_player = tokio::time::timeout(fetch_timeout, player_resp.text())
-        .await
-        .map_err(|_| "tv-player-ias.js body timed out".to_owned())?
-        .map_err(|e| format!("tv-player-ias.js read failed: {e}"))?;
-
-    let sts = extract_sts_from_player_js(&raw_player)
-        .ok_or_else(|| format!("could not extract signatureTimestamp from player {player_id}"))?;
-
-    log::info!(
-        target: "nsh_music_plugin",
-        "yt-ejs fetched tv-player-ias.js player_id={player_id} sts={sts} bytes={} in {}ms",
-        raw_player.len(),
-        dl_start.elapsed().as_millis()
-    );
-
-    if let Ok(mut guard) = player_mem_cache().lock() {
-        *guard = Some(MemPlayerCache {
-            player_id: player_id.clone(),
+            player_id,
+            variant: var.to_owned(),
             sts,
-            raw_player: Some(raw_player.clone()),
+            raw_player: Some(raw_player),
             preprocessed_player: None,
-            fetched_at: Instant::now(),
         });
     }
 
-    Ok(TvPlayerBundle {
-        player_id,
-        sts,
-        raw_player: Some(raw_player),
-        preprocessed_player: None,
+    Err(if last_err.is_empty() {
+        format!("failed to download player JS for {player_id}")
+    } else {
+        last_err
     })
 }
 
 struct EjsJob {
-    player_id: String,
+    cache_key: String,
     raw_player: Option<String>,
     preprocessed_player: Option<String>,
     requests_json: String,
@@ -394,12 +580,12 @@ fn format_qjs_caught(err: CaughtError<'_>) -> String {
 
 const EJS_BRIDGE_JS: &str = r#"
 globalThis.__yt_ejs_cache = { id: null, code: null };
-globalThis.__yt_ejs_solve = function(playerId, rawPlayer, preprocPlayer, requestsJson) {
-    if (preprocPlayer && globalThis.__yt_ejs_cache.id !== playerId) {
-        globalThis.__yt_ejs_cache = { id: playerId, code: preprocPlayer };
+globalThis.__yt_ejs_solve = function(cacheKey, rawPlayer, preprocPlayer, requestsJson) {
+    if (preprocPlayer && globalThis.__yt_ejs_cache.id !== cacheKey) {
+        globalThis.__yt_ejs_cache = { id: cacheKey, code: preprocPlayer };
     }
     const requests = JSON.parse(requestsJson);
-    if (globalThis.__yt_ejs_cache.id === playerId && globalThis.__yt_ejs_cache.code) {
+    if (globalThis.__yt_ejs_cache.id === cacheKey && globalThis.__yt_ejs_cache.code) {
         const res = jsc({
             type: "preprocessed",
             preprocessed_player: globalThis.__yt_ejs_cache.code,
@@ -408,7 +594,7 @@ globalThis.__yt_ejs_solve = function(playerId, rawPlayer, preprocPlayer, request
         return JSON.stringify({ cold: false, res });
     }
     if (!rawPlayer) {
-        throw new Error("missing raw player script for " + playerId);
+        throw new Error("missing raw player script for " + cacheKey);
     }
     const res = jsc({
         type: "player",
@@ -418,7 +604,7 @@ globalThis.__yt_ejs_solve = function(playerId, rawPlayer, preprocPlayer, request
     });
     let outPreproc = null;
     if (res && typeof res.preprocessed_player === "string" && res.preprocessed_player.length > 0) {
-        globalThis.__yt_ejs_cache = { id: playerId, code: res.preprocessed_player };
+        globalThis.__yt_ejs_cache = { id: cacheKey, code: res.preprocessed_player };
         outPreproc = res.preprocessed_player;
     }
     return JSON.stringify({
@@ -500,7 +686,7 @@ fn run_ejs_worker(rx: mpsc::Receiver<EjsJob>, boot_tx: mpsc::SyncSender<Result<(
                 .map_err(|e| format!("missing __yt_ejs_solve: {}", format_qjs_caught(e)))?;
             let out: String = solve_fn
                 .call((
-                    job.player_id.as_str(),
+                    job.cache_key.as_str(),
                     job.raw_player.as_deref(),
                     job.preprocessed_player.as_deref(),
                     job.requests_json.as_str(),
@@ -586,7 +772,7 @@ pub fn solve_challenges(
     let worker = global_ejs_worker()?;
     let (dummy_tx, _) = mpsc::sync_channel(1);
     let out = worker.execute(EjsJob {
-        player_id: bundle.player_id.clone(),
+        cache_key: bundle.cache_key(),
         raw_player: bundle.raw_player.clone(),
         preprocessed_player: bundle.preprocessed_player.clone(),
         requests_json,
@@ -595,7 +781,13 @@ pub fn solve_challenges(
     })?;
 
     if let Some(ref preproc) = out.preprocessed_player {
-        update_cached_preprocessed(&bundle.player_id, bundle.sts, preproc, cache_dir);
+        update_cached_preprocessed(
+            &bundle.player_id,
+            &bundle.variant,
+            bundle.sts,
+            preproc,
+            cache_dir,
+        );
     }
 
     let mut result = EjsSolveResult {
@@ -622,8 +814,9 @@ pub fn solve_challenges(
 
     log::info!(
         target: "nsh_music_plugin",
-        "yt-ejs solve player_id={} mode={} sigs={} ns={} elapsed={}ms",
+        "yt-ejs solve player_id={} variant={} mode={} sigs={} ns={} elapsed={}ms",
         bundle.player_id,
+        bundle.variant,
         if result.cold { "cold" } else { "warm" },
         result.sigs.len(),
         result.ns.len(),
@@ -666,8 +859,42 @@ mod tests {
         assert!(!YT_EJS_LIB_JS.is_empty());
         assert!(!YT_EJS_CORE_JS.is_empty());
 
+        // Verify all 10 upstream player JS variants exist.
+        for key in [
+            "tv", "main", "es5", "es6", "tv_es6", "tcc", "tce", "es6_tcc", "es6_tce", "phone",
+        ] {
+            assert!(
+                player_js_variant_path(key).is_some(),
+                "missing variant `{key}`"
+            );
+        }
+        assert_eq!(
+            player_js_variant_path("tv"),
+            Some("tv-player-ias.vflset/tv-player-ias.js")
+        );
+        assert_eq!(
+            player_js_variant_path("tv_es6"),
+            Some("tv-player-es6.vflset/tv-player-es6.js")
+        );
+        assert_eq!(
+            player_js_variant_path("phone"),
+            Some("player-plasma-ias-phone-en_US.vflset/base.js")
+        );
+
+        // Verify disk cache separates variants for the same player_id cleanly.
+        let cache_dir = std::env::temp_dir().join(format!(
+            "nsh-yt-ejs-variant-cache-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        save_disk_cache(&cache_dir, "deadbeef", "tv_es6", 20779, "/* preproc */");
+        assert!(load_disk_cache(&cache_dir, "deadbeef", "tv_es6").is_some());
+        assert!(load_disk_cache(&cache_dir, "deadbeef", "tv").is_none());
+        let _ = std::fs::remove_dir_all(&cache_dir);
+
         // Verify worker boots cleanly with embedded yt-dlp-ejs 0.8.0 lib + core.
-        let _worker = global_ejs_worker().expect("embedded yt-dlp-ejs 0.8.0 should boot in QuickJS");
+        let _worker =
+            global_ejs_worker().expect("embedded yt-dlp-ejs 0.8.0 should boot in QuickJS");
 
         // Verify `extract_player_id_from_iframe_api` handles both unescaped and escaped JS strings.
         assert_eq!(
@@ -699,6 +926,7 @@ mod tests {
         // Verify synthetic preprocessed player solves both `sig` and `n` through `jsc(...)`.
         let fake_bundle = TvPlayerBundle {
             player_id: "unit-test-preproc-001".to_owned(),
+            variant: "tv".to_owned(),
             sts: 20185,
             raw_player: None,
             preprocessed_player: Some(
@@ -735,10 +963,8 @@ mod tests {
             .build()
             .unwrap();
         let client = reqwest::Client::new();
-        let cache_dir = std::env::temp_dir().join(format!(
-            "nsh-yt-ejs-bench-{}",
-            std::process::id()
-        ));
+        let cache_dir =
+            std::env::temp_dir().join(format!("nsh-yt-ejs-bench-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&cache_dir);
 
         let bundle = rt
@@ -749,8 +975,9 @@ mod tests {
             ))
             .expect("fetch tv-player-ias.js");
         println!(
-            "FETCHED player_id={} sts={} raw_len={:?}",
+            "FETCHED player_id={} variant={} sts={} raw_len={:?}",
             bundle.player_id,
+            bundle.variant,
             bundle.sts,
             bundle.raw_player.as_ref().map(String::len)
         );
@@ -767,7 +994,6 @@ mod tests {
             cold.cold, cold.elapsed_ms, cold.sigs, cold.ns
         );
 
-        // Fetch cached bundle (now has preprocessed_player) and run warm solve.
         let cached_bundle = rt
             .block_on(fetch_or_cached_tv_player(
                 &client,

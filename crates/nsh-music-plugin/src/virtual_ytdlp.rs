@@ -20,7 +20,14 @@ use crate::mobile_compat::{
     VirtualProcessShim, VirtualSpawnResult, resolve_real_binary, resolve_relative_command,
     with_default_cwd,
 };
+use crate::yt_clients::{
+    InnerTubeClientSpec, WEB_REMIX_UA, compute_youtube_auth_header, lookup_client,
+    resolve_requested_clients,
+};
 use crate::yt_ejs;
+use crate::yt_format_selector::{
+    CandidateFormatMeta, FormatSelector, PoTokenContext, YoutubeExtractorArgs,
+};
 
 const DEFAULT_INNERTUBE_ORIGIN: &str = "https://music.youtube.com";
 const WEB_YOUTUBE_ORIGIN: &str = "https://www.youtube.com";
@@ -29,14 +36,6 @@ const VISITOR_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 const PLAYER_HTTP_TIMEOUT: Duration = Duration::from_secs(8);
 const PREFLIGHT_HTTP_TIMEOUT: Duration = Duration::from_secs(6);
 const DEFAULT_CASCADE_BUDGET: Duration = Duration::from_secs(40);
-
-const WEB_REMIX_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
-const WEB_SAFARI_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.5 Safari/605.1.15,gzip(gfe)";
-const ANDROID_UA: &str = "com.google.android.youtube/21.26.364 (Linux; U; Android 11) gzip";
-const ANDROID_VR_UA: &str = "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
-const IOS_UA: &str =
-    "com.google.ios.youtube/21.26.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)";
-const VISION_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
 
 /// Synthetic `--version` banner emitted by [`VirtualYtdlpShim`].
 pub const VIRTUAL_YTDLP_VERSION_BANNER: &str = "2026.03.01 (nsh-virtual-ytdlp)\n";
@@ -72,6 +71,7 @@ pub struct YtdlpParsedArgs {
     pub is_version: bool,
     pub reads_stdin_config: bool,
     pub output_mode: YtdlpOutputMode,
+    pub print_template: Option<String>,
     pub format_expr: Option<String>,
     pub extractor_args: Vec<String>,
     pub headers: HashMap<String, String>,
@@ -85,6 +85,7 @@ impl Default for YtdlpParsedArgs {
             is_version: false,
             reads_stdin_config: false,
             output_mode: YtdlpOutputMode::PrintUrl,
+            print_template: None,
             format_expr: None,
             extractor_args: Vec::new(),
             headers: HashMap::new(),
@@ -267,6 +268,9 @@ fn apply_ytdlp_tokens(parsed: &mut YtdlpParsedArgs, tokens: &[String], allow_pos
 
 fn apply_print_template(parsed: &mut YtdlpParsedArgs, tpl: &str) {
     let t = tpl.trim();
+    if !t.is_empty() {
+        parsed.print_template = Some(t.to_owned());
+    }
     if t.contains("http_headers") || t.ends_with("}j") || t.ends_with(")j") {
         parsed.output_mode = YtdlpOutputMode::PrintUrlAndHeadersJson;
     } else if t == "url" || t == "%(url)s" {
@@ -520,11 +524,22 @@ pub struct ResolvedAudioStream {
     pub mime_type: String,
     pub ext: String,
     pub acodec: String,
+    pub vcodec: String,
     pub format_id: String,
     pub bitrate: u64,
+    pub abr: Option<f64>,
+    pub tbr: Option<f64>,
+    pub asr: Option<u64>,
+    pub audio_channels: Option<u32>,
+    pub filesize: Option<u64>,
     pub duration_secs: Option<u64>,
+    pub protocol: String,
+    pub uploader: String,
+    pub channel_id: String,
+    pub thumbnail: String,
     pub user_agent: String,
     pub is_hls: bool,
+    pub formats_json: Vec<Value>,
 }
 
 fn visitor_cache() -> &'static Mutex<HashMap<String, (String, Instant)>> {
@@ -820,285 +835,73 @@ fn parse_visitor_pb_nested_geo(bytes: &[u8]) -> Option<String> {
     None
 }
 
-struct InnerTubeClientSpec {
-    label: &'static str,
-    client_id: &'static str,
-    client_version: &'static str,
-    user_agent: &'static str,
-    use_visitor: bool,
-    is_web_client: bool,
-    build_context: fn(visitor: &str) -> Value,
-}
-
-const CLIENT_WEB_REMIX: InnerTubeClientSpec = InnerTubeClientSpec {
-    label: "WEB_REMIX",
-    client_id: "67",
-    client_version: "1.20260707.12.00",
-    user_agent: WEB_REMIX_UA,
-    use_visitor: true,
-    is_web_client: true,
-    build_context: |visitor| {
-        let mut client = json!({
-            "clientName": "WEB_REMIX",
-            "clientVersion": "1.20260707.12.00",
-            "hl": "en",
-            "gl": "US"
-        });
-        if !visitor.is_empty()
-            && let Some(m) = client.as_object_mut()
-        {
-            m.insert("visitorData".to_owned(), json!(visitor));
-        }
-        json!({ "client": client })
-    },
-};
-
-const CLIENT_WEB_SAFARI: InnerTubeClientSpec = InnerTubeClientSpec {
-    label: "WEB_SAFARI",
-    client_id: "1",
-    client_version: "2.20260708.00.00",
-    user_agent: WEB_SAFARI_UA,
-    use_visitor: true,
-    is_web_client: true,
-    build_context: |visitor| {
-        let mut client = json!({
-            "clientName": "WEB",
-            "clientVersion": "2.20260708.00.00",
-            "userAgent": WEB_SAFARI_UA,
-            "hl": "en",
-            "gl": "US"
-        });
-        if !visitor.is_empty()
-            && let Some(m) = client.as_object_mut()
-        {
-            m.insert("visitorData".to_owned(), json!(visitor));
-        }
-        json!({ "client": client })
-    },
-};
-
-const CLIENT_WEB_CREATOR: InnerTubeClientSpec = InnerTubeClientSpec {
-    label: "WEB_CREATOR",
-    client_id: "62",
-    client_version: "1.20260708.06.00",
-    user_agent: WEB_REMIX_UA,
-    use_visitor: true,
-    is_web_client: true,
-    build_context: |visitor| {
-        let mut client = json!({
-            "clientName": "WEB_CREATOR",
-            "clientVersion": "1.20260708.06.00",
-            "hl": "en",
-            "gl": "US"
-        });
-        if !visitor.is_empty()
-            && let Some(m) = client.as_object_mut()
-        {
-            m.insert("visitorData".to_owned(), json!(visitor));
-        }
-        json!({ "client": client })
-    },
-};
-
-const CLIENT_WEB: InnerTubeClientSpec = InnerTubeClientSpec {
-    label: "WEB",
-    client_id: "1",
-    client_version: "2.20260708.00.00",
-    user_agent: WEB_REMIX_UA,
-    use_visitor: true,
-    is_web_client: true,
-    build_context: |visitor| {
-        let mut client = json!({
-            "clientName": "WEB",
-            "clientVersion": "2.20260708.00.00",
-            "hl": "en",
-            "gl": "US"
-        });
-        if !visitor.is_empty()
-            && let Some(m) = client.as_object_mut()
-        {
-            m.insert("visitorData".to_owned(), json!(visitor));
-        }
-        json!({ "client": client })
-    },
-};
-
-const CLIENT_ANDROID: InnerTubeClientSpec = InnerTubeClientSpec {
-    label: "ANDROID",
-    client_id: "3",
-    client_version: "21.26.364",
-    user_agent: ANDROID_UA,
-    use_visitor: true,
-    is_web_client: false,
-    build_context: |visitor| {
-        let mut client = json!({
-            "clientName": "ANDROID",
-            "clientVersion": "21.26.364",
-            "osName": "Android",
-            "osVersion": "11",
-            "androidSdkVersion": 30,
-            "hl": "en",
-            "gl": "US"
-        });
-        if !visitor.is_empty()
-            && let Some(m) = client.as_object_mut()
-        {
-            m.insert("visitorData".to_owned(), json!(visitor));
-        }
-        json!({ "client": client })
-    },
-};
-
-const CLIENT_VISIONOS: InnerTubeClientSpec = InnerTubeClientSpec {
-    label: "VISIONOS",
-    client_id: "101",
-    client_version: "1.02",
-    user_agent: VISION_UA,
-    use_visitor: true,
-    is_web_client: false,
-    build_context: |visitor| {
-        let mut client = json!({
-            "clientName": "VISIONOS",
-            "clientVersion": "1.02",
-            "deviceMake": "Apple",
-            "deviceModel": "RealityDevice17,1",
-            "userAgent": VISION_UA,
-            "osName": "visionOS",
-            "osVersion": "26.5.23O471"
-        });
-        if !visitor.is_empty()
-            && let Some(m) = client.as_object_mut()
-        {
-            m.insert("visitorData".to_owned(), json!(visitor));
-        }
-        json!({ "client": client })
-    },
-};
-
-const CLIENT_ANDROID_VR: InnerTubeClientSpec = InnerTubeClientSpec {
-    label: "ANDROID_VR",
-    client_id: "28",
-    client_version: "1.65.10",
-    user_agent: ANDROID_VR_UA,
-    use_visitor: true,
-    is_web_client: false,
-    build_context: |visitor| {
-        let mut client = json!({
-            "clientName": "ANDROID_VR",
-            "clientVersion": "1.65.10",
-            "deviceMake": "Oculus",
-            "deviceModel": "Quest 3",
-            "osName": "Android",
-            "osVersion": "12L",
-            "androidSdkVersion": 32,
-            "hl": "en",
-            "gl": "US"
-        });
-        if !visitor.is_empty()
-            && let Some(m) = client.as_object_mut()
-        {
-            m.insert("visitorData".to_owned(), json!(visitor));
-        }
-        json!({ "client": client })
-    },
-};
-
-const CLIENT_IOS: InnerTubeClientSpec = InnerTubeClientSpec {
-    label: "IOS",
-    client_id: "5",
-    client_version: "21.26.4",
-    user_agent: IOS_UA,
-    use_visitor: true,
-    is_web_client: false,
-    build_context: |visitor| {
-        let mut client = json!({
-            "clientName": "IOS",
-            "clientVersion": "21.26.4",
-            "deviceMake": "Apple",
-            "deviceModel": "iPhone16,2",
-            "osName": "iPhone",
-            "osVersion": "18.3.2.22D82",
-            "hl": "en",
-            "gl": "US"
-        });
-        if !visitor.is_empty()
-            && let Some(m) = client.as_object_mut()
-        {
-            m.insert("visitorData".to_owned(), json!(visitor));
-        }
-        json!({ "client": client })
-    },
-};
-
-struct CascadeStep<'a> {
+struct CascadeStep {
     spec: &'static InnerTubeClientSpec,
-    origin: &'a str,
+    origin: String,
     send_auth: bool,
 }
 
-fn build_cascade_steps<'a>(
-    primary: &'a str,
-    secondary: Option<&'a str>,
-    include_auth_web: bool,
-) -> Vec<CascadeStep<'a>> {
-    let mut steps: Vec<CascadeStep<'a>> = Vec::with_capacity(10);
-    if include_auth_web {
-        let web_origin = secondary.unwrap_or(WEB_YOUTUBE_ORIGIN);
+fn build_cascade_steps(
+    primary: &str,
+    secondary: Option<&str>,
+    has_cookie: bool,
+    ext_args: &YoutubeExtractorArgs,
+) -> Vec<CascadeStep> {
+    let loopback = is_loopback_origin(primary);
+    let mut steps: Vec<CascadeStep> = Vec::with_capacity(12);
+
+    if loopback && ext_args.player_client.is_empty() {
+        // Keep default loopback unit-test cascade identical (anonymous mobile clients against loopback).
+        let push_loopback = |steps: &mut Vec<CascadeStep>, key: &str, origin: &str| {
+            if let Some(spec) = lookup_client(key) {
+                steps.push(CascadeStep {
+                    spec,
+                    origin: origin.to_owned(),
+                    send_auth: false,
+                });
+            }
+        };
+        push_loopback(&mut steps, "visionos", primary);
+        if let Some(sec) = secondary {
+            push_loopback(&mut steps, "visionos", sec);
+        }
+        push_loopback(&mut steps, "android", primary);
+        if let Some(sec) = secondary {
+            push_loopback(&mut steps, "android", sec);
+        }
+        push_loopback(&mut steps, "android_vr", primary);
+        push_loopback(&mut steps, "ios", primary);
+        return steps;
+    }
+
+    let mut chosen = resolve_requested_clients(&ext_args.player_client, has_cookie);
+    if !ext_args.player_client.is_empty() && !loopback {
+        // Resilient fallback if all explicitly requested client(s) fail on live YouTube.
+        for fallback_key in ["web_music", "web_creator", "visionos"] {
+            if let Some(spec) = lookup_client(fallback_key)
+                && !chosen.iter().any(|c| c.key == spec.key)
+            {
+                chosen.push(spec);
+            }
+        }
+    }
+
+    for spec in chosen {
+        let origin = if loopback || (spec.key == "web_music" && primary == DEFAULT_INNERTUBE_ORIGIN) {
+            primary.to_owned()
+        } else if spec.host == "www.youtube.com" {
+            secondary.unwrap_or(WEB_YOUTUBE_ORIGIN).to_owned()
+        } else {
+            spec.default_origin()
+        };
+        let send_auth = spec.supports_cookies && has_cookie;
         steps.push(CascadeStep {
-            spec: &CLIENT_WEB_REMIX,
-            origin: primary,
-            send_auth: true,
-        });
-        steps.push(CascadeStep {
-            spec: &CLIENT_WEB_SAFARI,
-            origin: web_origin,
-            send_auth: true,
-        });
-        steps.push(CascadeStep {
-            spec: &CLIENT_WEB_CREATOR,
-            origin: web_origin,
-            send_auth: true,
-        });
-        steps.push(CascadeStep {
-            spec: &CLIENT_WEB,
-            origin: web_origin,
-            send_auth: true,
+            spec,
+            origin,
+            send_auth,
         });
     }
-    steps.push(CascadeStep {
-        spec: &CLIENT_VISIONOS,
-        origin: primary,
-        send_auth: false,
-    });
-    if let Some(web) = secondary {
-        steps.push(CascadeStep {
-            spec: &CLIENT_VISIONOS,
-            origin: web,
-            send_auth: false,
-        });
-    }
-    steps.push(CascadeStep {
-        spec: &CLIENT_ANDROID,
-        origin: primary,
-        send_auth: false,
-    });
-    if let Some(web) = secondary {
-        steps.push(CascadeStep {
-            spec: &CLIENT_ANDROID,
-            origin: web,
-            send_auth: false,
-        });
-    }
-    steps.push(CascadeStep {
-        spec: &CLIENT_ANDROID_VR,
-        origin: primary,
-        send_auth: false,
-    });
-    steps.push(CascadeStep {
-        spec: &CLIENT_IOS,
-        origin: primary,
-        send_auth: false,
-    });
+
     steps
 }
 
@@ -1211,7 +1014,7 @@ pub async fn resolve_innertube_stream_with_options(
 }
 
 /// Same as [`resolve_innertube_stream_with_options`] with an optional disk `cache_dir`
-/// for persisting preprocessed `tv-player-ias.js` (`<cache_dir>/yt-ejs-player.json`).
+/// for persisting preprocessed player JS (`<cache_dir>/yt-ejs-player.json`).
 #[allow(clippy::too_many_arguments)]
 pub async fn resolve_innertube_stream_with_cache(
     client: &reqwest::Client,
@@ -1219,6 +1022,33 @@ pub async fn resolve_innertube_stream_with_cache(
     video_id: &str,
     cookie: Option<&str>,
     format_expr: Option<&str>,
+    prefer_mobile_aac: bool,
+    verify_stream_url: bool,
+    cache_dir: Option<&Path>,
+) -> Result<ResolvedAudioStream, String> {
+    let default_ext = YoutubeExtractorArgs::default();
+    resolve_innertube_stream_with_extractor_args(
+        client,
+        base_origin,
+        video_id,
+        cookie,
+        format_expr,
+        &default_ext,
+        prefer_mobile_aac,
+        verify_stream_url,
+        cache_dir,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_innertube_stream_with_extractor_args(
+    client: &reqwest::Client,
+    base_origin: &str,
+    video_id: &str,
+    cookie: Option<&str>,
+    format_expr: Option<&str>,
+    ext_args: &YoutubeExtractorArgs,
     prefer_mobile_aac: bool,
     verify_stream_url: bool,
     cache_dir: Option<&Path>,
@@ -1232,6 +1062,7 @@ pub async fn resolve_innertube_stream_with_cache(
         video_id,
         cookie,
         format_expr,
+        ext_args,
         prefer_mobile_aac,
         verify_stream_url,
         DEFAULT_CASCADE_BUDGET,
@@ -1248,6 +1079,7 @@ async fn resolve_innertube_stream_inner(
     video_id: &str,
     cookie: Option<&str>,
     format_expr: Option<&str>,
+    ext_args: &YoutubeExtractorArgs,
     prefer_mobile_aac: bool,
     verify_stream_url: bool,
     total_budget: Duration,
@@ -1256,8 +1088,11 @@ async fn resolve_innertube_stream_inner(
     let primary = primary_origin.trim_end_matches('/');
     let secondary = secondary_origin.map(|s| s.trim_end_matches('/'));
     let trimmed_cookie = cookie.map(str::trim).filter(|s| !s.is_empty());
-    let include_auth_web = trimmed_cookie.is_some() && !is_loopback_origin(primary);
-    let steps = build_cascade_steps(primary, secondary, include_auth_web);
+    let has_cookie = trimmed_cookie.is_some();
+    let steps = build_cascade_steps(primary, secondary, has_cookie, ext_args);
+    let selector = FormatSelector::parse(format_expr.unwrap_or(""));
+    let hl = ext_args.lang.as_deref().unwrap_or("en");
+    let gl = "US";
 
     let deadline = Instant::now() + total_budget;
     let mut visitor_by_origin: HashMap<String, String> = HashMap::new();
@@ -1270,7 +1105,7 @@ async fn resolve_innertube_stream_inner(
 
     for step in steps {
         let spec = step.spec;
-        let step_origin = step.origin;
+        let step_origin = step.origin.as_str();
         let Some(rem) = deadline
             .checked_duration_since(Instant::now())
             .filter(|d| !d.is_zero())
@@ -1286,17 +1121,21 @@ async fn resolve_innertube_stream_inner(
 
         let origin_label = sanitize_url_for_log(step_origin);
         let client_tag = if step.send_auth {
-            format!("{}(auth@{origin_label})", spec.label)
+            format!("{}(auth@{origin_label})", spec.key)
         } else {
-            format!("{}(anon@{origin_label})", spec.label)
+            format!("{}(anon@{origin_label})", spec.key)
         };
 
-        // Ensure `tv-player-ias.js` bundle (with `sts`) is available before authenticated web clients.
-        if step.send_auth && tv_bundle.is_none() && !tv_bundle_failed {
-            match yt_ejs::fetch_or_cached_tv_player(
+        // Ensure player JS bundle (with `sts`) is loaded for non-jsless clients on real YouTube.
+        if !spec.jsless && !is_loopback_origin(step_origin) && tv_bundle.is_none() && !tv_bundle_failed
+        {
+            match yt_ejs::fetch_or_cached_tv_player_with_options(
                 client,
                 cache_dir,
                 rem.min(Duration::from_secs(15)),
+                ext_args.player_js_variant.as_deref(),
+                ext_args.player_js_version.as_deref(),
+                Some(video_id),
             )
             .await
             {
@@ -1306,7 +1145,7 @@ async fn resolve_innertube_stream_inner(
                 Err(e) => {
                     log::warn!(
                         target: "nsh_music_plugin",
-                        "virtual yt-dlp video={video_id} failed to fetch tv-player-ias.js: {e}"
+                        "virtual yt-dlp video={video_id} failed to fetch player JS: {e}"
                     );
                     tv_bundle_failed = true;
                 }
@@ -1326,33 +1165,36 @@ async fn resolve_innertube_stream_inner(
             break;
         };
 
-        let visitor = if spec.use_visitor {
-            if let Some(cached) = visitor_by_origin.get(step_origin) {
-                cached.clone()
-            } else {
-                let fetched = fetch_or_cached_visitor_data(
-                    client,
-                    step_origin,
-                    rem_visitor.min(VISITOR_HTTP_TIMEOUT),
-                )
-                .await;
-                let geo_opt = decode_visitor_data_geo(&fetched);
-                log::info!(
-                    target: "nsh_music_plugin",
-                    "virtual yt-dlp video={video_id} origin={origin_label} visitor_len={} geo={}",
-                    fetched.len(),
-                    geo_opt.as_deref().unwrap_or("unknown"),
-                );
-                if detected_geo.is_none()
-                    && let Some(cc) = geo_opt
-                {
-                    detected_geo = Some(cc);
-                }
-                visitor_by_origin.insert(step_origin.to_owned(), fetched.clone());
-                fetched
+        let visitor = if let Some(ref explicit_vd) = ext_args.visitor_data {
+            if detected_geo.is_none()
+                && let Some(cc) = decode_visitor_data_geo(explicit_vd)
+            {
+                detected_geo = Some(cc);
             }
+            explicit_vd.clone()
+        } else if let Some(cached) = visitor_by_origin.get(step_origin) {
+            cached.clone()
         } else {
-            String::new()
+            let fetched = fetch_or_cached_visitor_data(
+                client,
+                step_origin,
+                rem_visitor.min(VISITOR_HTTP_TIMEOUT),
+            )
+            .await;
+            let geo_opt = decode_visitor_data_geo(&fetched);
+            log::info!(
+                target: "nsh_music_plugin",
+                "virtual yt-dlp video={video_id} origin={origin_label} visitor_len={} geo={}",
+                fetched.len(),
+                geo_opt.as_deref().unwrap_or("unknown"),
+            );
+            if detected_geo.is_none()
+                && let Some(cc) = geo_opt
+            {
+                detected_geo = Some(cc);
+            }
+            visitor_by_origin.insert(step_origin.to_owned(), fetched.clone());
+            fetched
         };
         let geo_label = detected_geo.as_deref().unwrap_or("unknown");
 
@@ -1371,14 +1213,14 @@ async fn resolve_innertube_stream_inner(
         let req_timeout = rem_after_visitor.min(PLAYER_HTTP_TIMEOUT);
 
         let player_url = format!("{step_origin}/youtubei/v1/player?prettyPrint=false");
-        let ctx_val = (spec.build_context)(if spec.use_visitor { &visitor } else { "" });
+        let ctx_val = spec.build_context(&visitor, hl, gl);
         let mut body = json!({
             "context": ctx_val,
             "videoId": video_id,
             "contentCheckOk": true,
             "racyCheckOk": true
         });
-        if step.send_auth
+        if !spec.jsless
             && let Some(ref bundle) = tv_bundle
             && let Some(obj) = body.as_object_mut()
         {
@@ -1389,6 +1231,14 @@ async fn resolve_innertube_stream_inner(
                         "signatureTimestamp": bundle.sts
                     }
                 }),
+            );
+        }
+        if let Some(player_pot) = ext_args.find_po_token(spec.key, PoTokenContext::Player)
+            && let Some(obj) = body.as_object_mut()
+        {
+            obj.insert(
+                "serviceIntegrityDimensions".to_owned(),
+                json!({ "poToken": player_pot }),
             );
         }
 
@@ -1403,18 +1253,19 @@ async fn resolve_innertube_stream_inner(
             .json(&body)
             .timeout(req_timeout);
 
-        if spec.use_visitor && !visitor.is_empty() {
+        if !visitor.is_empty() {
             req = req.header("x-goog-visitor-id", &visitor);
         }
         if step.send_auth
             && let Some(c) = trimmed_cookie
         {
             req = req.header("cookie", c);
+            req = req.header("x-youtube-bootstrap-logged-in", "true");
             let now_secs = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            if let Some(auth) = compute_sapisidhash(c, step_origin, now_secs) {
+            if let Some(auth) = compute_youtube_auth_header(c, step_origin, now_secs) {
                 req = req.header("authorization", auth);
                 req = req.header("x-goog-authuser", "0");
             }
@@ -1473,14 +1324,13 @@ async fn resolve_innertube_stream_inner(
             }
         };
 
-        let mut raw_candidates = match collect_audio_candidates(
+        let extracted = match extract_raw_player_candidates(
             &payload,
             video_id,
             spec.user_agent,
-            format_expr,
-            prefer_mobile_aac,
+            ext_args.skip_hls,
         ) {
-            Ok(list) => list,
+            Ok(e) => e,
             Err(SelectionError::Playability { status, reason }) => {
                 let msg = if reason.is_empty() {
                     format!("video {status}")
@@ -1505,35 +1355,113 @@ async fn resolve_innertube_stream_inner(
             }
         };
 
-        // For HLS candidates (e.g. `WEB_SAFARI`), expand master playlist into the best audio-bearing
-        // variant URL before batch EJS solving so `/n/<challenge>/` on the variant playlist is solved too.
-        for cand in &mut raw_candidates {
-            if cand.stream.is_hls && (spec.is_web_client || verify_stream_url) {
-                let Some(hls_rem) = deadline
+        // Expand `hlsManifestUrl` master playlist into individual variant `AudioCandidate` entries
+        // BEFORE running `FormatSelector`, so selectors like `bestaudio[protocol^=m3u8]/93/94/92/95/91`
+        // operate directly on real HLS variants (with format_id `93`, `94`, `234`, etc.).
+        let mut all_candidates = extracted.candidates;
+        if let Some(ref hls_url) = extracted.hls_manifest_url
+            && !ext_args.skip_hls
+        {
+            let mut expanded = Vec::new();
+            if (!spec.jsless || verify_stream_url)
+                && let Some(hls_rem) = deadline
                     .checked_duration_since(Instant::now())
                     .filter(|d| !d.is_zero())
-                else {
-                    break;
-                };
+            {
                 let hls_timeout = hls_rem.min(PREFLIGHT_HTTP_TIMEOUT);
                 if let Ok(text) = fetch_text_prefix(
                     client,
-                    &cand.stream.url,
-                    &cand.stream.user_agent,
+                    hls_url,
+                    spec.user_agent,
                     hls_timeout,
                     256 * 1024,
                 )
                 .await
-                    && let Some(variant_url) =
-                        select_best_youtube_hls_variant(&cand.stream.url, &text)
                 {
-                    cand.stream.url = variant_url;
+                    expanded = expand_hls_master_variants(
+                        hls_url,
+                        &text,
+                        &extracted.video_meta,
+                        spec.user_agent,
+                    );
                 }
+            }
+            if !expanded.is_empty() {
+                all_candidates.extend(expanded);
+            } else {
+                // Already a media playlist (or unexpanded fallback): expose as a single HLS audio candidate.
+                all_candidates.push(AudioCandidate {
+                    stream: build_hls_stream(
+                        hls_url,
+                        "hls",
+                        "aac",
+                        "none",
+                        None,
+                        None,
+                        &extracted.video_meta,
+                        spec.user_agent,
+                    ),
+                    meta: CandidateFormatMeta {
+                        format_id: "hls".to_owned(),
+                        ext: "m3u8".to_owned(),
+                        protocol: "m3u8_native".to_owned(),
+                        acodec: "aac".to_owned(),
+                        vcodec: "none".to_owned(),
+                        abr: None,
+                        tbr: None,
+                        asr: None,
+                        audio_channels: None,
+                        filesize: None,
+                        is_drc: false,
+                        is_default_audio_track: true,
+                        is_original_audio_track: true,
+                        is_hls: true,
+                        is_muxed: false,
+                    },
+                    cipher_s: None,
+                    cipher_sp: "signature".to_owned(),
+                });
             }
         }
 
-        // Collect all unique `s` (signatureCipher) and `n` challenges across candidates.
-        let (sig_challenges, n_challenges) = collect_unique_challenges(&raw_candidates);
+        if all_candidates.is_empty() {
+            log::warn!(
+                target: "nsh_music_plugin",
+                "virtual yt-dlp video={video_id} client={client_tag} no audio formats in streamingData"
+            );
+            errors.push(format!("{client_tag}: no audio formats in streamingData"));
+            continue;
+        }
+
+        let metas: Vec<CandidateFormatMeta> =
+            all_candidates.iter().map(|c| c.meta.clone()).collect();
+        let selected_indices = selector.select_indices(&metas, prefer_mobile_aac);
+        if selected_indices.is_empty() {
+            log::warn!(
+                target: "nsh_music_plugin",
+                "virtual yt-dlp video={video_id} client={client_tag} format selector `{}` matched 0 of {} candidates",
+                format_expr.unwrap_or("bestaudio/best"),
+                all_candidates.len()
+            );
+            errors.push(format!("{client_tag}: requested format not available"));
+            continue;
+        }
+
+        let formats_summary: Vec<Value> = all_candidates
+            .iter()
+            .map(candidate_to_format_summary_json)
+            .collect();
+        let raw_selected: Vec<AudioCandidate> = selected_indices
+            .into_iter()
+            .map(|idx| {
+                let mut c = all_candidates[idx].clone();
+                c.stream.formats_json = formats_summary.clone();
+                c
+            })
+            .collect();
+
+        // Batch-solve all unique `s` (signatureCipher/cipher) and `n` challenges across selected candidates.
+        let (sig_challenges, n_challenges) = collect_unique_challenges(&raw_selected);
         let solved = if !sig_challenges.is_empty() || !n_challenges.is_empty() {
             if tv_bundle.is_none() && !tv_bundle_failed {
                 let fetch_rem = deadline
@@ -1541,12 +1469,21 @@ async fn resolve_innertube_stream_inner(
                     .unwrap_or_default()
                     .min(Duration::from_secs(15));
                 if !fetch_rem.is_zero() {
-                    match yt_ejs::fetch_or_cached_tv_player(client, cache_dir, fetch_rem).await {
+                    match yt_ejs::fetch_or_cached_tv_player_with_options(
+                        client,
+                        cache_dir,
+                        fetch_rem,
+                        ext_args.player_js_variant.as_deref(),
+                        ext_args.player_js_version.as_deref(),
+                        Some(video_id),
+                    )
+                    .await
+                    {
                         Ok(bundle) => tv_bundle = Some(bundle),
                         Err(e) => {
                             log::warn!(
                                 target: "nsh_music_plugin",
-                                "virtual yt-dlp video={video_id} failed to fetch tv-player-ias.js: {e}"
+                                "virtual yt-dlp video={video_id} failed to fetch player JS: {e}"
                             );
                             tv_bundle_failed = true;
                         }
@@ -1573,12 +1510,14 @@ async fn resolve_innertube_stream_inner(
 
                 match solve_res {
                     Ok(res) => {
-                        // Refresh local `tv_bundle` to pick up cached `preprocessed_player` on warm steps.
                         if res.cold
-                            && let Ok(refreshed) = yt_ejs::fetch_or_cached_tv_player(
+                            && let Ok(refreshed) = yt_ejs::fetch_or_cached_tv_player_with_options(
                                 client,
                                 cache_dir,
                                 Duration::from_secs(1),
+                                Some(&bundle.variant),
+                                Some(&bundle.player_id),
+                                Some(video_id),
                             )
                             .await
                         {
@@ -1602,7 +1541,8 @@ async fn resolve_innertube_stream_inner(
             None
         };
 
-        let candidates = finalize_solved_candidates(raw_candidates, solved.as_ref());
+        let gvs_pot = ext_args.find_po_token(spec.key, PoTokenContext::Gvs);
+        let candidates = finalize_solved_candidates(raw_selected, solved.as_ref(), gvs_pot);
         if candidates.is_empty() {
             log::warn!(
                 target: "nsh_music_plugin",
@@ -1613,6 +1553,11 @@ async fn resolve_innertube_stream_inner(
             ));
             continue;
         }
+
+        let solved_n_outputs: HashSet<String> = solved
+            .as_ref()
+            .map(|r| r.ns.values().cloned().collect())
+            .unwrap_or_default();
 
         let total = candidates.len();
         for (idx, candidate) in candidates.into_iter().enumerate() {
@@ -1644,7 +1589,14 @@ async fn resolve_innertube_stream_inner(
 
             match tokio::time::timeout(
                 preflight_timeout,
-                verify_candidate_stream_url(client, &candidate, preflight_timeout),
+                verify_candidate_stream_url_with_ejs(
+                    client,
+                    &candidate,
+                    preflight_timeout,
+                    tv_bundle.as_ref(),
+                    &solved_n_outputs,
+                    cache_dir,
+                ),
             )
             .await
             {
@@ -1745,10 +1697,23 @@ async fn fetch_text_prefix(
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
+#[cfg(test)]
 async fn verify_candidate_stream_url(
     client: &reqwest::Client,
     candidate: &ResolvedAudioStream,
     timeout: Duration,
+) -> Result<(), String> {
+    verify_candidate_stream_url_with_ejs(client, candidate, timeout, None, &HashSet::new(), None)
+        .await
+}
+
+async fn verify_candidate_stream_url_with_ejs(
+    client: &reqwest::Client,
+    candidate: &ResolvedAudioStream,
+    timeout: Duration,
+    tv_bundle: Option<&yt_ejs::TvPlayerBundle>,
+    solved_n_outputs: &HashSet<String>,
+    cache_dir: Option<&Path>,
 ) -> Result<(), String> {
     if candidate.is_hls {
         let mut playlist_url = candidate.url.clone();
@@ -1779,7 +1744,30 @@ async fn verify_candidate_stream_url(
 
         // If the media playlist contains absolute `http://`/`https://` segment URLs, verify
         // that fetching the first segment returns 2xx (rejecting 403 segments during preflight).
-        if let Some(seg_url) = extract_first_hls_http_segment_url(&text) {
+        // If a segment has a separate `/n/` not already solved on the variant URL, solve it first.
+        if let Some(mut seg_url) = extract_first_hls_http_segment_url(&text) {
+            let seg_n = extract_path_n_param(&seg_url).or_else(|| extract_query_n_param(&seg_url));
+            if let Some(ref raw_seg_n) = seg_n
+                && !solved_n_outputs.contains(raw_seg_n)
+                && let Some(bundle) = tv_bundle
+            {
+                let bundle_clone = bundle.clone();
+                let n_vec = vec![raw_seg_n.clone()];
+                let cache_owned = cache_dir.map(Path::to_path_buf);
+                if let Ok(Ok(res)) = tokio::task::spawn_blocking(move || {
+                    yt_ejs::solve_challenges(&bundle_clone, &[], &n_vec, cache_owned.as_deref())
+                })
+                .await
+                    && let Some(solved_seg_n) = res.ns.get(raw_seg_n)
+                {
+                    if extract_path_n_param(&seg_url).is_some() {
+                        seg_url = replace_path_n_param(&seg_url, solved_seg_n);
+                    } else {
+                        seg_url = replace_query_param_preserve_order(&seg_url, "n", solved_seg_n);
+                    }
+                }
+            }
+
             let mut seg_resp = client
                 .get(&seg_url)
                 .header("user-agent", &candidate.user_agent)
@@ -1911,10 +1899,27 @@ fn extract_playability_reason(payload: &Value) -> String {
 }
 
 #[derive(Debug, Clone)]
+struct VideoMeta {
+    video_id: String,
+    title: String,
+    duration_secs: Option<u64>,
+    uploader: String,
+    channel_id: String,
+    thumbnail: String,
+}
+
+#[derive(Debug, Clone)]
 struct AudioCandidate {
     stream: ResolvedAudioStream,
+    meta: CandidateFormatMeta,
     cipher_s: Option<String>,
     cipher_sp: String,
+}
+
+struct ExtractedPlayerFormats {
+    video_meta: VideoMeta,
+    candidates: Vec<AudioCandidate>,
+    hls_manifest_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2101,6 +2106,7 @@ fn collect_unique_challenges(candidates: &[AudioCandidate]) -> (Vec<String>, Vec
 fn finalize_solved_candidates(
     raw_candidates: Vec<AudioCandidate>,
     solved: Option<&yt_ejs::EjsSolveResult>,
+    gvs_po_token: Option<&str>,
 ) -> Vec<ResolvedAudioStream> {
     let empty_map = HashMap::new();
     let sigs = solved.map_or(&empty_map, |r| &r.sigs);
@@ -2108,13 +2114,16 @@ fn finalize_solved_candidates(
 
     let mut out = Vec::with_capacity(raw_candidates.len());
     for mut cand in raw_candidates {
-        if let Some(final_url) = apply_solved_sig_and_n(
+        if let Some(mut final_url) = apply_solved_sig_and_n(
             &cand.stream.url,
             cand.cipher_s.as_deref(),
             &cand.cipher_sp,
             sigs,
             ns,
         ) {
+            if let Some(pot) = gvs_po_token {
+                final_url = replace_query_param_preserve_order(&final_url, "pot", pot);
+            }
             cand.stream.url = final_url;
             out.push(cand.stream);
         }
@@ -2266,13 +2275,325 @@ fn extract_first_hls_http_segment_url(playlist_text: &str) -> Option<String> {
     None
 }
 
-fn collect_audio_candidates(
+#[allow(clippy::too_many_arguments)]
+fn build_hls_stream(
+    url: &str,
+    format_id: &str,
+    acodec: &str,
+    vcodec: &str,
+    abr: Option<f64>,
+    tbr: Option<f64>,
+    meta: &VideoMeta,
+    user_agent: &str,
+) -> ResolvedAudioStream {
+    let bitrate = abr
+        .or(tbr)
+        .map(|k| (k * 1000.0) as u64)
+        .unwrap_or(0);
+    ResolvedAudioStream {
+        video_id: meta.video_id.clone(),
+        title: meta.title.clone(),
+        url: url.to_owned(),
+        mime_type: "application/vnd.apple.mpegurl".to_owned(),
+        ext: "m3u8".to_owned(),
+        acodec: acodec.to_owned(),
+        vcodec: vcodec.to_owned(),
+        format_id: format_id.to_owned(),
+        bitrate,
+        abr,
+        tbr,
+        asr: None,
+        audio_channels: Some(2),
+        filesize: None,
+        duration_secs: meta.duration_secs,
+        protocol: "m3u8_native".to_owned(),
+        uploader: meta.uploader.clone(),
+        channel_id: meta.channel_id.clone(),
+        thumbnail: meta.thumbnail.clone(),
+        user_agent: user_agent.to_owned(),
+        is_hls: true,
+        formats_json: Vec::new(),
+    }
+}
+
+fn split_hls_codecs(codecs_attr: &str) -> (String, String) {
+    let mut vcodec = "none".to_owned();
+    let mut acodec = "none".to_owned();
+    for part in codecs_attr.split(',') {
+        let c = part.trim();
+        let lower = c.to_ascii_lowercase();
+        if lower.is_empty() {
+            continue;
+        }
+        if lower.starts_with("mp4a")
+            || lower.starts_with("opus")
+            || lower.starts_with("ac-3")
+            || lower.starts_with("ec-3")
+            || lower.starts_with("vorbis")
+        {
+            acodec = c.to_owned();
+        } else {
+            vcodec = c.to_owned();
+        }
+    }
+    (acodec, vcodec)
+}
+
+/// Expands a YouTube HLS master playlist into individual `AudioCandidate` entries per variant
+/// (each with real `format_id`, `protocol: "m3u8_native"`, `acodec`, `vcodec`, `abr`, `tbr`)
+/// so `FormatSelector` can select variants directly (e.g. `bestaudio[protocol^=m3u8]/93/94/92/95/91`).
+fn expand_hls_master_variants(
+    master_url: &str,
+    playlist_text: &str,
+    meta: &VideoMeta,
+    user_agent: &str,
+) -> Vec<AudioCandidate> {
+    let lines: Vec<&str> = playlist_text.lines().map(str::trim).collect();
+    let mut group_codecs: HashMap<String, String> = HashMap::new();
+    for line in &lines {
+        if line.starts_with("#EXT-X-STREAM-INF:")
+            && let Some(group) = parse_hls_attr(line, "AUDIO")
+            && let Some(codecs) = parse_hls_attr(line, "CODECS")
+        {
+            group_codecs.insert(group, codecs);
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut seen_urls = HashSet::new();
+    let mut audio_idx = 0usize;
+
+    // 1. Audio-only `#EXT-X-MEDIA:TYPE=AUDIO` renditions (`vcodec = "none"`).
+    for line in &lines {
+        if line.starts_with("#EXT-X-MEDIA:")
+            && parse_hls_attr(line, "TYPE").is_some_and(|t| t.eq_ignore_ascii_case("AUDIO"))
+            && let Some(uri) = parse_hls_attr(line, "URI").filter(|u| !u.is_empty())
+        {
+            let resolved = resolve_hls_uri(master_url, &uri);
+            if !seen_urls.insert(resolved.clone()) {
+                continue;
+            }
+            let itag = extract_itag_from_url(&resolved);
+            let format_id = itag
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| {
+                    audio_idx += 1;
+                    format!("hls-audio-{audio_idx}")
+                });
+            let group_codec = parse_hls_attr(line, "GROUP-ID")
+                .and_then(|g| group_codecs.get(&g))
+                .cloned()
+                .unwrap_or_default();
+            let (parsed_a, _) = split_hls_codecs(&group_codec);
+            let acodec = if parsed_a != "none" {
+                parsed_a
+            } else if matches!(itag, Some(140 | 141 | 233 | 234)) {
+                "mp4a.40.2".to_owned()
+            } else {
+                "aac".to_owned()
+            };
+            let abr = match itag {
+                Some(141) => Some(256.0),
+                Some(140 | 234) => Some(128.0),
+                Some(233 | 139) => Some(48.0),
+                _ => None,
+            };
+            let is_default = parse_hls_attr(line, "DEFAULT")
+                .is_none_or(|d| d.eq_ignore_ascii_case("YES"));
+            let name_lower = parse_hls_attr(line, "NAME")
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let is_drc = name_lower.contains("drc");
+            let stream = build_hls_stream(
+                &resolved,
+                &format_id,
+                &acodec,
+                "none",
+                abr,
+                abr,
+                meta,
+                user_agent,
+            );
+            out.push(AudioCandidate {
+                meta: CandidateFormatMeta {
+                    format_id,
+                    ext: "m3u8".to_owned(),
+                    protocol: "m3u8_native".to_owned(),
+                    acodec,
+                    vcodec: "none".to_owned(),
+                    abr,
+                    tbr: abr,
+                    asr: None,
+                    audio_channels: Some(2),
+                    filesize: None,
+                    is_drc,
+                    is_default_audio_track: is_default,
+                    is_original_audio_track: is_default || name_lower.contains("original"),
+                    is_hls: true,
+                    is_muxed: false,
+                },
+                stream,
+                cipher_s: None,
+                cipher_sp: "signature".to_owned(),
+            });
+        }
+    }
+
+    // 2. `#EXT-X-STREAM-INF:` variants (muxed `91/92/93/94/95/96` or audio-only streams).
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if line.starts_with("#EXT-X-STREAM-INF:") {
+            let codecs_raw = parse_hls_attr(line, "CODECS").unwrap_or_default();
+            let (mut acodec, vcodec) = split_hls_codecs(&codecs_raw);
+            let bandwidth = parse_hls_attr(line, "BANDWIDTH").and_then(|b| b.parse::<u64>().ok());
+            let mut j = i + 1;
+            while j < lines.len() && (lines[j].is_empty() || lines[j].starts_with('#')) {
+                j += 1;
+            }
+            if j < lines.len() {
+                let resolved = resolve_hls_uri(master_url, lines[j]);
+                if seen_urls.insert(resolved.clone()) {
+                    let itag = extract_itag_from_url(&resolved);
+                    if acodec == "none" && matches!(itag, Some(91..=96)) {
+                        acodec = if matches!(itag, Some(91 | 92)) {
+                            "mp4a.40.5".to_owned()
+                        } else {
+                            "mp4a.40.2".to_owned()
+                        };
+                    }
+                    if acodec != "none" {
+                        let format_id = itag
+                            .map(|n| n.to_string())
+                            .unwrap_or_else(|| format!("hls-{}", bandwidth.unwrap_or(0)));
+                        let tbr = bandwidth.map(|b| (b as f64) / 1000.0);
+                        let is_muxed = vcodec != "none";
+                        let abr = if !is_muxed {
+                            tbr
+                        } else {
+                            match itag {
+                                Some(93..=96) => Some(128.0),
+                                Some(91 | 92) => Some(48.0),
+                                _ => tbr,
+                            }
+                        };
+                        let stream = build_hls_stream(
+                            &resolved,
+                            &format_id,
+                            &acodec,
+                            &vcodec,
+                            abr,
+                            tbr,
+                            meta,
+                            user_agent,
+                        );
+                        out.push(AudioCandidate {
+                            meta: CandidateFormatMeta {
+                                format_id,
+                                ext: "m3u8".to_owned(),
+                                protocol: "m3u8_native".to_owned(),
+                                acodec,
+                                vcodec,
+                                abr,
+                                tbr,
+                                asr: None,
+                                audio_channels: Some(2),
+                                filesize: None,
+                                is_drc: false,
+                                is_default_audio_track: true,
+                                is_original_audio_track: true,
+                                is_hls: true,
+                                is_muxed,
+                            },
+                            stream,
+                            cipher_s: None,
+                            cipher_sp: "signature".to_owned(),
+                        });
+                    }
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    out
+}
+
+fn candidate_to_format_summary_json(c: &AudioCandidate) -> Value {
+    json!({
+        "format_id": c.meta.format_id,
+        "ext": c.meta.ext,
+        "protocol": c.meta.protocol,
+        "acodec": c.meta.acodec,
+        "vcodec": c.meta.vcodec,
+        "abr": c.meta.abr,
+        "tbr": c.meta.tbr,
+        "asr": c.meta.asr,
+        "audio_channels": c.meta.audio_channels,
+        "filesize": c.meta.filesize,
+    })
+}
+
+fn infer_direct_ext_and_codecs(mime_lower: &str, is_muxed: bool) -> (String, String, String) {
+    let ext = if mime_lower.starts_with("audio/mp4") {
+        "m4a"
+    } else if mime_lower.starts_with("video/mp4") {
+        "mp4"
+    } else if mime_lower.starts_with("audio/webm") || mime_lower.starts_with("video/webm") {
+        "webm"
+    } else if mime_lower.starts_with("audio/mpeg") {
+        "mp3"
+    } else if mime_lower.starts_with("video/3gpp") {
+        "3gp"
+    } else {
+        "audio"
+    };
+
+    let mut acodec = "none".to_owned();
+    let mut vcodec = "none".to_owned();
+
+    if let Some(pos) = mime_lower.find("codecs=") {
+        let rest = &mime_lower[pos + 7..];
+        let codecs_raw = if let Some(s) = rest.strip_prefix('"') {
+            s.split('"').next().unwrap_or("")
+        } else if let Some(s) = rest.strip_prefix('\'') {
+            s.split('\'').next().unwrap_or("")
+        } else {
+            rest.split(';').next().unwrap_or("")
+        };
+        let (a, v) = split_hls_codecs(codecs_raw);
+        acodec = a;
+        vcodec = v;
+    }
+
+    if acodec == "none" {
+        if mime_lower.contains("opus") {
+            acodec = "opus".to_owned();
+        } else if mime_lower.contains("mp4a.40.5") {
+            acodec = "mp4a.40.5".to_owned();
+        } else if mime_lower.contains("mp4a") {
+            acodec = "mp4a.40.2".to_owned();
+        } else if mime_lower.contains("vorbis") {
+            acodec = "vorbis".to_owned();
+        } else if mime_lower.starts_with("audio/") || is_muxed {
+            acodec = "unknown".to_owned();
+        }
+    }
+    if is_muxed && vcodec == "none" {
+        vcodec = "unknown".to_owned();
+    }
+
+    (ext.to_owned(), acodec, vcodec)
+}
+
+fn extract_raw_player_candidates(
     payload: &Value,
     video_id: &str,
     user_agent: &str,
-    format_expr: Option<&str>,
-    prefer_mobile_aac: bool,
-) -> Result<Vec<AudioCandidate>, SelectionError> {
+    skip_hls: bool,
+) -> Result<ExtractedPlayerFormats, SelectionError> {
     let status = payload
         .pointer("/playabilityStatus/status")
         .and_then(|v| v.as_str())
@@ -2294,33 +2615,52 @@ fn collect_audio_candidates(
         .pointer("/videoDetails/lengthSeconds")
         .and_then(|v| v.as_str())
         .and_then(|s| s.parse::<u64>().ok());
+    let uploader = payload
+        .pointer("/videoDetails/author")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let channel_id = payload
+        .pointer("/videoDetails/channelId")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let thumbnail = payload
+        .pointer("/videoDetails/thumbnail/thumbnails")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.last())
+        .and_then(|t| t.get("url"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_owned();
 
-    let fmt_lower = format_expr.unwrap_or_default().to_ascii_lowercase();
-    let excludes_m3u8 = fmt_lower.contains("!=m3u8") || fmt_lower.contains("!*m3u8");
-    let wants_m3u8 = !excludes_m3u8 && (fmt_lower.contains("m3u8") || fmt_lower.contains("hls"));
-    let wants_m4a =
-        fmt_lower.contains("m4a") || fmt_lower.contains("mp4") || fmt_lower.contains("aac");
-    let wants_webm = fmt_lower.contains("webm") || fmt_lower.contains("opus");
-    let prefer_mp4 = wants_m4a || (prefer_mobile_aac && !wants_webm);
+    let video_meta = VideoMeta {
+        video_id: video_id.to_owned(),
+        title,
+        duration_secs,
+        uploader,
+        channel_id,
+        thumbnail,
+    };
 
-    let mut raw_formats: Vec<&Value> = Vec::new();
+    let mut raw_entries: Vec<(&Value, bool)> = Vec::new();
     if let Some(arr) = payload
         .pointer("/streamingData/adaptiveFormats")
         .and_then(|v| v.as_array())
     {
-        raw_formats.extend(arr.iter());
+        raw_entries.extend(arr.iter().map(|v| (v, false)));
     }
     if let Some(arr) = payload
         .pointer("/streamingData/formats")
         .and_then(|v| v.as_array())
     {
-        raw_formats.extend(arr.iter());
+        raw_entries.extend(arr.iter().map(|v| (v, true)));
     }
 
-    let mut preferred: Vec<(u8, u64, AudioCandidate)> = Vec::new();
-    let mut fallback: Vec<(u64, AudioCandidate)> = Vec::new();
+    let mut candidates = Vec::new();
+    let mut seen_urls = HashSet::new();
 
-    for fmt in raw_formats {
+    for (fmt, from_muxed_list) in raw_entries {
         let Some(parsed_url) = parse_format_url(fmt) else {
             continue;
         };
@@ -2329,137 +2669,171 @@ fn collect_audio_candidates(
             .and_then(|v| v.as_str())
             .unwrap_or_default();
         let mime_lower = mime.to_ascii_lowercase();
-        if !mime_lower.starts_with("audio/") {
+        let is_audio_mime = mime_lower.starts_with("audio/");
+        let has_audio_meta = is_audio_mime
+            || from_muxed_list
+            || fmt.get("audioQuality").is_some()
+            || fmt.get("audioChannels").is_some();
+        if !has_audio_meta {
             continue;
         }
-        if fmt.get("isDrc").and_then(|v| v.as_bool()) == Some(true) {
+        let is_muxed = !is_audio_mime;
+        let (ext, acodec, vcodec) = infer_direct_ext_and_codecs(&mime_lower, is_muxed);
+        if acodec == "none" {
             continue;
         }
-        if let Some(track) = fmt.get("audioTrack")
-            && track.get("audioIsDefault").and_then(|v| v.as_bool()) == Some(false)
-        {
+
+        if !seen_urls.insert(parsed_url.base_url.clone()) {
             continue;
         }
+
+        let is_drc = fmt.get("isDrc").and_then(|v| v.as_bool()) == Some(true);
+        let (is_default_audio_track, is_original_audio_track) =
+            if let Some(track) = fmt.get("audioTrack") {
+                let is_def = track
+                    .get("audioIsDefault")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let id_str = track.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                let name_lower = track
+                    .get("displayName")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                let is_orig =
+                    is_def || id_str.contains(".4") || name_lower.contains("original");
+                (is_def, is_orig)
+            } else {
+                (true, true)
+            };
 
         let bitrate = fmt
-            .get("bitrate")
+            .get("averageBitrate")
             .and_then(|v| v.as_u64())
-            .or_else(|| fmt.get("averageBitrate").and_then(|v| v.as_u64()))
+            .or_else(|| fmt.get("bitrate").and_then(|v| v.as_u64()))
             .unwrap_or(0);
+        let kbps = (bitrate > 0).then(|| (bitrate as f64) / 1000.0);
+        let abr = if is_muxed { None } else { kbps };
+        let tbr = kbps;
+        let asr = fmt
+            .get("audioSampleRate")
+            .and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+            });
+        let audio_channels = fmt
+            .get("audioChannels")
+            .and_then(|v| v.as_u64())
+            .and_then(|n| u32::try_from(n).ok());
+        let filesize = fmt.get("contentLength").and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+        });
         let itag = fmt.get("itag").and_then(|v| v.as_u64()).unwrap_or(0);
-        let (ext, acodec) = infer_ext_and_codec(&mime_lower);
+        let format_id = if is_drc && itag > 0 {
+            format!("{itag}-drc")
+        } else {
+            itag.to_string()
+        };
 
-        let candidate = AudioCandidate {
-            stream: ResolvedAudioStream {
-                video_id: video_id.to_owned(),
-                title: title.clone(),
-                url: parsed_url.base_url,
-                mime_type: mime.to_owned(),
+        let stream = ResolvedAudioStream {
+            video_id: video_meta.video_id.clone(),
+            title: video_meta.title.clone(),
+            url: parsed_url.base_url,
+            mime_type: mime.to_owned(),
+            ext: ext.clone(),
+            acodec: acodec.clone(),
+            vcodec: vcodec.clone(),
+            format_id: format_id.clone(),
+            bitrate,
+            abr,
+            tbr,
+            asr,
+            audio_channels,
+            filesize,
+            duration_secs: video_meta.duration_secs,
+            protocol: "https".to_owned(),
+            uploader: video_meta.uploader.clone(),
+            channel_id: video_meta.channel_id.clone(),
+            thumbnail: video_meta.thumbnail.clone(),
+            user_agent: user_agent.to_owned(),
+            is_hls: false,
+            formats_json: Vec::new(),
+        };
+
+        candidates.push(AudioCandidate {
+            stream,
+            meta: CandidateFormatMeta {
+                format_id,
                 ext,
+                protocol: "https".to_owned(),
                 acodec,
-                format_id: itag.to_string(),
-                bitrate,
-                duration_secs,
-                user_agent: user_agent.to_owned(),
+                vcodec,
+                abr,
+                tbr,
+                asr,
+                audio_channels,
+                filesize,
+                is_drc,
+                is_default_audio_track,
+                is_original_audio_track,
                 is_hls: false,
+                is_muxed,
             },
             cipher_s: parsed_url.s,
             cipher_sp: parsed_url.sp,
-        };
-
-        let is_mp4 = mime_lower.starts_with("audio/mp4");
-        let is_webm = mime_lower.starts_with("audio/webm");
-
-        if prefer_mp4 && is_mp4 {
-            let tier = if mime_lower.contains("mp4a") || matches!(itag, 139..=141) {
-                match itag {
-                    141 => 4,
-                    140 => 3,
-                    139 => 1,
-                    _ => 2,
-                }
-            } else {
-                0
-            };
-            preferred.push((tier, bitrate, candidate.clone()));
-        } else if wants_webm && is_webm {
-            preferred.push((1, bitrate, candidate.clone()));
-        }
-
-        fallback.push((bitrate, candidate));
-    }
-
-    preferred.sort_by_key(|a| std::cmp::Reverse((a.0, a.1)));
-    fallback.sort_by_key(|a| std::cmp::Reverse(a.0));
-
-    let mut ordered: Vec<AudioCandidate> = Vec::new();
-    let mut seen_urls = HashSet::new();
-
-    for (_, _, cand) in preferred {
-        if seen_urls.insert(cand.stream.url.clone()) {
-            ordered.push(cand);
-        }
-    }
-    for (_, cand) in fallback {
-        if seen_urls.insert(cand.stream.url.clone()) {
-            ordered.push(cand);
-        }
-    }
-
-    if let Some(hls) = payload
-        .pointer("/streamingData/hlsManifestUrl")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        && seen_urls.insert(hls.to_owned())
-    {
-        ordered.push(AudioCandidate {
-            stream: ResolvedAudioStream {
-                video_id: video_id.to_owned(),
-                title,
-                url: hls.to_owned(),
-                mime_type: "application/vnd.apple.mpegurl".to_owned(),
-                ext: "m3u8".to_owned(),
-                acodec: if wants_m3u8 { "aac" } else { "unknown" }.to_owned(),
-                format_id: "hls".to_owned(),
-                bitrate: 0,
-                duration_secs,
-                user_agent: user_agent.to_owned(),
-                is_hls: true,
-            },
-            cipher_s: None,
-            cipher_sp: "signature".to_owned(),
         });
     }
 
-    if ordered.is_empty() {
+    let hls_manifest_url = if skip_hls {
+        None
+    } else {
+        payload
+            .pointer("/streamingData/hlsManifestUrl")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+
+    if candidates.is_empty() && hls_manifest_url.is_none() {
         return Err(SelectionError::NoFormat(
-            "no direct audio stream listed in streamingData".to_owned(),
+            "no audio stream listed in streamingData".to_owned(),
         ));
     }
 
-    Ok(ordered)
+    Ok(ExtractedPlayerFormats {
+        video_meta,
+        candidates,
+        hls_manifest_url,
+    })
 }
 
-fn infer_ext_and_codec(mime_lower: &str) -> (String, String) {
-    let ext = if mime_lower.starts_with("audio/mp4") {
-        "m4a"
-    } else if mime_lower.starts_with("audio/webm") {
-        "webm"
-    } else if mime_lower.starts_with("audio/mpeg") {
-        "mp3"
-    } else {
-        "audio"
-    };
-    let acodec = if mime_lower.contains("opus") {
-        "opus"
-    } else if mime_lower.contains("mp4a") {
-        "mp4a.40.2"
-    } else if mime_lower.contains("vorbis") {
-        "vorbis"
-    } else {
-        "unknown"
-    };
-    (ext.to_owned(), acodec.to_owned())
+#[cfg(test)]
+fn collect_audio_candidates(
+    payload: &Value,
+    video_id: &str,
+    user_agent: &str,
+    format_expr: Option<&str>,
+    prefer_mobile_aac: bool,
+) -> Result<Vec<AudioCandidate>, SelectionError> {
+    let extracted = extract_raw_player_candidates(payload, video_id, user_agent, false)?;
+    let selector = FormatSelector::parse(format_expr.unwrap_or(""));
+    let metas: Vec<CandidateFormatMeta> = extracted
+        .candidates
+        .iter()
+        .map(|c| c.meta.clone())
+        .collect();
+    let indices = selector.select_indices(&metas, prefer_mobile_aac);
+    let ordered: Vec<AudioCandidate> = indices
+        .into_iter()
+        .map(|i| extracted.candidates[i].clone())
+        .collect();
+    if ordered.is_empty() {
+        return Err(SelectionError::NoFormat(
+            "no audio stream matched format selector".to_owned(),
+        ));
+    }
+    Ok(ordered)
 }
 
 /// Pure-Rust in-process `yt-dlp` runtime engine.
@@ -2555,12 +2929,14 @@ impl VirtualYtdlpShim {
                 };
 
                 let verify = !is_loopback_origin(&base_origin);
-                let resolved = rt.block_on(resolve_innertube_stream_with_cache(
+                let ext_args = YoutubeExtractorArgs::parse(&parsed.extractor_args);
+                let resolved = rt.block_on(resolve_innertube_stream_with_extractor_args(
                     &http_client,
                     &base_origin,
                     &video_id,
                     cookie.as_deref(),
                     parsed.format_expr.as_deref(),
+                    &ext_args,
                     prefer_mobile_aac,
                     verify,
                     cache_dir.as_deref(),
@@ -2587,6 +2963,122 @@ impl VirtualYtdlpShim {
     }
 }
 
+fn build_dump_json_value(
+    stream: &ResolvedAudioStream,
+    http_headers: serde_json::Map<String, Value>,
+) -> Value {
+    let abr_val = stream
+        .abr
+        .map(|v| json!(v))
+        .unwrap_or_else(|| json!((stream.bitrate as f64) / 1000.0));
+    let tbr_val = stream
+        .tbr
+        .map(|v| json!(v))
+        .unwrap_or_else(|| json!((stream.bitrate as f64) / 1000.0));
+    json!({
+        "id": stream.video_id,
+        "title": stream.title,
+        "url": stream.url,
+        "ext": stream.ext,
+        "acodec": stream.acodec,
+        "vcodec": stream.vcodec,
+        "format_id": stream.format_id,
+        "abr": abr_val,
+        "tbr": tbr_val,
+        "asr": stream.asr,
+        "audio_channels": stream.audio_channels,
+        "filesize": stream.filesize,
+        "duration": stream.duration_secs,
+        "protocol": if stream.protocol.is_empty() {
+            if stream.is_hls { "m3u8_native" } else { "https" }
+        } else {
+            stream.protocol.as_str()
+        },
+        "uploader": stream.uploader,
+        "channel_id": stream.channel_id,
+        "thumbnail": stream.thumbnail,
+        "http_headers": http_headers,
+        "formats": stream.formats_json,
+    })
+}
+
+fn json_field_to_print_string(val: Option<&Value>) -> String {
+    match val {
+        None | Some(Value::Null) => "NA".to_owned(),
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::Bool(b)) => b.to_string(),
+        Some(other) => other.to_string(),
+    }
+}
+
+fn render_print_template(tpl: &str, info: &Value) -> String {
+    let trimmed = tpl.trim();
+    // 1. Exact `%(.{f1,f2,...})j` arbitrary JSON projection.
+    if let Some(inner) = trimmed
+        .strip_prefix("%(.{")
+        .and_then(|s| s.strip_suffix("})j"))
+    {
+        let mut projected = serde_json::Map::new();
+        for field in inner.split(',') {
+            let key = field.trim();
+            if key.is_empty() {
+                continue;
+            }
+            if let Some(v) = info.get(key) {
+                projected.insert(key.to_owned(), v.clone());
+            }
+        }
+        return Value::Object(projected).to_string();
+    }
+
+    // 2. Bare field name without `%` (e.g. `url`, `id`, `title`, `ext`, `acodec`, `format_id`, `abr`, `duration`).
+    if !trimmed.contains('%') {
+        if let Some(val) = info.get(trimmed) {
+            return json_field_to_print_string(Some(val));
+        }
+        return trimmed.to_owned();
+    }
+
+    // 3. Interpolate `%(field)s`, `%(field)j`, `%(field)d`, `%(.{f1,f2})j` tokens inside arbitrary templates.
+    let mut out = String::with_capacity(trimmed.len() + 32);
+    let mut rest = trimmed;
+    while let Some(pos) = rest.find("%(") {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + 2..];
+        let Some(close) = after.find(')') else {
+            out.push_str(&rest[pos..]);
+            rest = "";
+            break;
+        };
+        let key_expr = &after[..close];
+        let spec_char = after[close + 1..].chars().next();
+        let advance = close + 1 + spec_char.map_or(0, char::len_utf8);
+        if let Some(proj) = key_expr.strip_prefix(".{").and_then(|s| s.strip_suffix('}')) {
+            let mut projected = serde_json::Map::new();
+            for field in proj.split(',') {
+                let k = field.trim();
+                if !k.is_empty()
+                    && let Some(v) = info.get(k)
+                {
+                    projected.insert(k.to_owned(), v.clone());
+                }
+            }
+            out.push_str(&Value::Object(projected).to_string());
+        } else {
+            let val = info.get(key_expr.trim());
+            if spec_char == Some('j') {
+                out.push_str(&val.cloned().unwrap_or(Value::Null).to_string());
+            } else {
+                out.push_str(&json_field_to_print_string(val));
+            }
+        }
+        rest = &after[advance..];
+    }
+    out.push_str(rest);
+    out
+}
+
 fn format_ytdlp_output(stream: &ResolvedAudioStream, parsed: &YtdlpParsedArgs) -> String {
     let mut http_headers = serde_json::Map::new();
     // Always advertise the winning InnerTube client's User-Agent so googlevideo.com
@@ -2603,26 +3095,21 @@ fn format_ytdlp_output(stream: &ResolvedAudioStream, parsed: &YtdlpParsedArgs) -
         }
     }
 
+    let info = build_dump_json_value(stream, http_headers);
+
+    if parsed.output_mode == YtdlpOutputMode::DumpJson {
+        return info.to_string();
+    }
+    if let Some(ref tpl) = parsed.print_template {
+        return render_print_template(tpl, &info);
+    }
+
     match parsed.output_mode {
-        YtdlpOutputMode::PrintUrlAndHeadersJson => json!({
-            "url": stream.url,
-            "http_headers": http_headers
-        })
-        .to_string(),
+        YtdlpOutputMode::PrintUrlAndHeadersJson => {
+            render_print_template("%(.{url,http_headers})j", &info)
+        }
         YtdlpOutputMode::PrintUrl => stream.url.clone(),
-        YtdlpOutputMode::DumpJson => json!({
-            "id": stream.video_id,
-            "title": stream.title,
-            "url": stream.url,
-            "ext": stream.ext,
-            "acodec": stream.acodec,
-            "format_id": stream.format_id,
-            "abr": stream.bitrate / 1000,
-            "duration": stream.duration_secs,
-            "protocol": if stream.is_hls { "m3u8_native" } else { "https" },
-            "http_headers": http_headers
-        })
-        .to_string(),
+        YtdlpOutputMode::DumpJson => info.to_string(),
     }
 }
 
@@ -2690,6 +3177,7 @@ impl VirtualProcessShim for YtdlpVirtualShim {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::yt_clients::{ANDROID_UA, WEB_SAFARI_UA};
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -3308,6 +3796,7 @@ mod tests {
 
         // 1. Primary (`music.youtube.com`) fails -> falls back to secondary (`www.youtube.com`)
         //    ANDROID(anon) with matching Origin/X-Origin and NO SAPISIDHASH / Cookie headers.
+        let default_ext = YoutubeExtractorArgs::default();
         let resolved = rt
             .block_on(resolve_innertube_stream_inner(
                 &client,
@@ -3316,6 +3805,7 @@ mod tests {
                 "DUAL_ORIGIN_OK",
                 Some("SAPISID=dual_origin_secret"),
                 None,
+                &default_ext,
                 true,
                 false,
                 Duration::from_secs(10),
@@ -3342,6 +3832,7 @@ mod tests {
                 "SLOW_BUDGET",
                 Some("SAPISID=dual_origin_secret"),
                 None,
+                &default_ext,
                 true,
                 false,
                 Duration::from_millis(320),
@@ -3684,11 +4175,22 @@ https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/94/n/hlsN001/ind
             mime_type: "application/vnd.apple.mpegurl".to_owned(),
             ext: "m3u8".to_owned(),
             acodec: "aac".to_owned(),
+            vcodec: "none".to_owned(),
             format_id: "hls".to_owned(),
             bitrate: 0,
+            abr: None,
+            tbr: None,
+            asr: None,
+            audio_channels: Some(2),
+            filesize: None,
             duration_secs: None,
+            protocol: "m3u8_native".to_owned(),
+            uploader: String::new(),
+            channel_id: String::new(),
+            thumbnail: String::new(),
             user_agent: WEB_SAFARI_UA.to_owned(),
             is_hls: true,
+            formats_json: Vec::new(),
         };
 
         let bad_res = rt.block_on(verify_candidate_stream_url(
@@ -3813,6 +4315,372 @@ https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/94/n/hlsN001/ind
             stream2.is_hls,
             stream2.mime_type,
             sanitize_url_for_log(&stream2.url),
+        );
+
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    #[test]
+    fn hls_multi_variant_expansion_and_print_templates_and_dump_json_fields() {
+        let meta = VideoMeta {
+            video_id: "vidHls00001".to_owned(),
+            title: "Test Track".to_owned(),
+            duration_secs: Some(215),
+            uploader: "Test Artist".to_owned(),
+            channel_id: "UCtest123".to_owned(),
+            thumbnail: "https://i.ytimg.com/vi/vidHls00001/maxresdefault.jpg".to_owned(),
+        };
+        let master = "\
+#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=86008,CODECS=\"avc1.42c00c,mp4a.40.5\"
+https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/91/n/n91/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=122443,CODECS=\"avc1.4d4015,mp4a.40.5\"
+https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/92/n/n92/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=263884,CODECS=\"avc1.4d401e,mp4a.40.2\"
+https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/93/n/n93/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=322741,CODECS=\"avc1.4d401f,mp4a.40.2\"
+https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/94/n/n94/index.m3u8
+";
+        let expanded = expand_hls_master_variants(
+            "https://manifest.googlevideo.com/master.m3u8",
+            master,
+            &meta,
+            WEB_SAFARI_UA,
+        );
+        assert_eq!(expanded.len(), 4);
+        let metas: Vec<CandidateFormatMeta> = expanded.iter().map(|c| c.meta.clone()).collect();
+        let sel = FormatSelector::parse("bestaudio[protocol^=m3u8]/93/94/92/95/91");
+        let chosen = sel.select_indices(&metas, true);
+        let chosen_ids: Vec<&str> = chosen
+            .iter()
+            .map(|&i| expanded[i].meta.format_id.as_str())
+            .collect();
+        assert_eq!(chosen_ids, vec!["93", "94", "92", "91"]);
+
+        // Test arbitrary `--print` templates, arbitrary JSON projections, and complete `-j` dump fields.
+        let mut sample_stream = expanded[chosen[0]].stream.clone();
+        sample_stream.asr = Some(44100);
+        sample_stream.filesize = Some(4_567_890);
+        sample_stream.formats_json = expanded
+            .iter()
+            .map(candidate_to_format_summary_json)
+            .collect();
+
+        let p_dump = parse_ytdlp_args(&["-j".to_owned(), "vidHls00001".to_owned()]);
+        let dump_val: Value =
+            serde_json::from_str(&format_ytdlp_output(&sample_stream, &p_dump)).unwrap();
+        for req_field in [
+            "id",
+            "title",
+            "url",
+            "ext",
+            "acodec",
+            "vcodec",
+            "format_id",
+            "abr",
+            "tbr",
+            "asr",
+            "audio_channels",
+            "filesize",
+            "duration",
+            "protocol",
+            "uploader",
+            "channel_id",
+            "thumbnail",
+            "http_headers",
+            "formats",
+        ] {
+            assert!(
+                dump_val.get(req_field).is_some(),
+                "dump-json missing `{req_field}`: {dump_val}"
+            );
+        }
+        assert_eq!(dump_val["format_id"], "93");
+        assert_eq!(dump_val["protocol"], "m3u8_native");
+        assert_eq!(dump_val["formats"].as_array().unwrap().len(), 4);
+
+        // Arbitrary JSON projection `%(.{id,format_id,ext,acodec,uploader})j`.
+        let p_proj = parse_ytdlp_args(&[
+            "--print".to_owned(),
+            "%(.{id,format_id,ext,acodec,uploader})j".to_owned(),
+            "vidHls00001".to_owned(),
+        ]);
+        let proj_val: Value =
+            serde_json::from_str(&format_ytdlp_output(&sample_stream, &p_proj)).unwrap();
+        assert_eq!(proj_val["id"], "vidHls00001");
+        assert_eq!(proj_val["format_id"], "93");
+        assert_eq!(proj_val["ext"], "m3u8");
+        assert_eq!(proj_val["acodec"], "mp4a.40.2");
+        assert_eq!(proj_val["uploader"], "Test Artist");
+        assert!(proj_val.get("url").is_none());
+
+        // Interpolated string template and bare field templates.
+        let p_interp = parse_ytdlp_args(&[
+            "--print".to_owned(),
+            "%(id)s - %(title)s [%(format_id)s.%(ext)s]".to_owned(),
+            "vidHls00001".to_owned(),
+        ]);
+        assert_eq!(
+            format_ytdlp_output(&sample_stream, &p_interp),
+            "vidHls00001 - Test Track [93.m3u8]"
+        );
+
+        let p_bare_title = parse_ytdlp_args(&[
+            "--print".to_owned(),
+            "title".to_owned(),
+            "vidHls00001".to_owned(),
+        ]);
+        assert_eq!(format_ytdlp_output(&sample_stream, &p_bare_title), "Test Track");
+    }
+
+    #[test]
+    fn extractor_args_end_to_end_player_client_po_token_skip_hls_and_lang() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ext args mock");
+        let port = listener.local_addr().unwrap().port();
+        let origin = format!("http://127.0.0.1:{port}");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_srv = Arc::clone(&stop);
+        let saw_bootstrap_logged_in = Arc::new(AtomicBool::new(false));
+        let saw_boot_srv = Arc::clone(&saw_bootstrap_logged_in);
+        let saw_multi_sapisid = Arc::new(AtomicBool::new(false));
+        let saw_auth_srv = Arc::clone(&saw_multi_sapisid);
+        let saw_player_pot_and_lang = Arc::new(AtomicBool::new(false));
+        let saw_pot_srv = Arc::clone(&saw_player_pot_and_lang);
+        let _ = listener.set_nonblocking(true);
+
+        let srv = std::thread::spawn(move || {
+            while !stop_srv.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let req = read_http_request(&mut stream);
+                        let req_lower = req.to_ascii_lowercase();
+                        if req_lower.contains("x-youtube-bootstrap-logged-in: true") {
+                            saw_boot_srv.store(true, Ordering::SeqCst);
+                        }
+                        if req_lower.contains("sapisidhash ")
+                            && req_lower.contains("sapisid1phash ")
+                            && req_lower.contains("sapisid3phash ")
+                        {
+                            saw_auth_srv.store(true, Ordering::SeqCst);
+                        }
+                        if req.contains("\"poToken\":\"PL_TOK_99\"")
+                            && req.contains("\"hl\":\"ja\"")
+                            && req.contains("\"visitorData\":\"EXPLICIT_VIS_7\"")
+                            && req.contains("\"clientName\":\"WEB\"")
+                        {
+                            saw_pot_srv.store(true, Ordering::SeqCst);
+                        }
+
+                        let body = json!({
+                            "playabilityStatus": { "status": "OK" },
+                            "videoDetails": { "title": "Ext Args Track", "lengthSeconds": "150" },
+                            "streamingData": {
+                                "adaptiveFormats": [
+                                    {
+                                        "itag": 140,
+                                        "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"",
+                                        "bitrate": 128000,
+                                        "url": "https://cdn.example.test/videoplayback?itag=140"
+                                    }
+                                ],
+                                "hlsManifestUrl": "https://cdn.example.test/ignored.m3u8"
+                            }
+                        })
+                        .to_string();
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let args: Vec<String> = [
+            "--config-locations",
+            "-",
+            "--extractor-args",
+            "youtube:player_client=web_safari;lang=ja;visitor_data=EXPLICIT_VIS_7;po_token=web_safari.player+PL_TOK_99,web_safari.gvs+GVS_TOK_77;skip=hls,dash",
+            "--format",
+            "bestaudio[protocol^=http]/bestaudio",
+            "--print",
+            "%(.{url,http_headers})j",
+            "https://www.youtube.com/watch?v=EXTARG00001",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+
+        let pipe = VirtualYtdlpShim::spawn_with_origin(
+            &args,
+            reqwest::Client::new(),
+            origin,
+            true,
+        );
+        pipe.write_stdin(
+            "--add-headers \"Cookie:SAPISID=s0; __Secure-1PAPISID=s1; __Secure-3PAPISID=s3\"\n",
+        )
+        .unwrap();
+        pipe.close_stdin();
+
+        let line = pipe.read_line_blocking().expect("json output");
+        assert_eq!(pipe.wait(), 0);
+        let parsed: Value = serde_json::from_str(&line).expect("valid JSON");
+        let resolved_url = parsed["url"].as_str().expect("url string");
+        assert!(
+            resolved_url.contains("pot=GVS_TOK_77"),
+            "GVS po_token should be appended to URL: {resolved_url}"
+        );
+        assert_eq!(parsed["http_headers"]["User-Agent"], WEB_SAFARI_UA);
+        assert!(saw_bootstrap_logged_in.load(Ordering::SeqCst));
+        assert!(saw_multi_sapisid.load(Ordering::SeqCst));
+        assert!(saw_player_pot_and_lang.load(Ordering::SeqCst));
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = srv.join();
+    }
+
+    fn load_local_mac_ytm_cookie() -> Option<String> {
+        std::env::var("NSH_YTM_COOKIE")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                let base = dirs::data_dir()?
+                    .join("nsh-music")
+                    .join("plugin-data")
+                    .join("youtube-music");
+                for fname in ["settings.json", "storage.json"] {
+                    if let Ok(raw) = std::fs::read_to_string(base.join(fname))
+                        && let Ok(val) = serde_json::from_str::<Value>(&raw)
+                        && let Some(c) = val
+                            .get("cookie")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.trim().is_empty())
+                    {
+                        return Some(c.to_owned());
+                    }
+                }
+                None
+            })
+    }
+
+    #[test]
+    #[ignore = "live network test verifying exact youtube-music/index.js CLI invocations on 1_8jBVA9a3U"]
+    fn live_yt_ejs_matches_youtube_music_plugin_cli_invocations() {
+        let cookie = load_local_mac_ytm_cookie();
+        let cache_dir = std::env::temp_dir().join(format!(
+            "nsh-live-yt-ejs-cli-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        let client = reqwest::Client::new();
+
+        // 1. Exact logged-in `youtube-music/index.js` CLI invocation on `1_8jBVA9a3U`:
+        //    --config-locations - --extractor-args youtube:player_client=web_safari
+        //    --format bestaudio[protocol^=m3u8]/93/94/92/95/91 --print %(.{url,http_headers})j
+        if let Some(ref c) = cookie {
+            let t1 = Instant::now();
+            let logged_in_args: Vec<String> = [
+                "--config-locations",
+                "-",
+                "--extractor-args",
+                "youtube:player_client=web_safari",
+                "--format",
+                "bestaudio[protocol^=m3u8]/93/94/92/95/91",
+                "--print",
+                "%(.{url,http_headers})j",
+                "https://www.youtube.com/watch?v=1_8jBVA9a3U",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+
+            let pipe1 = VirtualYtdlpShim::spawn_with_origin_and_cache(
+                &logged_in_args,
+                client.clone(),
+                DEFAULT_INNERTUBE_ORIGIN.to_owned(),
+                true,
+                Some(cache_dir.clone()),
+            );
+            let escaped = c.replace('\\', "\\\\").replace('"', "\\\"");
+            pipe1
+                .write_stdin(&format!("--add-headers \"Cookie:{escaped}\"\n"))
+                .unwrap();
+            pipe1.close_stdin();
+
+            let out1 = pipe1.read_line_blocking();
+            let code1 = pipe1.wait();
+            let err1 = pipe1.error_output();
+            println!(
+                "CLI #1 (logged-in web_safari HLS): code={code1} elapsed={}ms err={:?}",
+                t1.elapsed().as_millis(),
+                err1.trim()
+            );
+            assert_eq!(code1, 0, "logged-in web_safari CLI failed: {err1}");
+            let line1 = out1.expect("stdout JSON line for logged-in CLI");
+            let parsed1: Value = serde_json::from_str(&line1).expect("valid JSON output");
+            let url1 = parsed1["url"].as_str().expect("url string");
+            println!(
+                "CLI #1 resolved host={} ua={:?}",
+                sanitize_url_for_log(url1),
+                parsed1["http_headers"]["User-Agent"].as_str()
+            );
+            assert!(url1.starts_with("https://"), "expected HTTPS stream URL");
+        } else {
+            println!("CLI #1 skipped: no local Mac YouTube Music cookie found");
+        }
+
+        // 2. Exact logged-out `youtube-music/index.js` CLI invocation on `1_8jBVA9a3U`:
+        //    --extractor-args youtube:skip=hls,dash --format bestaudio[protocol^=http]/bestaudio
+        //    --print %(.{url,http_headers})j
+        let t2 = Instant::now();
+        let logged_out_args: Vec<String> = [
+            "--extractor-args",
+            "youtube:skip=hls,dash",
+            "--format",
+            "bestaudio[protocol^=http]/bestaudio",
+            "--print",
+            "%(.{url,http_headers})j",
+            "https://www.youtube.com/watch?v=1_8jBVA9a3U",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+
+        let pipe2 = VirtualYtdlpShim::spawn_with_origin_and_cache(
+            &logged_out_args,
+            client,
+            DEFAULT_INNERTUBE_ORIGIN.to_owned(),
+            true,
+            Some(cache_dir.clone()),
+        );
+        let out2 = pipe2.read_line_blocking();
+        let code2 = pipe2.wait();
+        let err2 = pipe2.error_output();
+        println!(
+            "CLI #2 (logged-out skip=hls,dash HTTP): code={code2} elapsed={}ms err={:?}",
+            t2.elapsed().as_millis(),
+            err2.trim()
+        );
+        assert_eq!(code2, 0, "logged-out HTTP CLI failed: {err2}");
+        let line2 = out2.expect("stdout JSON line for logged-out CLI");
+        let parsed2: Value = serde_json::from_str(&line2).expect("valid JSON output");
+        let url2 = parsed2["url"].as_str().expect("url string");
+        println!(
+            "CLI #2 resolved host={} ua={:?}",
+            sanitize_url_for_log(url2),
+            parsed2["http_headers"]["User-Agent"].as_str()
+        );
+        assert!(url2.starts_with("https://"), "expected HTTPS stream URL");
+        assert!(
+            !url2.contains(".m3u8"),
+            "skip=hls,dash must not return an HLS manifest URL"
         );
 
         let _ = std::fs::remove_dir_all(&cache_dir);

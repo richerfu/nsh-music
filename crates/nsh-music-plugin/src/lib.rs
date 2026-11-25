@@ -18,7 +18,9 @@ pub mod manifest;
 pub mod mobile_compat;
 pub mod runtime;
 pub mod virtual_ytdlp;
+pub(crate) mod yt_clients;
 pub(crate) mod yt_ejs;
+pub(crate) mod yt_format_selector;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
