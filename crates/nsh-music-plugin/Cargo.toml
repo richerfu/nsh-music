@@ -1,0 +1,26 @@
+[package]
+name = "nsh-music-plugin"
+description = "mygo-music compatible JS/TS plugin runtime (QuickJS + oxc) with host.* APIs, requestHeaders, ZIP/GitHub installer, and virtual FFmpeg integration."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nsh-music-core.workspace = true
+nsh-music-audio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+url.workspace = true
+log.workspace = true
+md-5.workspace = true
+aes.workspace = true
+hex.workspace = true
+zip.workspace = true
+quickjs-jit.workspace = true
+oxc.workspace = true
+qrcode.workspace = true
+dirs.workspace = true

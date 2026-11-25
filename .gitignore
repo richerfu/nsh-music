@@ -1,0 +1,4 @@
+/target
+/.nsh
+*.part
+.DS_Store

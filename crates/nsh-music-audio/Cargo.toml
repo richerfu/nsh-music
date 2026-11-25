@@ -1,0 +1,34 @@
+[package]
+name = "nsh-music-audio"
+description = "Cross-platform audio engine with progressive LRU disk cache, ReplayGain/fade/FFT DSP, Symphonia + optional static audio-only FFmpeg, cpal/OHOS output, and virtual FFmpeg shim."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["audio-symphonia"]
+audio-symphonia = ["dep:symphonia"]
+audio-ffmpeg = ["dep:ffmpeg-sys-next"]
+
+[dependencies]
+nsh-music-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+url.workspace = true
+log.workspace = true
+sha2.workspace = true
+hex.workspace = true
+dirs.workspace = true
+
+symphonia = { workspace = true, optional = true }
+ffmpeg-sys-next = { workspace = true, optional = true }
+
+[target.'cfg(not(any(target_arch = "wasm32", target_env = "ohos")))'.dependencies]
+cpal.workspace = true
+
+[target.'cfg(target_env = "ohos")'.dependencies]
+ohos-audio-binding.workspace = true

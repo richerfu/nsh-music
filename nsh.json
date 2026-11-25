@@ -1,0 +1,33 @@
+{
+  "name": "nsh-music",
+  "id": "com.southorange.nshmusic",
+  "version": "0.1.0",
+  "appearance": "system",
+  "theme": "theme.json",
+  "rust": ".",
+  "root": "App",
+  "schemes": ["nsh-music", "mygo-music"],
+  "capabilities": {
+    "audio": true,
+    "network": {
+      "hosts": ["*"]
+    },
+    "webview": {
+      "hosts": ["*"]
+    }
+  },
+  "harmonyos": {
+    "permissions": [
+      {
+        "name": "ohos.permission.INTERNET",
+        "reason": "Stream music, fetch album artwork, and run music plugins.",
+        "when": "inuse"
+      },
+      {
+        "name": "ohos.permission.KEEP_BACKGROUND_RUNNING",
+        "reason": "Continue audio playback in the background.",
+        "when": "always"
+      }
+    ]
+  }
+}
