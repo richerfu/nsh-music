@@ -13,7 +13,7 @@ use nsh_music_core::model::Track;
 
 use super::{
     controls::{artwork_box, heart_button, icon_button_sized},
-    icons::{Icon, icon},
+    icons::{Icon, icon, icon_reactive},
     motion,
     theme::{self, DeviceForm, colors, font_size, radius},
 };
@@ -237,43 +237,57 @@ impl IntoElement for TrackRow {
 
         let leading_index = index.map(|idx| {
             let idx_str: SharedString = format!("{}", idx + 1).into();
-            let is_active_playing = {
+            let active_idx = active_idx.clone();
+            let playing_eq = playing_eq.clone();
+            let spec_eq = spec_eq.clone();
+            // Hide leading track number on Phone when cover art is already shown
+            // to avoid crowding 390pt rows; album lists (`!show_cover`) keep indices.
+            let show_leading = move || !show_cover || !theme::detect_device_form().is_phone();
+            when(show_leading, move || {
                 let active_idx = active_idx.clone();
                 let playing_eq = playing_eq.clone();
-                move || active_idx.get() && playing_eq.get()
-            };
-            view()
-                .w(px(28.0))
-                .flex_shrink_0()
-                .items_center()
-                .justify_center()
-                .child(
-                    when(is_active_playing, move || {
-                        mini_equalizer(spec_eq.clone(), playing_eq.clone())
-                    })
-                    .otherwise(move || {
-                        let active_inner = active_idx.clone();
-                        let idx_inner = idx_str.clone();
-                        when(move || active_inner.get(), || {
-                            icon(Icon::Play, 13.0, colors::PRIMARY)
+                let spec_eq = spec_eq.clone();
+                let idx_str = idx_str.clone();
+                let is_active_playing = {
+                    let active_idx = active_idx.clone();
+                    let playing_eq = playing_eq.clone();
+                    move || active_idx.get() && playing_eq.get()
+                };
+                view()
+                    .w(px(28.0))
+                    .flex_shrink_0()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        when(is_active_playing, move || {
+                            mini_equalizer(spec_eq.clone(), playing_eq.clone())
                         })
                         .otherwise(move || {
-                            text(idx_inner.clone())
-                                .tabular_nums()
-                                .text_size(px(font_size::CAPTION))
-                                .text_color(theme::muted_fg)
-                        })
-                    }),
-                )
+                            let active_inner = active_idx.clone();
+                            let idx_inner = idx_str.clone();
+                            when(
+                                move || active_inner.get(),
+                                || icon(Icon::Play, 13.0, colors::PRIMARY),
+                            )
+                            .otherwise(move || {
+                                text(idx_inner.clone())
+                                    .tabular_nums()
+                                    .text_size(px(font_size::CAPTION))
+                                    .text_color(theme::muted_fg)
+                            })
+                        }),
+                    )
+            })
         });
 
         let cover_thumb = show_cover.then(|| {
-            let size_pt = if untracked(theme::detect_device_form).is_desktop() {
-                40.0
-            } else {
-                44.0
+            let form = untracked(theme::detect_device_form);
+            let (size_pt, corner) = match form {
+                DeviceForm::Desktop => (40.0, radius::SM),
+                DeviceForm::Pad { .. } => (44.0, radius::SM),
+                DeviceForm::Phone => (46.0, radius::CONTROL),
             };
-            artwork_box(cover_uri, cover_seed, size_pt, radius::SM)
+            artwork_box(cover_uri, cover_seed, size_pt, corner)
         });
 
         let badges_row = (quality_badge.is_some() || source_badge.is_some()).then(|| {
@@ -346,7 +360,13 @@ impl IntoElement for TrackRow {
             .child(
                 text(artists)
                     .number_of_lines(1)
-                    .text_size(px(font_size::CAPTION))
+                    .text_size(move || {
+                        if theme::detect_device_form().is_phone() {
+                            px(12.5)
+                        } else {
+                            px(font_size::CAPTION)
+                        }
+                    })
                     .text_color(theme::muted_fg),
             );
 
@@ -371,11 +391,73 @@ impl IntoElement for TrackRow {
         let trailing = view()
             .flex_row()
             .items_center()
-            .gap_1()
+            .gap(move || {
+                if theme::detect_device_form().is_phone() {
+                    px(2.0)
+                } else {
+                    px(4.0)
+                }
+            })
             .flex_shrink_0()
             .children(on_toggle_like.map(|like_cb| {
                 let liked_label: SharedString = format!("Like {title}").into();
-                heart_button(liked, liked_label, move || like_cb())
+                if untracked(theme::detect_device_form).is_phone() {
+                    // Visually compact 34pt heart with 5pt hit_slop (>= 44pt effective tap
+                    // target) so Phone rows stay airy on 390pt widths.
+                    let liked_icon = liked.clone();
+                    let liked_tint = liked.clone();
+                    let liked_sel = liked;
+                    let scale = animated_value(1.0);
+                    let was_liked = stored(untracked(|| liked_sel.get()));
+                    {
+                        let liked_eff = liked_sel.clone();
+                        effect(move || {
+                            let now = liked_eff.get();
+                            if was_liked.replace(now) != now && now {
+                                motion::pulse_pop(&scale);
+                            }
+                        });
+                    }
+                    button()
+                        .selected(move || liked_sel.get())
+                        .on_press(move || like_cb())
+                        .accessibility_label(liked_label)
+                        .hit_slop(EdgeInsets::all(px(5.0)))
+                        .size(px(34.0))
+                        .flex_shrink_0()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .bg(colors::TRANSPARENT)
+                        .hover(|s| s.bg(theme::hover))
+                        .active(|s| s.bg(theme::press))
+                        .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
+                        .child(
+                            view()
+                                .pointer_events(PointerEvents::None)
+                                .bind_scale(&scale)
+                                .child(icon_reactive(
+                                    move || {
+                                        if liked_icon.get() {
+                                            Icon::HeartFilled
+                                        } else {
+                                            Icon::Heart
+                                        }
+                                    },
+                                    17.0,
+                                    move || {
+                                        if liked_tint.get() {
+                                            theme::primary()
+                                        } else {
+                                            theme::muted_fg()
+                                        }
+                                    },
+                                )),
+                        )
+                        .into_element()
+                } else {
+                    heart_button(liked, liked_label, move || like_cb()).into_element()
+                }
             }))
             .child(when(
                 move || !theme::detect_device_form().is_phone(),
@@ -405,11 +487,29 @@ impl IntoElement for TrackRow {
         view()
             .w_full()
             .min_h(row_min_h)
-            .px_2p5()
-            .py_1()
+            .px(move || {
+                if theme::detect_device_form().is_phone() {
+                    px(8.0)
+                } else {
+                    px(10.0)
+                }
+            })
+            .py(move || {
+                if theme::detect_device_form().is_phone() {
+                    px(6.0)
+                } else {
+                    px(4.0)
+                }
+            })
             .flex_row()
             .items_center()
-            .gap_3()
+            .gap(move || {
+                if theme::detect_device_form().is_phone() {
+                    px(10.0)
+                } else {
+                    px(12.0)
+                }
+            })
             .rounded(px(radius::CONTROL))
             .bg(move || {
                 if active_bg.get() {
@@ -436,7 +536,13 @@ impl IntoElement for TrackRow {
                     .min_h(move || px(theme::detect_device_form().min_touch_target()))
                     .flex_row()
                     .items_center()
-                    .gap_3()
+                    .gap(move || {
+                        if theme::detect_device_form().is_phone() {
+                            px(10.0)
+                        } else {
+                            px(12.0)
+                        }
+                    })
                     .active(|s| s.opacity(0.75))
                     .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
                     .children(leading_index)

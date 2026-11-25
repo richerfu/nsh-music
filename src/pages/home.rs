@@ -1,29 +1,37 @@
 //! Home / Discover page aligned with `mygo-music`: clean empty onboarding state,
-//! shimmer loading skeletons, Daily Mix stacked 3-cover hover fan-out card with
-//! peeking vinyl, and responsive section shelves.
+//! shimmer loading skeletons, animated refresh spinner, Daily Mix stacked
+//! 3-cover hover fan-out card with peeking vinyl, and responsive section shelves.
+
+use std::rc::Rc;
 
 use nsh_base::button;
 use nsh_core::prelude::*;
 use nsh_music_core::model::{Section, Track};
 
 use crate::pages::{
-    page_scroll, render_browse_sections, shimmer_card_grid, shimmer_track_list, shuffle_and_play,
+    ARTWORK_SIZE_CARD, hero_play_shuffle_buttons, page_scroll, render_browse_sections,
+    shimmer_card_grid, shimmer_track_list, shuffle_and_play, sized_track_cover,
 };
-use crate::state::{ActiveModal, AppStore, ArtworkLoader, Route};
+use crate::state::{AppStore, ArtworkLoader, Route};
+use crate::ui::theme::{colors, font_size, radius};
 use crate::ui::{
     DeviceForm, Elevated, Elevation, Icon, artwork_box, empty_state_with_actions, ghost_button,
-    icon_button_sized, motion, primary_button, source_pill, theme,
+    icon, loading_spinner, motion, primary_button, theme,
 };
-use crate::ui::theme::{colors, font_size, radius};
 
 pub fn home_page(store: AppStore, form: DeviceForm) -> View {
+    let show_skeleton = computed(move || {
+        store.browse_loading.get() && store.home_data.with(|h| h.sections.is_empty())
+    });
+
     let body = view()
         .w_full()
         .gap_6()
-        .child(top_header(store, form))
+        .children((!form.is_phone()).then(|| top_header(store, form)))
         .child(dynamic(move || {
-            let loading = store.browse_loading.get();
+            let loading = show_skeleton.get();
             let home = store.home_data.get();
+            let active_entry = store.active_source_entry();
 
             untracked(move || {
                 if loading && home.sections.is_empty() {
@@ -31,25 +39,111 @@ pub fn home_page(store: AppStore, form: DeviceForm) -> View {
                         .w_full()
                         .gap_6()
                         .child(shimmer_card_grid(store, form, 6, false))
-                        .child(shimmer_track_list(5))
+                        .child(shimmer_track_list(6))
                         .into_element();
                 }
 
                 if home.sections.is_empty() {
+                    let min_h = px(form.min_touch_target());
+                    if let Some(plugin_entry) = active_entry.as_ref().filter(|e| !e.is_local) {
+                        let plugin_name = plugin_entry.info.name.clone();
+                        let supports_sign_in = plugin_entry.capabilities.contains("signIn")
+                            || plugin_entry.capabilities.contains("qrSignIn");
+                        let needs_sign_in = plugin_entry.account.is_none() && supports_sign_in;
+
+                        if needs_sign_in {
+                            let sid = plugin_entry.info.id.clone();
+                            let actions = view()
+                                .flex_row()
+                                .items_center()
+                                .justify_center()
+                                .flex_wrap()
+                                .gap_3()
+                                .child(
+                                    primary_button(
+                                        move || store.t("nav.sign_in"),
+                                        move || store.sign_in_source(&sid),
+                                    )
+                                    .min_h(min_h),
+                                )
+                                .child(
+                                    ghost_button(
+                                        move || store.t("common.refresh"),
+                                        move || store.refresh_home(),
+                                    )
+                                    .min_h(min_h),
+                                );
+
+                            return empty_state_with_actions(
+                                Icon::Globe,
+                                move || store.t("dialog.sign_in_required.title"),
+                                move || {
+                                    SharedString::from(format!(
+                                        "{plugin_name} · {}",
+                                        store.t("plugins.not_signed_in")
+                                    ))
+                                },
+                                actions,
+                            )
+                            .into_element();
+                        }
+
+                        let actions = view()
+                            .flex_row()
+                            .items_center()
+                            .justify_center()
+                            .flex_wrap()
+                            .gap_3()
+                            .child(
+                                primary_button(
+                                    move || store.t("common.refresh"),
+                                    move || store.refresh_home(),
+                                )
+                                .min_h(min_h),
+                            )
+                            .child(
+                                ghost_button(
+                                    move || store.t("nav.plugins"),
+                                    move || store.navigate(Route::Plugins),
+                                )
+                                .min_h(min_h),
+                            );
+
+                        return empty_state_with_actions(
+                            Icon::Globe,
+                            move || store.t("browse.empty"),
+                            move || {
+                                SharedString::from(format!(
+                                    "{plugin_name} · {}",
+                                    store.t("nav.discover")
+                                ))
+                            },
+                            actions,
+                        )
+                        .into_element();
+                    }
+
                     let actions = view()
                         .flex_row()
                         .items_center()
                         .justify_center()
                         .flex_wrap()
-                        .gap_2p5()
-                        .child(primary_button(
-                            move || store.t("home.add_folder"),
-                            move || store.pick_local_music_folders(),
-                        ))
-                        .child(ghost_button(
-                            move || store.t("home.install_plugin"),
-                            move || store.navigate(Route::Plugins),
-                        ));
+                        .gap_3()
+                        .child(
+                            primary_button(
+                                move || store.t("home.add_folder"),
+                                move || store.pick_local_music_folders(),
+                            )
+                            .min_h(min_h),
+                        )
+                        .child(
+                            ghost_button(
+                                move || store.t("home.install_plugin"),
+                                move || store.navigate(Route::Plugins),
+                            )
+                            .min_h(min_h),
+                        );
+
                     return empty_state_with_actions(
                         Icon::Disc,
                         move || store.t("home.empty_title"),
@@ -92,6 +186,7 @@ fn top_header(store: AppStore, form: DeviceForm) -> View {
             }
         })
     });
+    let btn_size = if form.is_touch() { 44.0 } else { 34.0 };
 
     view()
         .w_full()
@@ -113,23 +208,27 @@ fn top_header(store: AppStore, form: DeviceForm) -> View {
                 .text_color(theme::fg),
         )
         .child(
-            view()
-                .flex_row()
+            button()
+                .on_press(move || store.refresh_home())
+                .disabled(move || store.browse_loading.get())
+                .accessibility_label(move || Some(store.t("common.refresh")))
+                .size(px(btn_size))
+                .rounded_full()
                 .items_center()
-                .gap_2()
-                .child(source_pill(
-                    move || store.active_source_name(),
-                    true,
-                    move || store.open_modal(ActiveModal::SourceSwitcher),
-                ))
-                .child(icon_button_sized(
-                    Icon::Refresh,
-                    34.0,
-                    16.0,
-                    theme::muted_fg,
-                    move || store.t("common.refresh"),
-                    move || store.refresh_home(),
-                )),
+                .justify_center()
+                .bg(colors::TRANSPARENT)
+                .transition_colors()
+                .duration(move || motion::transition_ms(140.0))
+                .hover(|s| s.bg(theme::hover))
+                .active(|s| s.scale(motion::press_scale))
+                .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
+                .child(
+                    when(
+                        move || store.browse_loading.get(),
+                        || loading_spinner(16.0, colors::PRIMARY),
+                    )
+                    .otherwise(|| icon(Icon::Refresh, 16.0, colors::MUTED_FOREGROUND)),
+                ),
         )
 }
 
@@ -164,11 +263,7 @@ fn daily_mix_spotlight_card(
 ) -> View {
     let cover_for = |idx: usize| -> (SharedString, SharedString) {
         if let Some(tr) = tracks.get(idx) {
-            let uri: SharedString = if !tr.local_cover.is_empty() {
-                tr.local_cover.clone().into()
-            } else {
-                tr.album.image_url.clone().into()
-            };
+            let uri = sized_track_cover(tr, ARTWORK_SIZE_CARD);
             let seed: SharedString = if !tr.album.id.is_empty() {
                 tr.album.id.clone().into()
             } else {
@@ -176,7 +271,10 @@ fn daily_mix_spotlight_card(
             };
             (uri, seed)
         } else {
-            (SharedString::default(), SharedString::from(format!("mix-{idx}")))
+            (
+                SharedString::default(),
+                SharedString::from(format!("mix-{idx}")),
+            )
         }
     };
 
@@ -196,22 +294,27 @@ fn daily_mix_spotlight_card(
         .join(" · ")
         .into();
 
-    let tracks_card = tracks.clone();
+    let tracks_cover = tracks.clone();
     let tracks_play = tracks.clone();
     let tracks_shuffle = tracks;
 
-    let cover_size = if form.is_phone() { 84.0 } else { 104.0 };
+    let is_phone = form.is_phone();
+    let cover_size = if is_phone { 86.0 } else { 104.0 };
     let vinyl_size = cover_size * 0.92;
-    let stage_w = if form.is_phone() { 156.0 } else { 186.0 };
+    let stage_w = if is_phone { 164.0 } else { 186.0 };
     let stage_h = cover_size + 22.0;
 
-    // Stacked 3-cover fan-out + peeking vinyl behind right edge.
-    let cover_stack = view()
+    // Stacked 3-cover fan-out + peeking vinyl behind right edge (clean non-nested button).
+    let cover_stack = button()
+        .on_press(move || store.play_list(tracks_cover.clone(), 0))
+        .accessibility_label(move || Some(store.t("player.play_all")))
         .w(px(stage_w))
         .h(px(stage_h))
         .flex_shrink_0()
         .items_center()
         .justify_center()
+        .bg(colors::TRANSPARENT)
+        .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
         .child(
             // Peeking vinyl disc sliding out on hover
             view()
@@ -313,10 +416,12 @@ fn daily_mix_spotlight_card(
         .flex_1()
         .min_w(px(0.0))
         .gap_1p5()
+        .when(is_phone, |v| v.w_full().items_center())
         .child(
             view()
                 .flex_row()
                 .items_center()
+                .when(is_phone, |v| v.justify_center())
                 .gap_2()
                 .child(
                     view()
@@ -340,7 +445,8 @@ fn daily_mix_spotlight_card(
         .child(
             text(title_text)
                 .number_of_lines(1)
-                .text_size(px(if form.is_phone() {
+                .when(is_phone, |t| t.text_center())
+                .text_size(px(if is_phone {
                     font_size::TITLE
                 } else {
                     font_size::TITLE_LG
@@ -351,25 +457,19 @@ fn daily_mix_spotlight_card(
         .children((!preview_line.is_empty()).then(|| {
             text(preview_line)
                 .number_of_lines(1)
+                .when(is_phone, |t| t.text_center())
                 .text_size(px(font_size::SUBTITLE))
                 .text_color(theme::muted_fg)
         }))
-        .child(
-            view()
-                .pt_2()
-                .flex_row()
-                .items_center()
-                .flex_wrap()
-                .gap_2()
-                .child(primary_button(
-                    move || store.t("player.play_all"),
-                    move || store.play_list(tracks_play.clone(), 0),
-                ))
-                .child(ghost_button(
-                    move || store.t("player.shuffle_all"),
-                    move || shuffle_and_play(store, tracks_shuffle.clone()),
-                )),
-        );
+        .child(view().w_full().pt_2().child(hero_play_shuffle_buttons(
+            store,
+            form,
+            false,
+            move || store.play_list(tracks_play.clone(), 0),
+            Some(Rc::new(move || {
+                shuffle_and_play(store, tracks_shuffle.clone());
+            })),
+        )));
 
     let layout = if form.is_phone() {
         view()
@@ -388,10 +488,9 @@ fn daily_mix_spotlight_card(
             .child(info_col)
     };
 
-    view().w_full().child(
-        button()
+    Elevated::elevation(
+        view()
             .group()
-            .on_press(move || store.play_list(tracks_card.clone(), 0))
             .w_full()
             .p(px(if form.is_phone() { 16.0 } else { 22.0 }))
             .rounded(px(radius::XL))
@@ -400,12 +499,10 @@ fn daily_mix_spotlight_card(
             .gradient_to(theme::card())
             .border_1()
             .border_color(theme::artwork_wash(accent, 0.25))
-            .elevation(Elevation::Card)
-            .transition_all()
+            .transition_colors()
             .duration(move || motion::transition_ms(180.0))
-            .hover(|s| s.border_color(theme::primary))
-            .active(|s| s.scale(motion::press_scale))
-            .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
-            .child(layout),
+            .hover(|s| s.border_color(theme::primary)),
+        Elevation::Card,
     )
+    .child(layout)
 }

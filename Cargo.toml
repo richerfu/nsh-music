@@ -5,6 +5,7 @@ members = [
   "crates/nsh-music-core",
   "crates/nsh-music-audio",
   "crates/nsh-music-plugin",
+  "crates/nsh-web-signin",
 ]
 
 [workspace.package]
@@ -13,23 +14,47 @@ edition = "2024"
 license = "AGPL-3.0"
 
 [workspace.dependencies]
-nsh-core = { path = "../nsh/crates/nsh-core" }
-nsh-base = { path = "../nsh/crates/nsh-base", default-features = false }
-nsh-engine = { path = "../nsh/crates/nsh-engine", default-features = false }
-nsh-testing = { path = "../nsh/crates/nsh-testing", default-features = false }
-nsh-platform-macos = { path = "../nsh/crates/nsh-platform-macos", default-features = false, features = ["shader", "svg"] }
-nsh-platform-linux = { path = "../nsh/crates/nsh-platform-linux", default-features = false, features = ["shader", "svg", "net", "sound"] }
-nsh-platform-windows = { path = "../nsh/crates/nsh-platform-windows", default-features = false, features = ["shader", "svg", "net"] }
+nsh-core = { version = "0.6" }
+nsh-base = { version = "0.6", default-features = false }
+nsh-engine = { version = "0.6", default-features = false }
+nsh-testing = { version = "0.6", default-features = false }
+nsh-platform-macos = { version = "0.6", default-features = false, features = ["shader", "svg"] }
+nsh-platform-linux = { version = "0.6", default-features = false, features = [
+  "shader",
+  "svg",
+  "net",
+  "sound",
+] }
+nsh-platform-windows = { version = "0.6", default-features = false, features = [
+  "shader",
+  "svg",
+  "net",
+] }
 
 nsh-music-core = { path = "crates/nsh-music-core" }
 nsh-music-audio = { path = "crates/nsh-music-audio" }
 nsh-music-plugin = { path = "crates/nsh-music-plugin" }
+nsh-web-signin = { path = "crates/nsh-web-signin" }
 
-ffmpeg-sys-next = { path = "../rust-ffmpeg-sys", default-features = false, features = ["avcodec", "avformat", "swresample", "static"] }
+ffmpeg-sys-next = { path = "../rust-ffmpeg-sys", default-features = false, features = [
+  "avcodec",
+  "avformat",
+  "swresample",
+  "static",
+] }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "net", "io-util", "process", "macros"] }
+tokio = { version = "1", features = [
+  "rt",
+  "rt-multi-thread",
+  "sync",
+  "time",
+  "net",
+  "io-util",
+  "process",
+  "macros",
+] }
 thiserror = "2"
 anyhow = "1"
 url = "2.5"
@@ -41,15 +66,33 @@ md-5 = "0.10"
 sha2 = "0.10"
 aes = "0.9"
 zip = { version = "9", default-features = false, features = ["deflate"] }
-quickjs-jit = { version = "=0.14.2", default-features = false, features = ["std", "futures", "loader", "macro"] }
+quickjs-jit = { version = "=0.14.2", default-features = false, features = [
+  "std",
+  "futures",
+  "loader",
+  "macro",
+] }
 oxc = { version = "=0.153.0", features = ["transformer", "codegen", "semantic"] }
 lofty = "0.22"
 symphonia = { version = "0.5", features = ["all"] }
+opus-pure = "0.2.5"
 cpal = "0.15"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "rustls-tls-native-roots", "system-proxy", "http2", "gzip", "deflate", "brotli", "charset", "stream", "json"] }
+reqwest = { version = "0.12", default-features = false, features = [
+  "rustls-tls",
+  "rustls-tls-native-roots",
+  "system-proxy",
+  "http2",
+  "gzip",
+  "deflate",
+  "brotli",
+  "charset",
+  "stream",
+  "json",
+] }
 ohos-audio-binding = { version = "0.1", default-features = false, features = ["api-20"] }
 dirs = "6"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 
 [package]
 name = "nsh-app-music"
@@ -73,6 +116,7 @@ nsh-base.workspace = true
 nsh-music-core.workspace = true
 nsh-music-audio.workspace = true
 nsh-music-plugin.workspace = true
+nsh-web-signin.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -84,11 +128,12 @@ reqwest.workspace = true
 url.workspace = true
 qrcode.workspace = true
 dirs.workspace = true
+image.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 nsh-platform-macos.workspace = true
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(all(target_os = "linux", not(target_env = "ohos")))'.dependencies]
 nsh-platform-linux.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
@@ -113,3 +158,18 @@ when = "always"
 
 [profile.dev.package."*"]
 debug = 0
+opt-level = 2
+
+[patch.crates-io]
+nsh-macros = { path = "../nsh/crates/nsh-macros" }
+nsh-core = { path = "../nsh/crates/nsh-core" }
+nsh-base = { path = "../nsh/crates/nsh-base" }
+nsh-engine = { path = "../nsh/crates/nsh-engine" }
+nsh-package = { path = "../nsh/crates/nsh-package" }
+nsh-js = { path = "../nsh/crates/nsh-js" }
+nsh-dev = { path = "../nsh/crates/nsh-dev" }
+nsh-bundler = { path = "../nsh/crates/nsh-bundler" }
+nsh-testing = { path = "../nsh/crates/nsh-testing" }
+nsh-platform-macos = { path = "../nsh/crates/nsh-platform-macos" }
+nsh-platform-linux = { path = "../nsh/crates/nsh-platform-linux" }
+nsh-platform-windows = { path = "../nsh/crates/nsh-platform-windows" }

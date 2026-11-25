@@ -1,13 +1,26 @@
 use std::fs;
 use std::io::{self, Cursor, Read};
 use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zip::ZipArchive;
 
-use crate::manifest::{is_valid_plugin_id, ManifestError, PluginManifest};
+use crate::manifest::{ManifestError, PluginManifest, effective_host_version, is_valid_plugin_id};
+
+/// File recorded inside an installed GitHub plugin directory tracking its originating repo/version.
+pub const ORIGIN_FILE: &str = ".origin.json";
+
+/// Persisted origin metadata recorded inside GitHub-installed plugins (`{"repo":"owner/repo","version":"..."}`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PluginOrigin {
+    pub repo: String,
+    pub version: String,
+}
 
 /// Maximum uncompressed bytes extracted from a plugin ZIP archive (64 MiB).
 const MAX_ZIP_UNCOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
@@ -41,6 +54,14 @@ pub enum InstallerError {
     NotInstalled(String),
     #[error("invalid plugin ID `{0}`")]
     InvalidPluginId(String),
+    #[error(
+        "a plugin called `{plugin_id}` is already installed from a different origin (`{existing_repo}` vs `{incoming_repo}`)"
+    )]
+    OriginConflict {
+        plugin_id: String,
+        existing_repo: String,
+        incoming_repo: String,
+    },
     #[error("registry serialization error: {0}")]
     Json(#[from] serde_json::Error),
 }
@@ -174,7 +195,9 @@ impl GitHubRepoSpec {
 
         // Handle shorthand `owner/repo` or `owner/repo@ref`.
         let (slug, git_ref) = match raw.split_once('@') {
-            Some((left, right)) if !right.trim().is_empty() => (left, Some(right.trim().to_owned())),
+            Some((left, right)) if !right.trim().is_empty() => {
+                (left, Some(right.trim().to_owned()))
+            }
             _ => (raw, None),
         };
         Self::parse_slug(slug, git_ref, input)
@@ -320,6 +343,7 @@ impl PluginInstaller {
     pub fn install_from_dir(&self, src_dir: &Path) -> Result<InstalledPluginMeta, InstallerError> {
         let resolved_src = locate_plugin_root(src_dir)?;
         let manifest = PluginManifest::from_dir(&resolved_src)?;
+        manifest.check_min_app_version(&effective_host_version())?;
         let _ = manifest.resolve_entry_path(&resolved_src)?;
 
         let staging = self.create_staging_dir(&manifest.id)?;
@@ -329,13 +353,15 @@ impl PluginInstaller {
             return Err(err);
         }
 
-        self.finalize_install(
+        let res = self.finalize_install(
             &manifest,
             &staging,
             InstallSource::LocalDir {
                 path: src_dir.display().to_string(),
             },
-        )
+        );
+        self.cleanup_staging_dir(&staging);
+        res
     }
 
     /// Installs or updates a plugin from a `.zip` file on disk (with zip-slip protection).
@@ -379,6 +405,10 @@ impl PluginInstaller {
                 return Err(InstallerError::Manifest(err));
             }
         };
+        if let Err(err) = manifest.check_min_app_version(&effective_host_version()) {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(InstallerError::Manifest(err));
+        }
         if let Err(err) = manifest.resolve_entry_path(&plugin_root) {
             let _ = fs::remove_dir_all(&staging);
             return Err(InstallerError::Manifest(err));
@@ -399,6 +429,7 @@ impl PluginInstaller {
     pub fn stage_from_dir(&self, src_dir: &Path) -> Result<PendingPluginInstall, InstallerError> {
         let resolved_src = locate_plugin_root(src_dir)?;
         let manifest = PluginManifest::from_dir(&resolved_src)?;
+        manifest.check_min_app_version(&effective_host_version())?;
         let _ = manifest.resolve_entry_path(&resolved_src)?;
 
         let staging = self.create_staging_dir(&format!("preview-{}", manifest.id))?;
@@ -457,6 +488,10 @@ impl PluginInstaller {
                 return Err(InstallerError::Manifest(err));
             }
         };
+        if let Err(err) = manifest.check_min_app_version(&effective_host_version()) {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(InstallerError::Manifest(err));
+        }
         if let Err(err) = manifest.resolve_entry_path(&plugin_root) {
             let _ = fs::remove_dir_all(&staging);
             return Err(InstallerError::Manifest(err));
@@ -472,29 +507,37 @@ impl PluginInstaller {
 
         let (used_ref, zip_bytes) = run_future_blocking(async move {
             let client = build_installer_http_client(Duration::from_secs(60))?;
-            let token = github_api_token();
             let mut candidates = Vec::new();
 
             if spec_for_task.git_ref.is_none() {
-                // Prefer latest release asset (or release zipball) when published.
-                if let Some((tag, rel_url)) = fetch_latest_release_archive(
+                // 1. Prefer latest release asset (or release zipball) when published.
+                match fetch_latest_release_archive(
                     &client,
                     &spec_for_task.owner,
                     &spec_for_task.repo,
-                    token.as_deref(),
                 )
                 .await
                 {
-                    candidates.push((tag, rel_url));
+                    ReleaseLookup::Found(tag, rel_url) => {
+                        candidates.push((tag, rel_url));
+                    }
+                    ReleaseLookup::NotFound => {
+                        // 2. When `/releases/latest` returns 404, fall back to `/commits/HEAD` + zipball.
+                        if let Some((short_sha, zipball_url)) = fetch_head_commit_archive(
+                            &client,
+                            &spec_for_task.owner,
+                            &spec_for_task.repo,
+                        )
+                        .await
+                        {
+                            candidates.push((short_sha, zipball_url));
+                        }
+                    }
+                    ReleaseLookup::Error => {}
                 }
-                // Check repository default branch in case it isn't `main` or `master`.
-                if let Some(default_branch) = fetch_default_branch(
-                    &client,
-                    &spec_for_task.owner,
-                    &spec_for_task.repo,
-                    token.as_deref(),
-                )
-                .await
+                // 3. Also inspect repository default branch in case it isn't `main` or `master`.
+                if let Some(default_branch) =
+                    fetch_default_branch(&client, &spec_for_task.owner, &spec_for_task.repo).await
                 {
                     candidates.push((
                         default_branch.clone(),
@@ -514,14 +557,14 @@ impl PluginInstaller {
 
             let mut last_err = String::from("no candidate URLs");
             for (git_ref, url) in candidates {
-                let mut req = client.get(&url);
-                if url.starts_with("https://api.github.com/") {
-                    req = req.header("Accept", "application/vnd.github+json");
-                    if let Some(tok) = token.as_deref() {
-                        req = req.bearer_auth(tok);
-                    }
-                }
-                match req.send().await {
+                let accept = if url.contains("/releases/assets/") {
+                    "application/octet-stream"
+                } else if url.starts_with("https://api.github.com/") {
+                    "application/vnd.github+json"
+                } else {
+                    ""
+                };
+                match github_send_with_retry(&client, &url, accept, Duration::from_secs(60)).await {
                     Ok(resp) if resp.status().is_success() => match resp.bytes().await {
                         Ok(bytes) if bytes.starts_with(b"PK") => {
                             return Ok((git_ref, bytes.to_vec()));
@@ -562,6 +605,7 @@ impl PluginInstaller {
         granted: bool,
     ) -> Result<InstalledPluginMeta, InstallerError> {
         let manifest = PluginManifest::from_dir(&pending.plugin_root)?;
+        manifest.check_min_app_version(&effective_host_version())?;
         let _ = manifest.resolve_entry_path(&pending.plugin_root)?;
         let res = self.finalize_install_with_grant(
             &manifest,
@@ -587,25 +631,42 @@ impl PluginInstaller {
             .find(|p| p.id == plugin_id)
             .ok_or_else(|| InstallerError::NotInstalled(plugin_id.to_owned()))?;
 
-        let InstallSource::GitHubRepo { owner, repo, git_ref } = &meta.source else {
+        let InstallSource::GitHubRepo {
+            owner,
+            repo,
+            git_ref,
+        } = &meta.source
+        else {
             return Ok(None);
         };
 
-        let current_version = meta.version.clone();
+        let origin = read_plugin_origin(&meta.dir);
+        let current_version = origin
+            .as_ref()
+            .filter(|o| !o.version.is_empty())
+            .map(|o| o.version.clone())
+            .unwrap_or_else(|| meta.version.clone());
         let owner = owner.clone();
         let repo = repo.clone();
         let git_ref = git_ref.clone();
 
         let remote_version = run_future_blocking(async move {
             let client = build_installer_http_client(Duration::from_secs(15))?;
-            let token = github_api_token();
-            if let Some((tag, _)) =
-                fetch_latest_release_archive(&client, &owner, &repo, token.as_deref()).await
-            {
-                let clean = tag.trim().trim_start_matches('v').to_owned();
-                if !clean.is_empty() {
-                    return Ok(Some(clean));
+            match fetch_latest_release_archive(&client, &owner, &repo).await {
+                ReleaseLookup::Found(tag, _) => {
+                    let clean = tag.trim().trim_start_matches('v').to_owned();
+                    if !clean.is_empty() {
+                        return Ok(Some(clean));
+                    }
                 }
+                ReleaseLookup::NotFound => {
+                    if let Some((short_sha, _)) =
+                        fetch_head_commit_archive(&client, &owner, &repo).await
+                    {
+                        return Ok(Some(short_sha));
+                    }
+                }
+                ReleaseLookup::Error => {}
             }
 
             let candidates = [
@@ -653,7 +714,11 @@ impl PluginInstaller {
     }
 
     /// Enables or disables an installed plugin in `registry.json`.
-    pub fn set_enabled(&self, plugin_id: &str, enabled: bool) -> Result<InstalledPluginMeta, InstallerError> {
+    pub fn set_enabled(
+        &self,
+        plugin_id: &str,
+        enabled: bool,
+    ) -> Result<InstalledPluginMeta, InstallerError> {
         let mut reg = self.load_registry()?;
         if let Some(item) = reg.plugins.iter_mut().find(|p| p.id == plugin_id) {
             item.enabled = enabled;
@@ -676,7 +741,11 @@ impl PluginInstaller {
     }
 
     /// Updates user permission grant status for a plugin.
-    pub fn set_granted(&self, plugin_id: &str, granted: bool) -> Result<InstalledPluginMeta, InstallerError> {
+    pub fn set_granted(
+        &self,
+        plugin_id: &str,
+        granted: bool,
+    ) -> Result<InstalledPluginMeta, InstallerError> {
         let mut reg = self.load_registry()?;
         let Some(item) = reg.plugins.iter_mut().find(|p| p.id == plugin_id) else {
             return Err(InstallerError::NotInstalled(plugin_id.to_owned()));
@@ -784,7 +853,11 @@ impl PluginInstaller {
         let compat = report.to_source_compat(true);
         let locales = crate::manifest::PluginLocales::load_from_dir(&plugin_root);
         let info = manifest.to_source_info(&locales, "zh-CN");
-        let is_update = self.plugins_dir.join(&manifest.id).join("plugin.json").is_file();
+        let is_update = self
+            .plugins_dir
+            .join(&manifest.id)
+            .join("plugin.json")
+            .is_file();
         Ok(PendingPluginInstall {
             id: manifest.id.clone(),
             name: info.name,
@@ -831,8 +904,60 @@ impl PluginInstaller {
             return Err(InstallerError::InvalidPluginId(manifest.id.clone()));
         }
         let dest_dir = self.plugins_dir.join(&manifest.id);
+
+        // Enforce `.origin.json` ownership guard (matching `mygo-music`'s `Pending.Install`):
+        // a plugin installed from one GitHub repo cannot be silently overwritten by a different repo
+        // or a local folder, and vice-versa.
+        let (incoming_repo, incoming_version) = match &source {
+            InstallSource::GitHubRepo {
+                owner,
+                repo,
+                git_ref,
+            } => (
+                format!("{owner}/{repo}"),
+                if git_ref.is_empty() {
+                    manifest.version.clone()
+                } else {
+                    git_ref.clone()
+                },
+            ),
+            _ => (String::new(), manifest.version.clone()),
+        };
+
+        if dest_dir.exists() {
+            let existing_repo = read_plugin_origin(&dest_dir)
+                .map(|o| o.repo)
+                .unwrap_or_default();
+            if existing_repo != incoming_repo {
+                return Err(InstallerError::OriginConflict {
+                    plugin_id: manifest.id.clone(),
+                    existing_repo,
+                    incoming_repo,
+                });
+            }
+        }
+
         let temp_dest = self.create_staging_dir(&format!("install-{}", manifest.id))?;
-        copy_dir_recursive(staged_plugin_root, &temp_dest)?;
+        if let Err(err) = copy_dir_recursive(staged_plugin_root, &temp_dest) {
+            let _ = fs::remove_dir_all(&temp_dest);
+            return Err(err);
+        }
+
+        if !incoming_repo.is_empty() {
+            let origin = PluginOrigin {
+                repo: incoming_repo,
+                version: incoming_version,
+            };
+            let origin_bytes = serde_json::to_vec(&origin)?;
+            let origin_path = temp_dest.join(ORIGIN_FILE);
+            if let Err(source_err) = fs::write(&origin_path, &origin_bytes) {
+                let _ = fs::remove_dir_all(&temp_dest);
+                return Err(InstallerError::Io {
+                    path: origin_path,
+                    source: source_err,
+                });
+            }
+        }
 
         // Replace existing plugin directory safely.
         if dest_dir.exists() {
@@ -876,12 +1001,11 @@ impl PluginInstaller {
         if !self.registry_path.is_file() {
             return Ok(PluginRegistry::default());
         }
-        let content = fs::read_to_string(&self.registry_path).map_err(|source| {
-            InstallerError::Io {
+        let content =
+            fs::read_to_string(&self.registry_path).map_err(|source| InstallerError::Io {
                 path: self.registry_path.clone(),
                 source,
-            }
-        })?;
+            })?;
         Ok(serde_json::from_str(&content)?)
     }
 
@@ -905,9 +1029,7 @@ pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
         .as_nanos();
     let tmp_name = format!(
         ".{}.{}.{nonce}.tmp",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("file"),
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("file"),
         std::process::id()
     );
     let tmp_path = path.with_file_name(tmp_name);
@@ -972,17 +1094,15 @@ fn locate_plugin_root(dir: &Path) -> Result<PathBuf, InstallerError> {
     if entries.len() == 1 && entries[0].is_dir() && entries[0].join("plugin.json").is_file() {
         return Ok(entries[0].clone());
     }
-    Err(InstallerError::Manifest(ManifestError::Validation(format!(
-        "plugin.json not found in {}",
-        dir.display()
-    ))))
+    Err(InstallerError::Manifest(ManifestError::Validation(
+        format!("plugin.json not found in {}", dir.display()),
+    )))
 }
 
 /// Extracts ZIP bytes into `dest_dir` with strict zip-slip, symlink, and zip-bomb checks.
 pub fn extract_zip_safely(bytes: &[u8], dest_dir: &Path) -> Result<(), InstallerError> {
     let cursor = Cursor::new(bytes);
-    let mut archive =
-        ZipArchive::new(cursor).map_err(|e| InstallerError::Zip(e.to_string()))?;
+    let mut archive = ZipArchive::new(cursor).map_err(|e| InstallerError::Zip(e.to_string()))?;
 
     if archive.len() > MAX_ZIP_ENTRIES {
         return Err(InstallerError::ArchiveLimit(format!(
@@ -1069,9 +1189,31 @@ pub fn extract_zip_safely(bytes: &[u8], dest_dir: &Path) -> Result<(), Installer
             path: out_path.clone(),
             source,
         })?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perm = if entry.unix_mode().is_some_and(|m| m & 0o111 != 0) {
+                0o755
+            } else {
+                0o644
+            };
+            let _ = fs::set_permissions(&out_path, fs::Permissions::from_mode(perm));
+        }
     }
 
     Ok(())
+}
+
+/// Reads `.origin.json` from an installed plugin directory if present.
+pub fn read_plugin_origin(plugin_dir: &Path) -> Option<PluginOrigin> {
+    let raw = fs::read_to_string(plugin_dir.join(ORIGIN_FILE)).ok()?;
+    let origin: PluginOrigin = serde_json::from_str(&raw).ok()?;
+    if origin.repo.is_empty() {
+        None
+    } else {
+        Some(origin)
+    }
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), InstallerError> {
@@ -1101,9 +1243,21 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), InstallerError> {
             copy_dir_recursive(&entry.path(), &target)?;
         } else if file_type.is_file() {
             fs::copy(entry.path(), &target).map_err(|source| InstallerError::Io {
-                path: target,
+                path: target.clone(),
                 source,
             })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = entry.metadata() {
+                    let perm = if meta.permissions().mode() & 0o111 != 0 {
+                        0o755
+                    } else {
+                        0o644
+                    };
+                    let _ = fs::set_permissions(&target, fs::Permissions::from_mode(perm));
+                }
+            }
         }
     }
     Ok(())
@@ -1118,54 +1272,159 @@ fn build_installer_http_client(timeout: Duration) -> Result<reqwest::Client, Ins
         .map_err(|e| InstallerError::Http(e.to_string()))
 }
 
+static GH_TOKEN_CACHE: OnceLock<Option<String>> = OnceLock::new();
+static GH_TOKEN_REFUSED: AtomicBool = AtomicBool::new(false);
+
 fn github_api_token() -> Option<String> {
-    ["GITHUB_TOKEN", "GH_TOKEN"].into_iter().find_map(|k| {
-        std::env::var(k)
-            .ok()
-            .map(|v| v.trim().to_owned())
-            .filter(|v| !v.is_empty())
-    })
+    if GH_TOKEN_REFUSED.load(Ordering::Relaxed) {
+        return None;
+    }
+    for key in ["GITHUB_TOKEN", "GH_TOKEN"] {
+        if let Ok(val) = std::env::var(key) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_owned());
+            }
+        }
+    }
+    GH_TOKEN_CACHE.get_or_init(find_gh_cli_token).clone()
+}
+
+fn find_gh_cli_token() -> Option<String> {
+    #[cfg(any(target_env = "ohos", target_os = "ios", target_os = "android"))]
+    {
+        None
+    }
+    #[cfg(not(any(target_env = "ohos", target_os = "ios", target_os = "android")))]
+    {
+        use std::process::{Command, Stdio};
+        let gh_path = crate::mobile_compat::resolve_real_binary("gh", "gh")?;
+        let mut child = Command::new(gh_path)
+            .args(["auth", "token", "--hostname", "github.com"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if !status.success() {
+                        return None;
+                    }
+                    let mut out = String::new();
+                    if let Some(mut stdout) = child.stdout.take() {
+                        let _ = stdout.read_to_string(&mut out);
+                    }
+                    let trimmed = out.trim();
+                    return (!trimmed.is_empty()).then(|| trimmed.to_owned());
+                }
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+}
+
+async fn github_send_with_retry(
+    client: &reqwest::Client,
+    url: &str,
+    accept: &str,
+    timeout: Duration,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let is_api = url.starts_with("https://api.github.com/");
+    let mut token = if is_api { github_api_token() } else { None };
+    loop {
+        let mut req = client.get(url).timeout(timeout);
+        if !accept.is_empty() {
+            req = req.header("Accept", accept);
+        }
+        if let Some(ref tok) = token {
+            req = req.bearer_auth(tok);
+        }
+        let resp = req.send().await?;
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED && token.is_some() {
+            log::warn!(
+                target: "nsh_music_plugin",
+                "GitHub refused auth token (HTTP 401); dropping token and retrying anonymously"
+            );
+            GH_TOKEN_REFUSED.store(true, Ordering::Relaxed);
+            token = None;
+            continue;
+        }
+        return Ok(resp);
+    }
+}
+
+enum ReleaseLookup {
+    Found(String, String),
+    NotFound,
+    Error,
 }
 
 async fn fetch_latest_release_archive(
     client: &reqwest::Client,
     owner: &str,
     repo: &str,
-    token: Option<&str>,
-) -> Option<(String, String)> {
+) -> ReleaseLookup {
     let url = format!("https://api.github.com/repos/{owner}/{repo}/releases/latest");
-    let mut req = client
-        .get(&url)
-        .header("Accept", "application/vnd.github+json")
-        .timeout(Duration::from_secs(12));
-    if let Some(tok) = token {
-        req = req.bearer_auth(tok);
+    let Ok(resp) = github_send_with_retry(
+        client,
+        &url,
+        "application/vnd.github+json",
+        Duration::from_secs(12),
+    )
+    .await
+    else {
+        return ReleaseLookup::Error;
+    };
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return ReleaseLookup::NotFound;
     }
-    let resp = req.send().await.ok()?;
     if !resp.status().is_success() {
-        return None;
+        return ReleaseLookup::Error;
     }
-    let val = resp.json::<serde_json::Value>().await.ok()?;
-    let tag = val
+    let Ok(val) = resp.json::<serde_json::Value>().await else {
+        return ReleaseLookup::Error;
+    };
+    let Some(tag) = val
         .get("tag_name")
         .and_then(|v| v.as_str())
         .map(str::trim)
-        .filter(|s| !s.is_empty())?
-        .to_owned();
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+    else {
+        return ReleaseLookup::Error;
+    };
 
     if let Some(assets) = val.get("assets").and_then(|v| v.as_array()) {
+        let has_token = github_api_token().is_some();
         let zip_assets: Vec<(&str, &str)> = assets
             .iter()
             .filter_map(|a| {
                 let name = a.get("name").and_then(|v| v.as_str())?;
-                let dl = a.get("browser_download_url").and_then(|v| v.as_str())?;
+                let dl = if has_token {
+                    a.get("url")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| a.get("browser_download_url").and_then(|v| v.as_str()))?
+                } else {
+                    a.get("browser_download_url").and_then(|v| v.as_str())?
+                };
                 name.to_ascii_lowercase()
                     .ends_with(".zip")
                     .then_some((name, dl))
             })
             .collect();
         if let Some((_, dl)) = pick_platform_zip_asset(&zip_assets) {
-            return Some((tag, dl.to_owned()));
+            return ReleaseLookup::Found(tag, dl.to_owned());
         }
     }
 
@@ -1174,13 +1433,41 @@ async fn fetch_latest_release_archive(
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
     {
-        return Some((tag, zipball.to_owned()));
+        return ReleaseLookup::Found(tag, zipball.to_owned());
     }
 
-    Some((
+    ReleaseLookup::Found(
         tag.clone(),
         format!("https://codeload.github.com/{owner}/{repo}/zip/refs/tags/{tag}"),
-    ))
+    )
+}
+
+async fn fetch_head_commit_archive(
+    client: &reqwest::Client,
+    owner: &str,
+    repo: &str,
+) -> Option<(String, String)> {
+    let url = format!("https://api.github.com/repos/{owner}/{repo}/commits/HEAD");
+    let resp = github_send_with_retry(
+        client,
+        &url,
+        "application/vnd.github+json",
+        Duration::from_secs(12),
+    )
+    .await
+    .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let val = resp.json::<serde_json::Value>().await.ok()?;
+    let sha = val
+        .get("sha")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let short_sha = sha[..sha.len().min(12)].to_owned();
+    let zipball = format!("https://api.github.com/repos/{owner}/{repo}/zipball/{sha}");
+    Some((short_sha, zipball))
 }
 
 fn pick_platform_zip_asset<'a>(assets: &[(&'a str, &'a str)]) -> Option<(&'a str, &'a str)> {
@@ -1194,7 +1481,11 @@ fn pick_platform_zip_asset<'a>(assets: &[(&'a str, &'a str)]) -> Option<(&'a str
     } else {
         "linux"
     };
-    let alt_os = if cfg!(target_os = "macos") { "macos" } else { os };
+    let alt_os = if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        os
+    };
     let arch = if cfg!(target_arch = "aarch64") {
         "arm64"
     } else if cfg!(target_arch = "x86_64") {
@@ -1227,21 +1518,16 @@ fn pick_platform_zip_asset<'a>(assets: &[(&'a str, &'a str)]) -> Option<(&'a str
         })
 }
 
-async fn fetch_default_branch(
-    client: &reqwest::Client,
-    owner: &str,
-    repo: &str,
-    token: Option<&str>,
-) -> Option<String> {
+async fn fetch_default_branch(client: &reqwest::Client, owner: &str, repo: &str) -> Option<String> {
     let url = format!("https://api.github.com/repos/{owner}/{repo}");
-    let mut req = client
-        .get(&url)
-        .header("Accept", "application/vnd.github+json")
-        .timeout(Duration::from_secs(12));
-    if let Some(tok) = token {
-        req = req.bearer_auth(tok);
-    }
-    let resp = req.send().await.ok()?;
+    let resp = github_send_with_retry(
+        client,
+        &url,
+        "application/vnd.github+json",
+        Duration::from_secs(12),
+    )
+    .await
+    .ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -1281,8 +1567,8 @@ where
 mod tests {
     use super::*;
     use std::io::Write;
-    use zip::write::SimpleFileOptions;
     use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
 
     fn temp_test_dir(name: &str) -> PathBuf {
         let nonce = SystemTime::now()
@@ -1348,8 +1634,10 @@ mod tests {
             let mut zw = ZipWriter::new(&mut buf);
             let opts = SimpleFileOptions::default();
             zw.start_file("demo-plugin-main/plugin.json", opts).unwrap();
-            zw.write_all(br#"{"id":"zip-demo","name":"Zip Demo","version":"1.0.0","main":"index.js"}"#)
-                .unwrap();
+            zw.write_all(
+                br#"{"id":"zip-demo","name":"Zip Demo","version":"1.0.0","main":"index.js"}"#,
+            )
+            .unwrap();
             zw.start_file("demo-plugin-main/index.js", opts).unwrap();
             zw.write_all(b"export async function search() { return { tracks: [] }; }")
                 .unwrap();
@@ -1392,6 +1680,106 @@ mod tests {
             .expect_err("zip slip must be rejected");
         assert!(matches!(err, InstallerError::ZipSlip(_)), "got {err:?}");
         assert!(!root.join("escape.txt").exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn enforces_origin_json_guard_and_preserves_unix_executable_bits() {
+        let root = temp_test_dir("origin-exec");
+        let installer = PluginInstaller::new(&root).expect("installer");
+
+        let make_zip = |version: &str| -> Vec<u8> {
+            let mut buf = Cursor::new(Vec::new());
+            {
+                let mut zw = ZipWriter::new(&mut buf);
+                let regular = SimpleFileOptions::default().unix_permissions(0o644);
+                let exec = SimpleFileOptions::default().unix_permissions(0o755);
+                zw.start_file("pkg/plugin.json", regular).unwrap();
+                zw.write_all(
+                    format!(r#"{{"id":"origin-demo","name":"Origin Demo","version":"{version}","main":"index.js"}}"#)
+                        .as_bytes(),
+                )
+                .unwrap();
+                zw.start_file("pkg/index.js", regular).unwrap();
+                zw.write_all(b"export async function suggest() { return []; }")
+                    .unwrap();
+                zw.start_file("pkg/bin/helper", exec).unwrap();
+                zw.write_all(b"#!/bin/sh\necho ok\n").unwrap();
+                zw.finish().unwrap();
+            }
+            buf.into_inner()
+        };
+
+        // 1. Install from GitHub repo `alice/origin-demo` writes `.origin.json` and preserves 0o755.
+        let zip_v1 = make_zip("1.0.0");
+        let meta = installer
+            .install_from_zip_bytes(
+                &zip_v1,
+                InstallSource::GitHubRepo {
+                    owner: "alice".to_owned(),
+                    repo: "origin-demo".to_owned(),
+                    git_ref: "v1.0.0".to_owned(),
+                },
+            )
+            .expect("install from alice/origin-demo");
+        let origin = read_plugin_origin(&meta.dir).expect(".origin.json must be written");
+        assert_eq!(origin.repo, "alice/origin-demo");
+        assert_eq!(origin.version, "v1.0.0");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let helper_mode = fs::metadata(meta.dir.join("bin/helper"))
+                .expect("helper exists")
+                .permissions()
+                .mode();
+            assert_ne!(helper_mode & 0o111, 0, "executable bit must be preserved");
+        }
+
+        // 2. Updating from the SAME repo succeeds.
+        let zip_v2 = make_zip("1.1.0");
+        let meta2 = installer
+            .install_from_zip_bytes(
+                &zip_v2,
+                InstallSource::GitHubRepo {
+                    owner: "alice".to_owned(),
+                    repo: "origin-demo".to_owned(),
+                    git_ref: "v1.1.0".to_owned(),
+                },
+            )
+            .expect("update from same repo succeeds");
+        assert_eq!(read_plugin_origin(&meta2.dir).unwrap().version, "v1.1.0");
+
+        // 3. Overwriting from a DIFFERENT GitHub repo is blocked!
+        let conflict_gh = installer
+            .install_from_zip_bytes(
+                &zip_v2,
+                InstallSource::GitHubRepo {
+                    owner: "bob".to_owned(),
+                    repo: "origin-demo".to_owned(),
+                    git_ref: "v2.0.0".to_owned(),
+                },
+            )
+            .expect_err("cross-repo overwrite must fail");
+        assert!(
+            matches!(conflict_gh, InstallerError::OriginConflict { .. }),
+            "expected OriginConflict, got {conflict_gh:?}"
+        );
+
+        // 4. Overwriting a GitHub plugin from a local zip is also blocked!
+        let conflict_local = installer
+            .install_from_zip_bytes(
+                &zip_v2,
+                InstallSource::ZipArchive {
+                    path: "local.zip".to_owned(),
+                },
+            )
+            .expect_err("local overwrite of github plugin must fail");
+        assert!(
+            matches!(conflict_local, InstallerError::OriginConflict { .. }),
+            "expected OriginConflict, got {conflict_local:?}"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

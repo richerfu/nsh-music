@@ -28,8 +28,8 @@ pub fn audio_backend_capabilities() -> AudioBackendCapabilities {
     {
         formats.extend(
             [
-                "mp3", "flac", "aac", "m4a", "mp4", "ogg", "opus", "vorbis", "wav", "alac",
-                "aiff", "webm", "mkv",
+                "mp3", "flac", "aac", "m4a", "mp4", "ogg", "opus", "vorbis", "wav", "alac", "aiff",
+                "webm", "mkv",
             ]
             .into_iter()
             .map(str::to_owned),
@@ -38,7 +38,9 @@ pub fn audio_backend_capabilities() -> AudioBackendCapabilities {
 
     #[cfg(feature = "audio-ffmpeg")]
     {
-        for extra in ["wma", "ac3", "eac3", "ape", "dsf", "dff", "mka", "ts", "hls"] {
+        for extra in [
+            "wma", "ac3", "eac3", "ape", "dsf", "dff", "mka", "ts", "hls",
+        ] {
             if !formats.iter().any(|f| f == extra) {
                 formats.push(extra.to_owned());
             }
@@ -175,9 +177,7 @@ mod ffmpeg_impl {
         let mut buf = [0i8; 128];
         unsafe {
             ff::av_strerror(code, buf.as_mut_ptr(), buf.len());
-            CStr::from_ptr(buf.as_ptr())
-                .to_string_lossy()
-                .into_owned()
+            CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned()
         }
     }
 
@@ -209,7 +209,9 @@ mod ffmpeg_impl {
             unsafe {
                 let avio_buf = ff::av_malloc(AVIO_BUFFER_SIZE) as *mut u8;
                 if avio_buf.is_null() {
-                    return Err(AudioError::Decode("av_malloc failed for AVIO buffer".into()));
+                    return Err(AudioError::Decode(
+                        "av_malloc failed for AVIO buffer".into(),
+                    ));
                 }
 
                 let opaque = Box::into_raw(Box::new(AvioOpaque { stream }));
@@ -419,14 +421,16 @@ mod ffmpeg_impl {
                         let nb_samples = (*self.frame).nb_samples;
                         if nb_samples > 0 {
                             let ch = self.spec.channels as usize;
+                            let max_out_frames =
+                                ff::swr_get_out_samples(self.swr_ctx, nb_samples).max(nb_samples);
                             let start_len = out.len();
-                            let out_count = nb_samples as usize * ch;
+                            let out_count = max_out_frames as usize * ch;
                             out.resize(start_len + out_count, 0.0);
                             let mut out_ptr = out[start_len..].as_mut_ptr() as *mut u8;
                             let converted = ff::swr_convert(
                                 self.swr_ctx,
                                 &mut out_ptr,
-                                nb_samples,
+                                max_out_frames,
                                 (*self.frame).extended_data as *mut *const u8,
                                 nb_samples,
                             );
@@ -459,12 +463,16 @@ mod ffmpeg_impl {
                         continue;
                     } else if recv == ff::AVERROR_EOF {
                         return Ok(0);
-                    } else if recv != ff::AVERROR(11) {
-                        // EAGAIN (11 on Linux, 35 on macOS) falls through to reading next packet.
-                        #[cfg(target_os = "macos")]
-                        let is_eagain = recv == ff::AVERROR(35);
-                        #[cfg(not(target_os = "macos"))]
-                        let is_eagain = false;
+                    } else {
+                        // EAGAIN (35 on Darwin/BSDs, 11 on Linux/OHOS/Windows) asks for the next packet.
+                        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+                        let is_eagain = recv == ff::AVERROR(35) || recv == ff::AVERROR(11);
+                        #[cfg(not(any(
+                            target_os = "macos",
+                            target_os = "ios",
+                            target_os = "freebsd"
+                        )))]
+                        let is_eagain = recv == ff::AVERROR(11);
                         if !is_eagain {
                             return Err(AudioError::Decode(format!(
                                 "avcodec_receive_frame failed: {}",

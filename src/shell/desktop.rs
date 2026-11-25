@@ -1,56 +1,75 @@
-//! Desktop application shell aligned to `egoist/mygo-music`:
+//! Desktop application shell aligned 1:1 to `egoist/mygo-music`:
 //! - Hidden `44pt` title bar (`TitleBarStyle::Hidden`, `.window_drag(true)`)
-//! - Full-height collapsible `232pt` / `68pt` sidebar under macOS traffic lights with:
+//! - Full-height collapsible `240pt` / `68pt` sidebar under macOS traffic lights with:
 //!   - Source switcher pill (`store.active_source_name()`)
-//!   - Integrated `32pt` sidebar search box with live suggestions & recent searches popover
+//!   - Integrated `32pt` sidebar search box with floating overlay suggestions & recent searches popover
 //!   - Capability-gated primary & library nav + active source custom `info.navigation` items
 //!   - Collapsible `My Playlists` (with `+` & right-click Rename/Delete) & `Saved Playlists`
-//!   - Bottom account row (`40pt`) + direct `Plugins` & `Settings` triggers
+//!   - Bottom account row (`40pt`) + unified `Settings` trigger opening the Settings child window
+//! - Native desktop application menu & system tray (`set_application_menu`, `set_tray`)
 //! - `44pt` top navigation bar with sidebar toggle, Back/Forward, scroll-edge revealed route title
 //!   & hairline border (`store.page_scrolled`), and theme toggle
-//! - Persistent `84pt` frosted bottom player bar (`player-bar`) with quiet idle state,
-//!   smoke-mode scrubber, lyrics/queue/volume/remote-devices/expand controls
-//! - Global desktop keyboard shortcuts (`space`, `mod+k`, `mod+f`, `mod+[`, `mod+]`,
-//!   `left`, `right`, `mod+1`, `mod+2`, `mod+3`, `escape`)
+//! - Persistent `84pt` right-column player bar (`player-bar`) with `48×48` hover-reveal cover,
+//!   clickable artist links, buffering/error status, smoke-mode scrubber (paused when Now Playing
+//!   is open), adaptive lyrics/episode toggle, queue, remote devices, volume, and expand controls
+//! - Global desktop keyboard shortcuts (`space`, `mod+k`, `mod+f`, `mod+,`, `mod+[`, `mod+]`,
+//!   `left`, `right`, `mod+1`..`mod+5`, `escape`)
+
+use std::f32::consts::PI;
 
 use nsh_base::{button, input};
 use nsh_core::{
-    desktop::{TitleBarOptions, TitleBarStyle, WindowAttributes},
-    element::desktop::{current_window, title_bar},
+    desktop::{TitleBarOptions, TitleBarStyle, WindowAttributes, WindowKind},
+    element::desktop::{current_window, title_bar, window as desktop_window},
+    geometry::size,
     keymap::When,
     prelude::*,
 };
+use nsh_music_audio::PlaybackStatus;
 use nsh_music_core::{
-    model::{NavItem, Playlist, RepeatMode},
+    model::{Artist, NavItem, Playlist, RepeatMode, Track},
     settings::ThemeMode,
 };
 
 use crate::{
     pages,
-    state::{ActiveModal, AppStore, NowPlayingPanel, Route},
+    state::{ActiveModal, AppStore, NowPlayingPanel, Route, SettingsSection},
     ui::{
         controls::{
-            artwork_box, heart_button, icon_button_sized, play_pause_button, source_pill,
+            artwork_box, heart_button, icon_button_sized, play_pause_button_buffering, source_pill,
             styled_slider,
         },
         icons::{Icon, icon, icon_reactive},
-        motion,
-        overlays::{ContextMenuAction, confirm_destructive, styled_context_menu, styled_menu},
+        loading_spinner, motion,
+        overlays::{
+            ContextMenuAction, confirm_destructive, styled_context_menu, styled_menu, toast_overlay,
+        },
         scrubber::scrubber,
         theme::{self, DeviceForm, Elevated, Elevation, colors, font_size, radius},
     },
 };
 
 const TITLE_BAR_HEIGHT: f32 = 44.0;
-const SIDEBAR_EXPANDED_W: f32 = 232.0;
+const SIDEBAR_EXPANDED_W: f32 = 240.0;
 const SIDEBAR_COLLAPSED_W: f32 = 68.0;
 const PLAYER_BAR_HEIGHT: f32 = 84.0;
 const SEEK_STEP_MS: u64 = 5_000;
 
+fn sidebar_top_clearance() -> f32 {
+    let tb = title_bar();
+    if tb.left.0 > 0.0 || tb.top.0 > 0.0 {
+        tb.top.0.max(TITLE_BAR_HEIGHT) + 4.0
+    } else {
+        14.0
+    }
+}
+
 /// Renders the full Desktop workspace shell.
 pub fn desktop_shell(store: AppStore) -> View {
     configure_hidden_title_bar();
+    install_desktop_menu_and_tray(store);
     let search_ref = element_ref();
+    let sidebar_header_h = signal(84.0_f32);
     register_desktop_shortcuts(store, search_ref);
 
     // Refresh remote devices whenever the active source supports remote control.
@@ -59,6 +78,19 @@ pub fn desktop_shell(store: AppStore) -> View {
         if store.active_can("remoteDevices") {
             untracked(|| store.refresh_remote_devices());
         }
+    });
+
+    let mut settings_bar = TitleBarOptions::default();
+    settings_bar.style = TitleBarStyle::Hidden;
+    settings_bar.height = Some(px(TITLE_BAR_HEIGHT));
+    let mut settings_attrs = WindowAttributes::default();
+    settings_attrs.title_bar = Some(settings_bar);
+
+    let show_suggestions = computed(move || {
+        !store.sidebar_collapsed.get()
+            && store.search_suggest_open.get()
+            && (store.search_suggestions.with(|v| !v.is_empty())
+                || store.recent_searches.with(|v| !v.is_empty()))
     });
 
     view()
@@ -70,7 +102,7 @@ pub fn desktop_shell(store: AppStore) -> View {
         .bg(theme::bg)
         .text_color(theme::fg)
         // Left full-height sidebar spanning from top edge to bottom edge.
-        .child(desktop_sidebar(store, search_ref))
+        .child(desktop_sidebar(store, search_ref, sidebar_header_h))
         // Right workspace column: top navigation bar, scrollable pages, and non-full-width player bar.
         .child(
             view()
@@ -82,7 +114,299 @@ pub fn desktop_shell(store: AppStore) -> View {
                 .child(desktop_main_viewport(store))
                 .child(desktop_player_bar(store)),
         )
+        // Floating sidebar search suggestions popover mounted above navigation without shifting layout.
+        .child(when(show_suggestions, move || {
+            let popover_top = move || px(sidebar_top_clearance() + sidebar_header_h.get() - 2.0);
+            view()
+                .absolute()
+                .inset_0()
+                // Click-outside dismiss scrim covering navigation below the search box.
+                .child(
+                    view()
+                        .test_id("desktop-search-suggestions-scrim")
+                        .absolute()
+                        .left_0()
+                        .w(px(SIDEBAR_EXPANDED_W))
+                        .top(popover_top)
+                        .bottom_0()
+                        .on_press_down(move |_: &PressEvent| {
+                            store.search_suggest_open.set(false);
+                        }),
+                )
+                // Click-outside dismiss scrim covering the right workspace column.
+                .child(
+                    view()
+                        .absolute()
+                        .left(px(SIDEBAR_EXPANDED_W))
+                        .right_0()
+                        .top_0()
+                        .bottom_0()
+                        .on_press_down(move |_: &PressEvent| {
+                            store.search_suggest_open.set(false);
+                        }),
+                )
+                // Floating suggestions popover anchored cleanly beneath `desktop-search-input`.
+                .child(
+                    view()
+                        .absolute()
+                        .left(px(10.0))
+                        .w(px(SIDEBAR_EXPANDED_W - 20.0))
+                        .top(popover_top)
+                        .child(sidebar_suggestions_popover(store)),
+                )
+        }))
+        // Native Desktop Settings child window (unified with Plugins).
+        .child(
+            desktop_window()
+                .id("settings")
+                .kind(WindowKind::Normal)
+                .default_size(size(px(780.0), px(640.0)))
+                .restore_bounds(true)
+                .title(move || store.t("settings.title").to_string())
+                .attributes(settings_attrs)
+                .open(store.settings_window_open)
+                .on_open_change(move |e| {
+                    if !e.open {
+                        store.close_settings_window();
+                    }
+                })
+                .content(move || {
+                    view()
+                        .flex_1()
+                        .w_full()
+                        .h_full()
+                        .bg(theme::bg)
+                        .text_color(theme::fg)
+                        .child(pages::settings::settings_window_content(store))
+                        .child(pages::render_settings_modal(store))
+                        .child(toast_overlay(store.toasts))
+                }),
+        )
 }
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "windows",
+    all(target_os = "linux", not(target_env = "ohos"))
+))]
+fn resolve_tray_icon_src() -> nsh_core::element::ImageSrc {
+    use std::path::{Path, PathBuf};
+
+    use nsh_core::element::ImageSrc;
+
+    let rel = Path::new("assets").join("tray-icon.svg");
+    if rel.is_file() {
+        return ImageSrc::from(rel.to_string_lossy().into_owned());
+    }
+
+    let manifest_icon = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/tray-icon.svg");
+    if manifest_icon.is_file() {
+        return ImageSrc::from(manifest_icon.to_string_lossy().into_owned());
+    }
+
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        for candidate in [
+            dir.join("assets/tray-icon.svg"),
+            dir.join("../assets/tray-icon.svg"),
+            dir.join("../Resources/tray-icon.svg"),
+        ] {
+            if candidate.is_file() {
+                return ImageSrc::from(candidate.to_string_lossy().into_owned());
+            }
+        }
+    }
+
+    let bytes = include_bytes!("../../assets/tray-icon.svg");
+    let cache_dir = dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("nsh-music");
+    let cached = cache_dir.join("tray-icon.svg");
+    let needs_write = std::fs::metadata(&cached)
+        .map(|m| m.len() != bytes.len() as u64)
+        .unwrap_or(true);
+    if !needs_write
+        || (std::fs::create_dir_all(&cache_dir).is_ok() && std::fs::write(&cached, bytes).is_ok())
+    {
+        return ImageSrc::from(cached.to_string_lossy().into_owned());
+    }
+
+    ImageSrc::svg_markup(include_str!("../../assets/tray-icon.svg"))
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "windows",
+    all(target_os = "linux", not(target_env = "ohos"))
+))]
+fn install_desktop_menu_and_tray(store: AppStore) {
+    use nsh_core::{
+        desktop::MenuRole,
+        element::desktop::{MenuItem, main_window, quit, set_application_menu, set_tray, tray},
+    };
+    use nsh_music_core::i18n::Locale;
+
+    // Native application menu reactive to locale and playback toggle state.
+    effect(move || {
+        let locale = store.locale.get();
+        let playing = store.is_playing.get();
+        let shuffle_on = store.shuffle.get();
+        let repeat_mode = store.repeat.get();
+
+        let play_label = if playing {
+            store.t("player.pause").to_string()
+        } else {
+            store.t("player.play").to_string()
+        };
+        let repeat_label = match repeat_mode {
+            RepeatMode::Off => store.t("player.repeat_off").to_string(),
+            RepeatMode::All => store.t("player.repeat_all").to_string(),
+            RepeatMode::One => store.t("player.repeat_one").to_string(),
+        };
+        let edit_menu_title = match locale {
+            Locale::ZhCn => "编辑",
+            Locale::En => "Edit",
+        };
+
+        let items = vec![
+            MenuItem::submenu(
+                store.t("menu.app").to_string(),
+                [
+                    MenuItem::new(store.t("menu.about").to_string()).on_select(move || {
+                        store.open_settings_window(SettingsSection::About);
+                    }),
+                    MenuItem::separator(),
+                    MenuItem::new(store.t("menu.settings").to_string())
+                        .shortcut("mod+,")
+                        .on_select(move || {
+                            store.open_settings_window(SettingsSection::General);
+                        }),
+                    MenuItem::separator(),
+                    MenuItem::role(MenuRole::Hide),
+                    MenuItem::role(MenuRole::HideOthers),
+                    MenuItem::role(MenuRole::ShowAll),
+                    MenuItem::separator(),
+                    MenuItem::role(MenuRole::Quit).label(store.t("menu.quit").to_string()),
+                ],
+            ),
+            MenuItem::submenu(
+                store.t("menu.file").to_string(),
+                [
+                    MenuItem::new(store.t("menu.import_folder").to_string()).on_select(move || {
+                        store.open_settings_window(SettingsSection::Cache);
+                    }),
+                    MenuItem::new(store.t("menu.install_plugin").to_string()).on_select(
+                        move || {
+                            store.open_settings_window(SettingsSection::Plugins);
+                            store.open_modal(ActiveModal::InstallPlugin);
+                        },
+                    ),
+                ],
+            ),
+            MenuItem::submenu(
+                edit_menu_title,
+                [
+                    MenuItem::role(MenuRole::Undo),
+                    MenuItem::role(MenuRole::Redo),
+                    MenuItem::separator(),
+                    MenuItem::role(MenuRole::Cut),
+                    MenuItem::role(MenuRole::Copy),
+                    MenuItem::role(MenuRole::Paste),
+                    MenuItem::role(MenuRole::SelectAll),
+                ],
+            ),
+            MenuItem::submenu(
+                store.t("menu.playback").to_string(),
+                [
+                    MenuItem::new(play_label).on_select(move || store.toggle_play()),
+                    MenuItem::new(store.t("player.prev").to_string())
+                        .on_select(move || store.prev_track()),
+                    MenuItem::new(store.t("player.next").to_string())
+                        .on_select(move || store.next_track()),
+                    MenuItem::separator(),
+                    MenuItem::new(store.t("player.shuffle").to_string())
+                        .checked(shuffle_on)
+                        .on_select(move || store.toggle_shuffle()),
+                    MenuItem::new(repeat_label)
+                        .checked(repeat_mode != RepeatMode::Off)
+                        .on_select(move || store.cycle_repeat()),
+                ],
+            ),
+            MenuItem::submenu(
+                store.t("menu.window").to_string(),
+                [
+                    MenuItem::role(MenuRole::Minimize),
+                    MenuItem::role(MenuRole::Zoom),
+                    MenuItem::separator(),
+                    MenuItem::role(MenuRole::Close),
+                ],
+            ),
+        ];
+
+        set_application_menu(items);
+    });
+
+    // Native system tray icon & menu reactive to current track, play state, and locale.
+    let tray_icon_src = resolve_tray_icon_src();
+    let tray_track = computed(move || {
+        store.current_track.with(|t| {
+            t.as_ref().map(|tr| {
+                let artists = tr.artist_names();
+                if artists.is_empty() {
+                    tr.name.clone()
+                } else {
+                    format!("{} — {}", tr.name, artists)
+                }
+            })
+        })
+    });
+
+    effect(move || {
+        let _locale = store.locale.get();
+        let playing = store.is_playing.get();
+        let tooltip = tray_track
+            .get()
+            .unwrap_or_else(|| store.t("app.name").to_string());
+        let play_label = if playing {
+            store.t("player.pause").to_string()
+        } else {
+            store.t("player.play").to_string()
+        };
+
+        set_tray(
+            tray()
+                .icon(tray_icon_src.clone())
+                .tooltip(tooltip)
+                .on_click(|_| {
+                    main_window().focus();
+                })
+                .menu([
+                    MenuItem::new(play_label).on_select(move || store.toggle_play()),
+                    MenuItem::new(store.t("player.prev").to_string())
+                        .on_select(move || store.prev_track()),
+                    MenuItem::new(store.t("player.next").to_string())
+                        .on_select(move || store.next_track()),
+                    MenuItem::separator(),
+                    MenuItem::new(store.t("tray.show_window").to_string()).on_select(|| {
+                        main_window().focus();
+                    }),
+                    MenuItem::new(store.t("menu.settings").to_string()).on_select(move || {
+                        store.open_settings_window(SettingsSection::General);
+                    }),
+                    MenuItem::separator(),
+                    MenuItem::new(store.t("menu.quit").to_string()).on_select(quit),
+                ]),
+        );
+    });
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "windows",
+    all(target_os = "linux", not(target_env = "ohos"))
+)))]
+fn install_desktop_menu_and_tray(_store: AppStore) {}
 
 fn configure_hidden_title_bar() {
     let mut bar = TitleBarOptions::default();
@@ -121,6 +445,18 @@ fn register_desktop_shortcuts(store: AppStore, search_ref: ElementRef) {
         move |_| {
             store.navigate(Route::Search);
             search_ref.focus();
+        },
+    );
+
+    // Cmd/Ctrl+, opens the Desktop Settings child window.
+    on_key_with(
+        "mod+,",
+        KeyOptions {
+            when: When::Always,
+            ..Default::default()
+        },
+        move |_| {
+            store.open_settings_window(SettingsSection::General);
         },
     );
 
@@ -167,46 +503,27 @@ fn register_desktop_shortcuts(store: AppStore, search_ref: ElementRef) {
         }
     });
 
-    // Cmd/Ctrl+1 / 2 / 3 switch Now Playing panel while overlay is open.
-    on_key_with(
-        "mod+1",
-        KeyOptions {
-            when: When::Always,
-            ..Default::default()
-        },
-        move |_| {
-            if store.now_playing_open.get_untracked() {
-                store.set_now_playing_panel(NowPlayingPanel::Lyrics);
-            }
-        },
-    );
-
-    on_key_with(
-        "mod+2",
-        KeyOptions {
-            when: When::Always,
-            ..Default::default()
-        },
-        move |_| {
-            if store.now_playing_open.get_untracked() {
-                store.set_now_playing_panel(NowPlayingPanel::Queue);
-            }
-        },
-    );
-
-    on_key_with(
-        "mod+3",
-        KeyOptions {
-            when: When::Always,
-            ..Default::default()
-        },
-        move |_| {
-            if store.now_playing_open.get_untracked() && untracked(|| store.active_can("comments"))
-            {
-                store.set_now_playing_panel(NowPlayingPanel::Comments);
-            }
-        },
-    );
+    // Cmd/Ctrl+1..5 switch Now Playing panels in upstream `npTabs` order while open:
+    // Songs: Lyrics, Stage, Queue, Wall, Comments (capability-gated).
+    // Episodes: Podcast (About), Queue, Comments (capability-gated).
+    for (idx, shortcut) in [
+        (0, "mod+1"),
+        (1, "mod+2"),
+        (2, "mod+3"),
+        (3, "mod+4"),
+        (4, "mod+5"),
+    ] {
+        on_key_with(
+            shortcut,
+            KeyOptions {
+                when: When::Always,
+                ..Default::default()
+            },
+            move |_| {
+                switch_now_playing_tab(store, idx);
+            },
+        );
+    }
 
     // Escape closes active modal first, then search suggestions, then Now Playing overlay.
     on_key_with(
@@ -227,6 +544,32 @@ fn register_desktop_shortcuts(store: AppStore, search_ref: ElementRef) {
     );
 }
 
+fn switch_now_playing_tab(store: AppStore, index: usize) {
+    if !store.now_playing_open.get_untracked() {
+        return;
+    }
+    let Some(track) = store.current_track.get_untracked() else {
+        return;
+    };
+    let can_comments = untracked(|| store.active_can("comments"));
+    let mut panels = Vec::with_capacity(5);
+    if track.is_episode() {
+        panels.push(NowPlayingPanel::Podcast);
+        panels.push(NowPlayingPanel::Queue);
+    } else {
+        panels.push(NowPlayingPanel::Lyrics);
+        panels.push(NowPlayingPanel::Stage);
+        panels.push(NowPlayingPanel::Queue);
+        panels.push(NowPlayingPanel::Wall);
+    }
+    if can_comments {
+        panels.push(NowPlayingPanel::Comments);
+    }
+    if let Some(&panel) = panels.get(index) {
+        store.set_now_playing_panel(panel);
+    }
+}
+
 fn desktop_top_bar(store: AppStore) -> View {
     let scrolled = store.page_scrolled;
     let route_title = computed(move || resolve_route_title(store));
@@ -234,24 +577,25 @@ fn desktop_top_bar(store: AppStore) -> View {
     view()
         .test_id("desktop-title-bar")
         .w_full()
-        .h(move || {
-            let top = title_bar().top.0;
-            px(if top > 0.0 {
-                top.max(TITLE_BAR_HEIGHT)
-            } else {
-                TITLE_BAR_HEIGHT
-            })
-        })
+        .h(move || px(title_bar().top.0.max(TITLE_BAR_HEIGHT)))
         .flex_shrink_0()
         .flex_row()
         .items_center()
         .justify_between()
         .gap_3()
-        .pl_3()
-        .pr(move || title_bar().right + px(14.0))
+        .pl(move || {
+            let sidebar_w = if store.sidebar_collapsed.get() {
+                SIDEBAR_COLLAPSED_W
+            } else {
+                SIDEBAR_EXPANDED_W
+            };
+            let extra_left = (title_bar().left.0 - sidebar_w).max(0.0);
+            px(12.0 + extra_left)
+        })
+        .pr(move || px(title_bar().right.0 + 14.0))
         .bg(move || {
             if scrolled.get() {
-                theme::glass_bar()
+                theme::card()
             } else {
                 theme::bg()
             }
@@ -348,7 +692,7 @@ fn desktop_top_bar(store: AppStore) -> View {
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(theme::fg)
                         .opacity(move || if scrolled.get() { 1.0_f32 } else { 0.0_f32 })
-                        .transition_all()
+                        .transition_opacity()
                         .duration(move || motion::transition_ms(160.0)),
                 ),
         )
@@ -391,7 +735,7 @@ fn desktop_top_bar(store: AppStore) -> View {
         )
 }
 
-fn desktop_sidebar(store: AppStore, search_ref: ElementRef) -> View {
+fn desktop_sidebar(store: AppStore, search_ref: ElementRef, sidebar_header_h: Signal<f32>) -> View {
     let collapsed = store.sidebar_collapsed;
 
     view()
@@ -410,15 +754,15 @@ fn desktop_sidebar(store: AppStore, search_ref: ElementRef) -> View {
         .border_color(theme::sidebar_border)
         .transition_all()
         .duration(move || motion::transition_ms(240.0))
-        // Top drag clearance under macOS traffic lights (`title_bar().top.0.max(12.0)`).
+        // Generous top drag clearance below macOS traffic lights (upstream `topBar(c) + 4`).
         .child(
             view()
                 .w_full()
-                .h(move || px(title_bar().top.0.max(12.0)))
+                .h(move || px(sidebar_top_clearance()))
                 .flex_shrink_0()
                 .window_drag(true),
         )
-        // Source switcher + integrated sidebar search box.
+        // Source switcher + integrated sidebar search box (measured for floating suggestions anchor).
         .child(
             view()
                 .w_full()
@@ -426,13 +770,23 @@ fn desktop_sidebar(store: AppStore, search_ref: ElementRef) -> View {
                 .pb_2()
                 .gap_2()
                 .flex_shrink_0()
+                .on_layout(move |bounds: &Bounds<Points>| {
+                    let h = bounds.size.height.0;
+                    if h > 0.0 && (sidebar_header_h.get_untracked() - h).abs() > 0.5 {
+                        sidebar_header_h.set(h);
+                    }
+                })
                 .child(
                     when(
                         move || !collapsed.get(),
                         move || {
-                            source_pill(move || store.active_source_name(), true, move || {
-                                store.open_modal(ActiveModal::SourceSwitcher);
-                            })
+                            source_pill(
+                                move || store.active_source_name(),
+                                true,
+                                move || {
+                                    store.open_modal(ActiveModal::SourceSwitcher);
+                                },
+                            )
                             .w_full()
                             .test_id("desktop-source-switcher")
                         },
@@ -569,94 +923,87 @@ fn sidebar_search_area(
         move || !collapsed.get(),
         move || {
             let has_query = computed(move || store.search_query.with(|q| !q.is_empty()));
-            let has_suggestions = computed(move || {
-                store.search_suggestions.with(|v| !v.is_empty())
-                    || store.recent_searches.with(|v| !v.is_empty())
-            });
 
             view()
                 .w_full()
+                .h(px(32.0))
+                .px_2()
+                .flex_row()
+                .items_center()
                 .gap_1p5()
+                .rounded(px(9.0))
+                .bg(theme::card)
+                .border_1()
+                .border_color(theme::input_border)
+                .focus_within(|s| s.border_color(theme::ring))
                 .child(
-                    view()
-                        .w_full()
-                        .h(px(32.0))
-                        .px_2()
-                        .flex_row()
+                    button()
+                        .test_id("nav-search")
+                        .accessibility_label(move || Some(store.t("nav.search")))
+                        .on_press(move || {
+                            store.navigate(Route::Search);
+                            search_ref.focus();
+                        })
+                        .size(px(22.0))
+                        .flex_shrink_0()
                         .items_center()
-                        .gap_1p5()
-                        .rounded(px(9.0))
-                        .bg(theme::card)
-                        .border_1()
-                        .border_color(theme::input_border)
-                        .focus_within(|s| s.border_color(theme::ring))
-                        .child(
-                            button()
-                                .test_id("nav-search")
-                                .accessibility_label(move || Some(store.t("nav.search")))
-                                .on_press(move || {
-                                    store.navigate(Route::Search);
-                                    search_ref.focus();
-                                })
-                                .size(px(22.0))
-                                .flex_shrink_0()
-                                .items_center()
-                                .justify_center()
-                                .rounded(px(radius::SM))
-                                .hover(|s| s.bg(theme::hover))
-                                .active(|s| s.scale(motion::press_scale))
-                                .child(icon(Icon::Search, 14.0, colors::MUTED_FOREGROUND)),
-                        )
-                        .child(
-                            input()
-                                .element_ref(&search_ref)
-                                .test_id("desktop-search-input")
-                                .value(move || store.search_query.get())
-                                .on_change(move |q: &str| {
-                                    store.update_search_query(q.to_owned());
-                                })
-                                .on_focus(move || {
-                                    if !store.search_suggestions.with_untracked(Vec::is_empty)
-                                        || !store.recent_searches.with_untracked(Vec::is_empty)
-                                    {
-                                        store.search_suggest_open.set(true);
-                                    }
-                                })
-                                .on_submit(move |q: &str| {
-                                    store.search(q);
-                                    store.navigate(Route::Search);
-                                })
-                                .placeholder(move || store.t("nav.search").to_string())
-                                .placeholder_color(|| color(theme::muted_fg()))
-                                .caret_color(|| color(theme::primary()))
-                                .selection_color(|| color(theme::primary_soft()))
-                                .return_key_type(ReturnKeyType::Search)
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .h_full()
-                                .text_size(px(font_size::SUBTITLE))
-                                .text_color(theme::fg),
-                        )
-                        .child(when(has_query, move || {
-                            icon_button_sized(
-                                Icon::Close,
-                                20.0,
-                                12.0,
-                                theme::muted_fg,
-                                move || store.t("common.close"),
-                                move || store.update_search_query(String::new()),
-                            )
-                            .test_id("desktop-search-clear")
-                        })),
+                        .justify_center()
+                        .rounded(px(radius::SM))
+                        .hover(|s| s.bg(theme::hover))
+                        .active(|s| s.scale(motion::press_scale))
+                        .child(icon(Icon::Search, 14.0, colors::MUTED_FOREGROUND)),
                 )
-                .child(when(
-                    move || store.search_suggest_open.get() && has_suggestions.get(),
-                    move || sidebar_suggestions_popover(store),
-                ))
+                .child(
+                    input()
+                        .element_ref(&search_ref)
+                        .test_id("desktop-search-input")
+                        .value(move || store.search_query.get())
+                        .on_change(move |q: &str| {
+                            store.update_search_query(q.to_owned());
+                        })
+                        .on_focus(move || {
+                            if !store.search_suggestions.with_untracked(Vec::is_empty)
+                                || !store.recent_searches.with_untracked(Vec::is_empty)
+                            {
+                                store.search_suggest_open.set(true);
+                            }
+                        })
+                        .on_submit(move |q: &str| {
+                            store.search(q);
+                            store.navigate(Route::Search);
+                        })
+                        .placeholder(move || store.t("nav.search").to_string())
+                        .placeholder_color(|| color(theme::muted_fg()))
+                        .caret_color(|| color(theme::primary()))
+                        .selection_color(|| color(theme::primary_soft()))
+                        .return_key_type(ReturnKeyType::Search)
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .h_full()
+                        .text_size(px(font_size::SUBTITLE))
+                        .text_color(theme::fg),
+                )
+                .child(when(has_query, move || {
+                    icon_button_sized(
+                        Icon::Close,
+                        20.0,
+                        12.0,
+                        theme::muted_fg,
+                        move || store.t("common.close"),
+                        move || store.update_search_query(String::new()),
+                    )
+                    .test_id("desktop-search-clear")
+                }))
         },
     )
     .otherwise(move || {
-        sidebar_nav_item(store, Icon::Search, "nav.search", Route::Search, "nav-search")
+        sidebar_nav_item(
+            store,
+            Icon::Search,
+            "nav.search",
+            Route::Search,
+            "nav-search",
+        )
     })
 }
 
@@ -665,147 +1012,155 @@ fn sidebar_suggestions_popover(store: AppStore) -> View {
         view()
             .test_id("desktop-search-suggestions")
             .w_full()
-            .p_1p5()
-            .gap_1()
+            .max_h(px(340.0))
             .rounded(px(radius::CONTROL))
             .bg(theme::popover)
             .border_1()
-            .border_color(theme::border),
+            .border_color(theme::border)
+            .overflow_hidden(),
         Elevation::Popover,
     )
-    .child(when(
-        move || store.search_suggestions.with(|v| !v.is_empty()),
-        move || {
+    .child(
+        scroll().w_full().max_h(px(338.0)).child(
             view()
                 .w_full()
-                .gap_0p5()
-                .child(
-                    view()
-                        .w_full()
-                        .px_2()
-                        .py_0p5()
-                        .flex_row()
-                        .items_center()
-                        .justify_between()
-                        .child(
-                            text(move || store.t("search.suggestions"))
-                                .text_size(px(font_size::MICRO))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(theme::faint_fg),
-                        )
-                        .child(icon_button_sized(
-                            Icon::Close,
-                            20.0,
-                            11.0,
-                            theme::muted_fg,
-                            move || store.t("common.close"),
-                            move || store.search_suggest_open.set(false),
-                        )),
-                )
-                .child(each(
-                    store.search_suggestions,
-                    |s| s.clone(),
-                    move |item, _| {
-                        let term = item.get_untracked();
-                        button()
-                            .on_press(move || {
-                                store.search(&term);
-                                store.navigate(Route::Search);
-                            })
+                .p_1p5()
+                .gap_1()
+                .child(when(
+                    move || store.search_suggestions.with(|v| !v.is_empty()),
+                    move || {
+                        view()
                             .w_full()
-                            .h(px(28.0))
-                            .px_2()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .rounded(px(radius::SM))
-                            .hover(|s| s.bg(theme::accent))
-                            .active(|s| s.bg(theme::press))
-                            .child(icon(Icon::Search, 12.0, colors::MUTED_FOREGROUND))
+                            .gap_0p5()
                             .child(
-                                text(move || SharedString::from(item.get()))
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .number_of_lines(1)
-                                    .text_size(px(font_size::CAPTION))
-                                    .text_color(theme::popover_fg),
+                                view()
+                                    .w_full()
+                                    .px_2()
+                                    .py_0p5()
+                                    .flex_row()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        text(move || store.t("search.suggestions"))
+                                            .text_size(px(font_size::MICRO))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(theme::faint_fg),
+                                    )
+                                    .child(icon_button_sized(
+                                        Icon::Close,
+                                        20.0,
+                                        11.0,
+                                        theme::muted_fg,
+                                        move || store.t("common.close"),
+                                        move || store.search_suggest_open.set(false),
+                                    )),
                             )
+                            .child(each(
+                                store.search_suggestions,
+                                |s| s.clone(),
+                                move |item, _| {
+                                    let term = item.get_untracked();
+                                    button()
+                                        .on_press(move || {
+                                            store.search(&term);
+                                            store.navigate(Route::Search);
+                                        })
+                                        .w_full()
+                                        .h(px(28.0))
+                                        .px_2()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_2()
+                                        .rounded(px(radius::SM))
+                                        .hover(|s| s.bg(theme::accent))
+                                        .active(|s| s.bg(theme::press))
+                                        .child(icon(Icon::Search, 12.0, colors::MUTED_FOREGROUND))
+                                        .child(
+                                            text(move || SharedString::from(item.get()))
+                                                .flex_1()
+                                                .min_w(px(0.0))
+                                                .number_of_lines(1)
+                                                .text_size(px(font_size::CAPTION))
+                                                .text_color(theme::popover_fg),
+                                        )
+                                },
+                            ))
                     },
                 ))
-        },
-    ))
-    .child(when(
-        move || {
-            store.search_suggestions.with(Vec::is_empty)
-                && store.recent_searches.with(|v| !v.is_empty())
-        },
-        move || {
-            view()
-                .w_full()
-                .gap_0p5()
-                .child(
-                    view()
-                        .w_full()
-                        .px_2()
-                        .py_0p5()
-                        .flex_row()
-                        .items_center()
-                        .justify_between()
-                        .child(
-                            text(move || store.t("search.recent"))
-                                .text_size(px(font_size::MICRO))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(theme::faint_fg),
-                        )
-                        .child(
-                            button()
-                                .on_press(move || {
-                                    store.clear_recent_searches();
-                                    store.search_suggest_open.set(false);
-                                })
-                                .px_1p5()
-                                .py_0p5()
-                                .rounded(px(radius::SM))
-                                .hover(|s| s.bg(theme::hover))
-                                .child(
-                                    text(move || store.t("search.clear_recent"))
-                                        .text_size(px(10.0))
-                                        .text_color(theme::muted_fg),
-                                ),
-                        ),
-                )
-                .child(each(
-                    store.recent_searches,
-                    |s| s.clone(),
-                    move |item, _| {
-                        let term = item.get_untracked();
-                        button()
-                            .on_press(move || {
-                                store.search(&term);
-                                store.navigate(Route::Search);
-                            })
-                            .w_full()
-                            .h(px(28.0))
-                            .px_2()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .rounded(px(radius::SM))
-                            .hover(|s| s.bg(theme::accent))
-                            .active(|s| s.bg(theme::press))
-                            .child(icon(Icon::Disc, 12.0, colors::MUTED_FOREGROUND))
-                            .child(
-                                text(move || SharedString::from(item.get()))
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .number_of_lines(1)
-                                    .text_size(px(font_size::CAPTION))
-                                    .text_color(theme::popover_fg),
-                            )
+                .child(when(
+                    move || {
+                        store.search_suggestions.with(Vec::is_empty)
+                            && store.recent_searches.with(|v| !v.is_empty())
                     },
-                ))
-        },
-    ))
+                    move || {
+                        view()
+                            .w_full()
+                            .gap_0p5()
+                            .child(
+                                view()
+                                    .w_full()
+                                    .px_2()
+                                    .py_0p5()
+                                    .flex_row()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        text(move || store.t("search.recent"))
+                                            .text_size(px(font_size::MICRO))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(theme::faint_fg),
+                                    )
+                                    .child(
+                                        button()
+                                            .on_press(move || {
+                                                store.clear_recent_searches();
+                                                store.search_suggest_open.set(false);
+                                            })
+                                            .px_1p5()
+                                            .py_0p5()
+                                            .rounded(px(radius::SM))
+                                            .hover(|s| s.bg(theme::hover))
+                                            .child(
+                                                text(move || store.t("search.clear_recent"))
+                                                    .text_size(px(10.0))
+                                                    .text_color(theme::muted_fg),
+                                            ),
+                                    ),
+                            )
+                            .child(each(
+                                store.recent_searches,
+                                |s| s.clone(),
+                                move |item, _| {
+                                    let term = item.get_untracked();
+                                    button()
+                                        .on_press(move || {
+                                            store.search(&term);
+                                            store.navigate(Route::Search);
+                                        })
+                                        .w_full()
+                                        .h(px(28.0))
+                                        .px_2()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_2()
+                                        .rounded(px(radius::SM))
+                                        .hover(|s| s.bg(theme::accent))
+                                        .active(|s| s.bg(theme::press))
+                                        .child(icon(Icon::Disc, 12.0, colors::MUTED_FOREGROUND))
+                                        .child(
+                                            text(move || SharedString::from(item.get()))
+                                                .flex_1()
+                                                .min_w(px(0.0))
+                                                .number_of_lines(1)
+                                                .text_size(px(font_size::CAPTION))
+                                                .text_color(theme::popover_fg),
+                                        )
+                                },
+                            ))
+                    },
+                )),
+        ),
+    )
 }
 
 fn sidebar_section_label(
@@ -838,7 +1193,11 @@ fn sidebar_nav_item(
 ) -> impl IntoElement {
     let collapsed = store.sidebar_collapsed;
     let target_check = target.clone();
-    let active = computed(move || route_matches(&store.route.get(), &target_check));
+    let active = computed(move || {
+        let current = store.route.get();
+        let custom = active_custom_nav(store);
+        route_matches(&current, &target_check, &custom)
+    });
 
     button()
         .test_id(test_id)
@@ -948,6 +1307,17 @@ fn desktop_plugin_nav_section(store: AppStore) -> impl IntoElement {
                         .hover(|s| s.bg(theme::hover))
                         .active(|s| s.bg(theme::press).scale(motion::press_scale))
                         .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
+                        .child(
+                            view()
+                                .absolute()
+                                .left_0()
+                                .top(px(7.0))
+                                .w(px(3.0))
+                                .h(px(20.0))
+                                .rounded_full()
+                                .bg(theme::primary)
+                                .opacity(move || if active.get() { 1.0_f32 } else { 0.0_f32 }),
+                        )
                         .child(icon_reactive(Icon::Compass, 16.0, move || {
                             if active.get() {
                                 theme::primary()
@@ -1227,8 +1597,14 @@ fn sidebar_playlist_row(
 }
 
 fn desktop_sidebar_footer(store: AppStore, collapsed: Signal<bool>) -> View {
-    let can_account =
-        computed(move || store.active_can("signIn") || store.active_can("account"));
+    let can_account = computed(move || store.active_can("signIn") || store.active_can("account"));
+    let settings_active = computed(move || {
+        store.settings_window_open.get()
+            || matches!(
+                store.route.get(),
+                Route::Settings | Route::SettingsDetail(_)
+            )
+    });
 
     view()
         .w_full()
@@ -1241,28 +1617,79 @@ fn desktop_sidebar_footer(store: AppStore, collapsed: Signal<bool>) -> View {
         .child(when(can_account, move || {
             desktop_account_row(store, collapsed)
         }))
-        .child(sidebar_nav_item(
-            store,
-            Icon::Plugin,
-            "nav.plugins",
-            Route::Plugins,
-            "nav-plugins",
-        ))
-        .child(sidebar_nav_item(
-            store,
-            Icon::Settings,
-            "nav.settings",
-            Route::Settings,
-            "nav-settings",
-        ))
+        .child(
+            button()
+                .test_id("nav-settings")
+                .selected(settings_active)
+                .accessibility_label(move || Some(store.t("nav.settings")))
+                .on_press(move || store.open_settings_window(SettingsSection::General))
+                .w_full()
+                .h(px(34.0))
+                .px_2p5()
+                .flex_row()
+                .items_center()
+                .gap_2p5()
+                .rounded(px(radius::CONTROL))
+                .style_when(collapsed, |s| s.justify_center().px_0())
+                .bg(move || {
+                    if settings_active.get() {
+                        theme::selected()
+                    } else {
+                        colors::TRANSPARENT
+                    }
+                })
+                .transition_colors()
+                .duration(move || motion::transition_ms(140.0))
+                .hover(|s| s.bg(theme::hover))
+                .active(|s| s.bg(theme::press).scale(motion::press_scale))
+                .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
+                .child(
+                    view()
+                        .absolute()
+                        .left_0()
+                        .top(px(7.0))
+                        .w(px(3.0))
+                        .h(px(20.0))
+                        .rounded_full()
+                        .bg(theme::primary)
+                        .opacity(move || {
+                            if settings_active.get() {
+                                1.0_f32
+                            } else {
+                                0.0_f32
+                            }
+                        }),
+                )
+                .child(icon_reactive(Icon::Settings, 17.0, move || {
+                    if settings_active.get() {
+                        theme::primary()
+                    } else {
+                        theme::muted_fg()
+                    }
+                }))
+                .child(when(
+                    move || !collapsed.get(),
+                    move || {
+                        text(move || store.t("nav.settings"))
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .number_of_lines(1)
+                            .text_size(px(font_size::BODY))
+                            .style_when(settings_active, |s| s.font_weight(FontWeight::SEMIBOLD))
+                            .text_color(move || {
+                                if settings_active.get() {
+                                    theme::primary()
+                                } else {
+                                    theme::sidebar_fg()
+                                }
+                            })
+                    },
+                )),
+        )
 }
 
 fn desktop_account_row(store: AppStore, collapsed: Signal<bool>) -> View {
-    let entry_memo = computed(move || {
-        store
-            .active_source_entry()
-            .map(|e| (e.info.id, e.account))
-    });
+    let entry_memo = computed(move || store.active_source_entry().map(|e| (e.info.id, e.account)));
 
     view().w_full().child(dynamic(move || {
         let Some((source_id, account)) = entry_memo.get() else {
@@ -1288,14 +1715,8 @@ fn desktop_account_row(store: AppStore, collapsed: Signal<bool>) -> View {
                     );
                 }
                 actions.push(
-                    ContextMenuAction::new(store.t("nav.plugins"), move || {
-                        store.navigate(Route::Plugins);
-                    })
-                    .icon(Icon::Plugin),
-                );
-                actions.push(
                     ContextMenuAction::new(store.t("nav.settings"), move || {
-                        store.navigate(Route::Settings);
+                        store.open_settings_window(SettingsSection::General);
                     })
                     .icon(Icon::Settings),
                 );
@@ -1390,7 +1811,25 @@ fn desktop_main_viewport(store: AppStore) -> View {
         .child(pages::render_route(store, DeviceForm::Desktop))
 }
 
+#[derive(Clone, PartialEq, Eq)]
+enum PlayerSubtitle {
+    Idle,
+    Buffering,
+    Error(String),
+    Artists(Vec<Artist>),
+}
+
 fn desktop_player_bar(store: AppStore) -> View {
+    let has_track = computed(move || store.current_track.with(Option::is_some));
+
+    let is_episode = computed(move || {
+        store
+            .current_track
+            .with(|t| t.as_ref().is_some_and(Track::is_episode))
+    });
+
+    let is_loading = computed(move || store.playback_status.with(PlaybackStatus::is_loading));
+
     let track_seed = computed(move || {
         store.current_track.with(|t| match t {
             Some(tr) if !tr.album.id.is_empty() => SharedString::from(tr.album.id.clone()),
@@ -1405,14 +1844,29 @@ fn desktop_player_bar(store: AppStore) -> View {
             .with(|t| t.as_ref().is_some_and(|tr| store.is_liked(&tr.id)))
     });
 
-    let buffered_ratio = move || {
+    // Narrow memo so Play/Pause toggles and 60ms `position_ms` ticks never rebuild artist links.
+    let subtitle_state = computed(move || {
+        match store.playback_status.get() {
+            PlaybackStatus::Loading => return PlayerSubtitle::Buffering,
+            PlaybackStatus::Error(msg) => return PlayerSubtitle::Error(msg),
+            PlaybackStatus::Stopped | PlaybackStatus::Playing | PlaybackStatus::Paused => {}
+        }
+        store.current_track.with(|t| match t {
+            Some(tr) => PlayerSubtitle::Artists(tr.artists.clone()),
+            None => PlayerSubtitle::Idle,
+        })
+    });
+
+    // Quantized buffered ratio memo to prevent high-frequency sub-pixel layout churn.
+    let buffered_ratio = computed(move || {
         let dur = store.duration_ms.get();
         if dur == 0 {
             0.0_f32
         } else {
-            (store.buffered_ms.get() as f32 / dur as f32).clamp(0.0, 1.0)
+            let raw = (store.buffered_ms.get() as f32 / dur as f32).clamp(0.0, 1.0);
+            (raw * 250.0).round() / 250.0
         }
-    };
+    });
 
     view()
         .test_id("player-bar")
@@ -1424,86 +1878,164 @@ fn desktop_player_bar(store: AppStore) -> View {
         .justify_between()
         .gap_4()
         .px_5()
-        .glass_bar_surface()
+        .bg(theme::card)
         .border_t_1()
         .border_color(theme::border)
-        // Left: artwork, title/artist (opens Now Playing), like button.
+        // Left: 48x48 cover (hover reveals scrim + upward chevron), title, clickable artist links
+        // (or buffering/error status), and Like heart button.
         .child(
             view()
                 .flex_1()
-                .min_w(px(160.0))
+                .min_w(px(176.0))
                 .flex_row()
                 .items_center()
                 .gap_3()
                 .child(
                     button()
                         .test_id("desktop-now-playing-trigger")
+                        .group()
                         .accessibility_label(move || Some(store.t("now_playing.expand")))
-                        .on_press(move || store.open_now_playing())
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .flex_row()
-                        .items_center()
-                        .gap_3()
-                        .p_1()
-                        .rounded(px(radius::CONTROL))
-                        .hover(|s| s.bg(theme::hover))
+                        .on_press(move || {
+                            if store.current_track.with_untracked(Option::is_some) {
+                                store.open_now_playing();
+                            }
+                        })
+                        .size(px(48.0))
+                        .flex_shrink_0()
+                        .rounded(px(radius::SM))
+                        .overflow_hidden()
                         .active(|s| s.scale(motion::press_scale))
                         .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
-                        .child(dynamic(move || {
-                            let seed = track_seed.get();
-                            untracked(move || {
-                                artwork_box(store.current_artwork_uri, seed, 52.0, radius::SM)
-                            })
-                        }))
                         .child(
-                            view()
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .gap_0p5()
-                                .child(
-                                    text(move || {
-                                        store.current_track.with(|t| match t {
-                                            Some(tr) => SharedString::from(tr.name.clone()),
-                                            None => store.t("player.idle_title"),
+                            when(has_track, move || {
+                                view()
+                                    .size_full()
+                                    .child(dynamic(move || {
+                                        let seed = track_seed.get();
+                                        untracked(move || {
+                                            artwork_box(
+                                                store.current_artwork_uri,
+                                                seed,
+                                                48.0,
+                                                radius::SM,
+                                            )
                                         })
-                                    })
-                                    .number_of_lines(1)
-                                    .text_size(px(font_size::BODY))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme::fg),
-                                )
-                                .child(
-                                    text(move || {
-                                        store.current_track.with(|t| match t {
-                                            Some(tr) => SharedString::from(tr.artist_names()),
-                                            None => SharedString::default(),
-                                        })
-                                    })
-                                    .number_of_lines(1)
-                                    .text_size(px(font_size::CAPTION))
-                                    .text_color(theme::muted_fg),
-                                ),
+                                    }))
+                                    .child(
+                                        view()
+                                            .absolute()
+                                            .inset_0()
+                                            .items_center()
+                                            .justify_center()
+                                            .bg(colors::MEDIA_BADGE_BG)
+                                            .opacity(0.0)
+                                            .transition_opacity()
+                                            .duration(move || motion::transition_ms(140.0))
+                                            .group_hover(|s| s.opacity(1.0))
+                                            .pointer_events(PointerEvents::None)
+                                            .child(
+                                                icon(
+                                                    Icon::ChevronDown,
+                                                    18.0,
+                                                    colors::MEDIA_BADGE_FG,
+                                                )
+                                                .rotate(Radians(PI)),
+                                            ),
+                                    )
+                            })
+                            .otherwise(move || {
+                                view()
+                                    .size_full()
+                                    .items_center()
+                                    .justify_center()
+                                    .bg(theme::muted)
+                                    .child(icon(Icon::Disc, 20.0, colors::FAINT_FOREGROUND))
+                            }),
                         ),
                 )
-                .child(when(
-                    move || store.current_track.with(|t| t.is_some()),
-                    move || {
-                        heart_button(
-                            track_liked,
-                            move || {
-                                if track_liked.get() {
-                                    store.t("player.unlike")
-                                } else {
-                                    store.t("player.like")
-                                }
-                            },
-                            move || store.toggle_like_current(),
+                .child(
+                    view()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .gap_0p5()
+                        .child(
+                            when(has_track, move || {
+                                button()
+                                    .accessibility_label(move || {
+                                        Some(store.t("now_playing.expand"))
+                                    })
+                                    .on_press(move || store.open_now_playing())
+                                    .w_full()
+                                    .items_start()
+                                    .min_w(px(0.0))
+                                    .rounded(px(radius::SM))
+                                    .hover(|s| s.opacity(0.78))
+                                    .focus_visible(|s| {
+                                        s.outline(px(2.0)).outline_color(theme::ring)
+                                    })
+                                    .child(
+                                        text(move || {
+                                            store.current_track.with(|t| match t {
+                                                Some(tr) => SharedString::from(tr.name.clone()),
+                                                None => SharedString::default(),
+                                            })
+                                        })
+                                        .number_of_lines(1)
+                                        .text_size(px(font_size::BODY))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(theme::fg),
+                                    )
+                            })
+                            .otherwise(move || {
+                                text(move || store.t("player.idle_title"))
+                                    .number_of_lines(1)
+                                    .text_size(px(font_size::BODY))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme::muted_fg)
+                            }),
                         )
-                    },
-                )),
+                        .child(dynamic(move || match subtitle_state.get() {
+                            PlayerSubtitle::Idle => view().into_element(),
+                            PlayerSubtitle::Buffering => view()
+                                .w_full()
+                                .min_w(px(0.0))
+                                .flex_row()
+                                .items_center()
+                                .gap_1p5()
+                                .child(loading_spinner(11.0, theme::muted_fg))
+                                .child(
+                                    text(move || store.t("player.buffering"))
+                                        .number_of_lines(1)
+                                        .text_size(px(font_size::CAPTION))
+                                        .text_color(theme::muted_fg),
+                                )
+                                .into_element(),
+                            PlayerSubtitle::Error(msg) => text(SharedString::from(msg))
+                                .number_of_lines(1)
+                                .text_size(px(font_size::CAPTION))
+                                .text_color(theme::danger)
+                                .into_element(),
+                            PlayerSubtitle::Artists(artists) => {
+                                untracked(move || player_artist_links(store, artists))
+                                    .into_element()
+                            }
+                        })),
+                )
+                .child(when(has_track, move || {
+                    heart_button(
+                        track_liked,
+                        move || {
+                            if track_liked.get() {
+                                store.t("player.unlike")
+                            } else {
+                                store.t("player.like")
+                            }
+                        },
+                        move || store.toggle_like_current(),
+                    )
+                })),
         )
-        // Center: transport controls + smoke-mode scrubber.
+        // Center: transport controls + smoke-mode scrubber (smoke paused while Now Playing covers bar).
         .child(
             view()
                 .w(px(420.0))
@@ -1547,11 +2079,14 @@ fn desktop_player_bar(store: AppStore) -> View {
                             )
                             .test_id("desktop-prev-btn"),
                         )
-                        .child(play_pause_button(
+                        .child(play_pause_button_buffering(
                             store.is_playing,
+                            is_loading,
                             34.0,
                             move || {
-                                if store.is_playing.get() {
+                                if is_loading.get() {
+                                    store.t("player.buffering")
+                                } else if store.is_playing.get() {
                                     store.t("player.pause")
                                 } else {
                                     store.t("player.play")
@@ -1597,16 +2132,21 @@ fn desktop_player_bar(store: AppStore) -> View {
                 .child(
                     scrubber(store.position_ms, store.duration_ms)
                         .buffered_ratio(buffered_ratio)
-                        .smoke_mode(move || store.settings.with(|s| s.smoke_progress))
+                        .smoke_mode(move || {
+                            !store.now_playing_open.get()
+                                && store.settings.with(|s| s.smoke_progress)
+                        })
                         .playing(move || store.is_playing.get())
                         .accent(move || store.current_accent.get())
                         .spectrum(store.spectrum)
+                        .disabled(move || !has_track.get())
                         .show_labels(true)
                         .inline_labels(true)
                         .on_seek(move |ms| store.seek(ms)),
                 ),
         )
-        // Right: lyrics toggle, queue button, remote devices menu, volume slider, expand Now Playing.
+        // Right: adaptive lyrics/episode toggle, queue button, remote devices menu, volume slider,
+        // expand Now Playing.
         .child(
             view()
                 .flex_1()
@@ -1617,28 +2157,62 @@ fn desktop_player_bar(store: AppStore) -> View {
                 .gap_1p5()
                 .child(
                     icon_button_sized(
-                        Icon::Lyrics,
+                        move || {
+                            if is_episode.get() {
+                                Icon::Podcast
+                            } else {
+                                Icon::Lyrics
+                            }
+                        },
                         30.0,
                         16.0,
                         move || {
-                            if store.now_playing_open.get()
-                                && store.now_playing_panel.get() == NowPlayingPanel::Lyrics
-                            {
+                            let open = store.now_playing_open.get();
+                            let panel = store.now_playing_panel.get();
+                            let active = open
+                                && if is_episode.get() {
+                                    panel == NowPlayingPanel::Podcast
+                                } else {
+                                    matches!(
+                                        panel,
+                                        NowPlayingPanel::Lyrics | NowPlayingPanel::Stage
+                                    )
+                                };
+                            if active {
                                 theme::primary()
                             } else {
                                 theme::muted_fg()
                             }
                         },
-                        move || store.t("now_playing.panel.lyrics"),
                         move || {
-                            if store.now_playing_open.get_untracked()
-                                && store.now_playing_panel.get_untracked()
-                                    == NowPlayingPanel::Lyrics
-                            {
+                            if is_episode.get() {
+                                store.t("now_playing.panel.podcast")
+                            } else {
+                                store.t("now_playing.panel.lyrics")
+                            }
+                        },
+                        move || {
+                            let ep = is_episode.get_untracked();
+                            let target = if ep {
+                                NowPlayingPanel::Podcast
+                            } else {
+                                store.preferred_lyrics_panel()
+                            };
+                            let open = store.now_playing_open.get_untracked();
+                            let current = store.now_playing_panel.get_untracked();
+                            let already_active = open
+                                && if ep {
+                                    current == NowPlayingPanel::Podcast
+                                } else {
+                                    matches!(
+                                        current,
+                                        NowPlayingPanel::Lyrics | NowPlayingPanel::Stage
+                                    )
+                                };
+                            if already_active {
                                 store.close_now_playing();
                             } else {
-                                store.set_now_playing_panel(NowPlayingPanel::Lyrics);
-                                store.open_now_playing();
+                                store.open_now_playing_panel(target);
                             }
                         },
                     )
@@ -1661,8 +2235,7 @@ fn desktop_player_bar(store: AppStore) -> View {
                         move || store.t("player.queue"),
                         move || {
                             if store.now_playing_open.get_untracked()
-                                && store.now_playing_panel.get_untracked()
-                                    == NowPlayingPanel::Queue
+                                && store.now_playing_panel.get_untracked() == NowPlayingPanel::Queue
                             {
                                 store.close_now_playing();
                             } else {
@@ -1700,27 +2273,25 @@ fn desktop_player_bar(store: AppStore) -> View {
                     )
                     .test_id("desktop-mute-btn"),
                 )
-                .child(
-                    view().w(px(76.0)).child(styled_slider(
-                        move || {
-                            if store.muted.get() {
-                                0.0
-                            } else {
-                                f64::from(store.volume.get())
-                            }
-                        },
-                        0.0,
-                        1.0,
-                        0.02,
-                        move || store.t("player.volume"),
-                        move |v| {
-                            if store.muted.get_untracked() && v > 0.0 {
-                                store.toggle_mute();
-                            }
-                            store.set_volume(v as f32);
-                        },
-                    )),
-                )
+                .child(view().w(px(84.0)).child(styled_slider(
+                    move || {
+                        if store.muted.get() {
+                            0.0
+                        } else {
+                            f64::from(store.volume.get())
+                        }
+                    },
+                    0.0,
+                    1.0,
+                    0.02,
+                    move || store.t("player.volume"),
+                    move |v| {
+                        if store.muted.get_untracked() && v > 0.0 {
+                            store.toggle_mute();
+                        }
+                        store.set_volume(v as f32);
+                    },
+                )))
                 .child(
                     icon_button_sized(
                         Icon::Expand,
@@ -1733,6 +2304,64 @@ fn desktop_player_bar(store: AppStore) -> View {
                     .test_id("desktop-expand-btn"),
                 ),
         )
+}
+
+fn player_artist_links(store: AppStore, artists: Vec<Artist>) -> View {
+    let mut row = view()
+        .w_full()
+        .min_w(px(0.0))
+        .flex_row()
+        .items_center()
+        .overflow_hidden();
+
+    let mut rendered = 0usize;
+    for artist in artists {
+        if artist.name.is_empty() {
+            continue;
+        }
+        if rendered > 0 {
+            row = row.child(
+                text(", ")
+                    .flex_shrink_0()
+                    .text_size(px(font_size::CAPTION))
+                    .text_color(theme::muted_fg),
+            );
+        }
+        let name = SharedString::from(artist.name);
+        if artist.id.is_empty() {
+            row = row.child(
+                text(name)
+                    .min_w(px(0.0))
+                    .number_of_lines(1)
+                    .text_size(px(font_size::CAPTION))
+                    .text_color(theme::muted_fg),
+            );
+        } else {
+            let artist_id = artist.id;
+            let label = name.clone();
+            row = row.child(
+                button()
+                    .group()
+                    .accessibility_label(Some(label))
+                    .on_press(move || {
+                        store.go_to_artist(&artist_id);
+                    })
+                    .min_w(px(0.0))
+                    .rounded(px(radius::SM))
+                    .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
+                    .child(
+                        text(name)
+                            .number_of_lines(1)
+                            .text_size(px(font_size::CAPTION))
+                            .text_color(theme::muted_fg)
+                            .group_hover(|s| s.text_color(theme::fg)),
+                    ),
+            );
+        }
+        rendered += 1;
+    }
+
+    row
 }
 
 fn remote_devices_menu(store: AppStore) -> View {
@@ -1808,16 +2437,26 @@ fn resolve_route_title(store: AppStore) -> SharedString {
             .unwrap_or_else(|| store.t("nav.playlists")),
         Route::AlbumDetail { .. } => store
             .active_album
-            .with(|a| a.as_ref().map(|al| SharedString::from(al.album.name.clone())))
+            .with(|a| {
+                a.as_ref()
+                    .map(|al| SharedString::from(al.album.name.clone()))
+            })
             .unwrap_or_else(|| store.t("nav.albums")),
         Route::ArtistDetail { .. } => store
             .active_artist
-            .with(|a| a.as_ref().map(|ar| SharedString::from(ar.artist.name.clone())))
+            .with(|a| {
+                a.as_ref()
+                    .map(|ar| SharedString::from(ar.artist.name.clone()))
+            })
             .unwrap_or_else(|| store.t("nav.artists")),
         Route::ShowDetail { .. } => store
             .active_show
-            .with(|s| s.as_ref().map(|sh| SharedString::from(sh.show.name.clone())))
+            .with(|s| {
+                s.as_ref()
+                    .map(|sh| SharedString::from(sh.show.name.clone()))
+            })
             .unwrap_or_else(|| store.t("nav.podcasts")),
+        Route::SettingsDetail(section) => store.t(section.title_key()),
         other => store.t(other.title_key()),
     }
 }
@@ -1852,11 +2491,16 @@ fn active_custom_nav(store: AppStore) -> Vec<NavItem> {
         .unwrap_or_default()
 }
 
-fn route_matches(current: &Route, target: &Route) -> bool {
+fn route_matches(current: &Route, target: &Route, custom_nav: &[NavItem]) -> bool {
     match (current, target) {
         (Route::Browse { page: a, .. }, Route::Browse { page: b, .. }) => {
-            b.is_empty() || a == b
+            if b.is_empty() {
+                a.is_empty() || !custom_nav.iter().any(|item| item.page == *a)
+            } else {
+                a == b
+            }
         }
+        (Route::Settings | Route::SettingsDetail(_), Route::Settings) => true,
         _ => current == target,
     }
 }

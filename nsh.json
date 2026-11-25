@@ -1,7 +1,8 @@
 {
-  "name": "nsh-music",
-  "id": "com.southorange.nshmusic",
+  "name": "NSH Music",
+  "id": "com.richerfu.nshmusic",
   "version": "0.1.0",
+  "icon": "assets/app-icon.png",
   "appearance": "system",
   "theme": "theme.json",
   "rust": ".",
@@ -9,6 +10,15 @@
   "schemes": ["nsh-music", "mygo-music"],
   "capabilities": {
     "audio": true,
+    "windows": true,
+    "application": true,
+    "statusBar": true,
+    "clipboard": true,
+    "picker": true,
+    "openUrl": true,
+    "fs": {
+      "read": ["${dataDir}"]
+    },
     "network": {
       "hosts": ["*"]
     },
@@ -17,6 +27,7 @@
     }
   },
   "harmonyos": {
+    "querySchemes": ["https", "http"],
     "permissions": [
       {
         "name": "ohos.permission.INTERNET",

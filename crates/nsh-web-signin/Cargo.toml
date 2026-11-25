@@ -1,0 +1,109 @@
+[package]
+name = "nsh-web-signin"
+description = "Standalone NSH native module (nshm) providing isolated popup WebView sign-in and HttpOnly cookie capture across macOS, iOS, Windows, Linux, Android, and HarmonyOS."
+keywords = ["nshm"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+nsh-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+url.workspace = true
+log.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.5"
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "NSString",
+  "NSDate",
+  "NSArray",
+  "NSURL",
+  "NSURLRequest",
+  "NSTimer",
+  "NSRunLoop",
+  "NSObject",
+  "NSGeometry",
+  "NSNotification",
+] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "NSApplication",
+  "NSWindow",
+  "NSView",
+  "NSScreen",
+  "NSResponder",
+  "NSGraphics",
+] }
+block2 = "0.6.2"
+dispatch2 = "0.3.1"
+
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2 = "0.6.5"
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "CFCGTypes",
+] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "block2",
+  "NSString",
+  "NSDate",
+  "NSArray",
+  "NSEnumerator",
+  "NSSet",
+  "NSURL",
+  "NSURLRequest",
+  "NSTimer",
+  "NSRunLoop",
+  "NSObject",
+] }
+objc2-ui-kit = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "block2",
+  "objc2-core-foundation",
+  "UIApplication",
+  "UIBarButtonItem",
+  "UIBarItem",
+  "UINavigationBar",
+  "UINavigationController",
+  "UINavigationItem",
+  "UIPresentationController",
+  "UIResponder",
+  "UIScene",
+  "UISceneDefinitions",
+  "UIView",
+  "UIViewController",
+  "UIWindow",
+  "UIWindowScene",
+] }
+block2 = "0.6.2"
+dispatch2 = "0.3.1"
+libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = [
+  "std",
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_System_Com",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Threading",
+  "Win32_UI_HiDpi",
+  "Win32_UI_WindowsAndMessaging",
+] }
+windows-core = "0.62"
+webview2-com = "0.39"
+
+[target.'cfg(all(target_os = "linux", not(target_env = "ohos")))'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+libc = "0.2"
+
+[target.'cfg(target_env = "ohos")'.dependencies]
+nsh-platform-harmonyos = { path = "../../../nsh-platform-harmonyos", default-features = false }

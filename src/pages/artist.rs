@@ -1,22 +1,35 @@
-//! Artist detail page with circular artist hero + ambient wash, capability-gated
-//! Follow toggle (`store.toggle_follow_artist`), shimmer loading, Top Tracks
-//! list, and Discography albums grid (no synthetic bio fallback).
+//! Artist detail page with circular `600px` artist hero + ambient wash,
+//! capability-gated Follow toggle (`store.toggle_follow_artist`), `Songs` /
+//! `Albums` switcher matching `mygo-music`, virtualized top tracks, and
+//! `240px` discography albums grid (no synthetic bio fallback).
 
 use std::rc::Rc;
 
+use nsh_base::{tab, tabs};
 use nsh_core::prelude::*;
 
 use crate::pages::{
-    card_grid, detail_hero, page_scroll, render_track_row, shimmer_card_grid,
-    shimmer_detail_hero, shimmer_track_list, shuffle_and_play, track_table_header,
+    ARTWORK_SIZE_CARD, PagesOwner, card_grid, detail_hero, hero_play_shuffle_buttons, page_scroll,
+    shimmer_card_grid, shimmer_detail_hero, shimmer_track_list, shuffle_and_play,
+    sized_artwork_url, virtual_track_list,
 };
 use crate::state::{AppStore, Route};
+use crate::ui::theme::{font_size, radius};
 use crate::ui::{
-    DeviceForm, ghost_button, media_card, primary_button, section_header, theme,
+    DeviceForm, Elevated, Elevation, Icon, empty_state, ghost_button, media_card, section_header,
+    theme,
 };
-use crate::ui::theme::radius;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArtistTab {
+    Songs,
+    Albums,
+}
 
 pub fn artist_page(store: AppStore, form: DeviceForm, id: String) -> View {
+    let active_tab = signal(ArtistTab::Songs);
+    let tasks = PagesOwner::capture();
+
     let body = view().w_full().child(dynamic(move || {
         let active = store.active_artist.get();
         let target_id = id.clone();
@@ -26,8 +39,8 @@ pub fn artist_page(store: AppStore, form: DeviceForm, id: String) -> View {
                 return view()
                     .w_full()
                     .gap_6()
-                    .child(shimmer_detail_hero(form))
-                    .child(shimmer_track_list(5))
+                    .child(shimmer_detail_hero(form, true))
+                    .child(shimmer_track_list(6))
                     .child(shimmer_card_grid(store, form, 4, false))
                     .into_element();
             };
@@ -35,12 +48,22 @@ pub fn artist_page(store: AppStore, form: DeviceForm, id: String) -> View {
             let artist = &page.artist;
             let track_count = page.tracks.len().to_string();
             let album_count = page.albums.len().to_string();
-            let meta: SharedString = format!(
-                "{} · {}",
-                store.t_fmt("track.count_fmt", &[("count", &track_count)]),
-                store.t_fmt("library.albums_count", &[("count", &album_count)]),
-            )
-            .into();
+            let mut meta_parts = Vec::new();
+            if !page.tracks.is_empty() {
+                meta_parts.push(
+                    store
+                        .t_fmt("track.count_fmt", &[("count", &track_count)])
+                        .to_string(),
+                );
+            }
+            if !page.albums.is_empty() {
+                meta_parts.push(
+                    store
+                        .t_fmt("library.albums_count", &[("count", &album_count)])
+                        .to_string(),
+                );
+            }
+            let meta: SharedString = meta_parts.join(" · ").into();
 
             let tracks_play = page.tracks.clone();
             let tracks_shuffle = page.tracks.clone();
@@ -48,39 +71,60 @@ pub fn artist_page(store: AppStore, form: DeviceForm, id: String) -> View {
             let artist_id_follow = artist.id.clone();
             let can_follow = store.active_can("followArtist");
 
-            let actions = view()
-                .flex_row()
-                .items_center()
-                .flex_wrap()
-                .gap_2p5()
-                .child(
-                    primary_button(move || store.t("player.play_all"), move || {
-                        if !tracks_play.is_empty() {
-                            store.play_list(tracks_play.clone(), 0);
+            let primary_actions = hero_play_shuffle_buttons(
+                store,
+                form,
+                page.tracks.is_empty(),
+                move || {
+                    if !tracks_play.is_empty() {
+                        store.play_list(tracks_play.clone(), 0);
+                    }
+                },
+                Some(Rc::new(move || {
+                    shuffle_and_play(store, tracks_shuffle.clone());
+                })),
+            );
+            let is_phone = form.is_phone();
+            let min_h = px(form.min_touch_target());
+            let follow_btn = can_follow.then(move || {
+                ghost_button(
+                    move || {
+                        if following_now {
+                            store.t("library.following_artist")
+                        } else {
+                            store.t("library.follow_artist")
                         }
-                    })
-                    .disabled(page.tracks.is_empty()),
+                    },
+                    move || {
+                        store.toggle_follow_artist(&artist_id_follow, !following_now);
+                    },
                 )
-                .child(
-                    ghost_button(move || store.t("player.shuffle_all"), move || {
-                        shuffle_and_play(store, tracks_shuffle.clone());
-                    })
-                    .disabled(page.tracks.is_empty()),
-                )
-                .children(can_follow.then(move || {
-                    ghost_button(
-                        move || {
-                            if following_now {
-                                store.t("library.following_artist")
-                            } else {
-                                store.t("library.follow_artist")
-                            }
-                        },
-                        move || {
-                            store.toggle_follow_artist(&artist_id_follow, !following_now);
-                        },
-                    )
-                }));
+                .min_h(min_h)
+                .when(is_phone, |b| b.rounded_full())
+            });
+
+            let actions = if form.is_phone() {
+                view()
+                    .w_full()
+                    .gap_2p5()
+                    .child(primary_actions)
+                    .children(follow_btn.map(|btn| {
+                        view()
+                            .w_full()
+                            .flex_row()
+                            .items_center()
+                            .justify_center()
+                            .child(btn)
+                    }))
+            } else {
+                view()
+                    .flex_row()
+                    .items_center()
+                    .flex_wrap()
+                    .gap_2p5()
+                    .child(primary_actions)
+                    .children(follow_btn)
+            };
 
             let hero = detail_hero(
                 store,
@@ -96,96 +140,197 @@ pub fn artist_page(store: AppStore, form: DeviceForm, id: String) -> View {
                 actions,
             );
 
-            let mut stack = view().w_full().gap_6().child(hero);
-
-            if !page.tracks.is_empty() {
-                let queue = Rc::new(page.tracks.clone());
-                let mut rows = view().w_full().gap_1();
-                if !form.is_phone() {
-                    rows = rows.child(track_table_header(store, form, true));
-                }
-                for (idx, tr) in page.tracks.iter().enumerate() {
-                    rows = rows.child(render_track_row(
-                        store,
-                        tr.clone(),
-                        Some(idx),
-                        Rc::clone(&queue),
-                        idx,
-                        true,
-                    ));
-                }
-                stack = stack.child(
-                    view()
-                        .w_full()
-                        .gap_3()
-                        .child(section_header(
-                            move || store.t("browse.charts"),
-                            None,
-                            None,
-                            None,
-                        ))
-                        .child(
-                            view()
-                                .w_full()
-                                .p_2()
-                                .rounded(px(radius::CARD))
-                                .bg(theme::card)
-                                .border_1()
-                                .border_color(theme::border)
-                                .child(rows),
-                        ),
-                );
+            let has_tracks = !page.tracks.is_empty();
+            let has_albums = !page.albums.is_empty();
+            if !has_tracks && has_albums {
+                active_tab.set(ArtistTab::Albums);
+            } else if has_tracks && !has_albums {
+                active_tab.set(ArtistTab::Songs);
             }
 
-            if !page.albums.is_empty() {
-                let cards: Vec<AnyElement> = page
-                    .albums
-                    .iter()
-                    .map(|alb| {
-                        let aid = alb.id.clone();
-                        let aid_play = alb.id.clone();
-                        let mut card = media_card(alb.name.clone(), alb.released.clone())
-                            .image_url(alb.image_url.clone())
-                            .seed(alb.id.clone())
-                            .on_press(move || {
-                                store.navigate(Route::AlbumDetail { id: aid.clone() });
-                            })
-                            .on_play(move || {
-                                let src = store.active_source();
-                                let id = aid_play.clone();
-                                spawn(async move {
-                                    if let Ok(Ok(alb_page)) =
-                                        blocking(move || src.album(&id)).await
-                                        && !alb_page.tracks.is_empty()
-                                    {
-                                        store.play_list(alb_page.tracks, 0);
-                                    }
-                                });
-                            });
-                        if !alb.released.is_empty() {
-                            card = card.badge(alb.released.clone());
-                        }
-                        card.into_element()
+            let tab_switcher = (has_tracks && has_albums).then(|| {
+                tabs()
+                    .flex_row()
+                    .when(is_phone, |t| t.w_full())
+                    .when(!is_phone, |t| t.self_start())
+                    .gap_1()
+                    .p_1()
+                    .rounded(px(if is_phone {
+                        radius::PILL
+                    } else {
+                        radius::CONTROL
+                    }))
+                    .bg(theme::muted)
+                    .indicator_style(move |s| {
+                        s.top_1()
+                            .bottom_1()
+                            .rounded(px(if is_phone { radius::PILL } else { radius::SM }))
+                            .bg(theme::card_elevated)
+                            .elevation(Elevation::Subtle)
                     })
-                    .collect();
+                    .child(artist_tab_item(
+                        store,
+                        form,
+                        active_tab,
+                        ArtistTab::Songs,
+                        "search.tab.tracks",
+                    ))
+                    .child(artist_tab_item(
+                        store,
+                        form,
+                        active_tab,
+                        ArtistTab::Albums,
+                        "nav.albums",
+                    ))
+            });
 
-                stack = stack.child(
+            let songs_queue = Rc::new(page.tracks.clone());
+            let albums_data = page.albums.clone();
+
+            let section_bar = if is_phone {
+                view().w_full().gap_2p5().children(tab_switcher).children(
+                    (!(has_tracks && has_albums)).then(|| {
+                        section_header(
+                            move || match active_tab.get() {
+                                ArtistTab::Songs => store.t("search.tab.tracks"),
+                                ArtistTab::Albums => store.t("nav.albums"),
+                            },
+                            None,
+                            None,
+                            None,
+                        )
+                    }),
+                )
+            } else {
+                view()
+                    .w_full()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .flex_wrap()
+                    .gap_3()
+                    .child(view().flex_1().min_w(px(120.0)).child(section_header(
+                        move || match active_tab.get() {
+                            ArtistTab::Songs => store.t("search.tab.tracks"),
+                            ArtistTab::Albums => store.t("nav.albums"),
+                        },
+                        None,
+                        None,
+                        None,
+                    )))
+                    .children(tab_switcher)
+            };
+
+            let section_body = view().w_full().child(dynamic(move || {
+                let current_tab = active_tab.get();
+                let songs_queue = Rc::clone(&songs_queue);
+                let albums_data = albums_data.clone();
+                untracked(move || match current_tab {
+                    ArtistTab::Songs => {
+                        if songs_queue.is_empty() {
+                            empty_state(
+                                Icon::Disc,
+                                store.t("common.empty"),
+                                store.t("search.tab.tracks"),
+                            )
+                            .into_element()
+                        } else {
+                            virtual_track_list(store, form, songs_queue, true, true, None, None)
+                                .into_element()
+                        }
+                    }
+                    ArtistTab::Albums => {
+                        if albums_data.is_empty() {
+                            empty_state(Icon::Disc, store.t("common.empty"), store.t("nav.albums"))
+                                .into_element()
+                        } else {
+                            let cards: Vec<AnyElement> = albums_data
+                                .iter()
+                                .map(|alb| {
+                                    let aid = alb.id.clone();
+                                    let aid_play = alb.id.clone();
+                                    let mut card =
+                                        media_card(alb.name.clone(), alb.released.clone())
+                                            .image_url(sized_artwork_url(
+                                                &alb.image_url,
+                                                ARTWORK_SIZE_CARD,
+                                            ))
+                                            .seed(alb.id.clone())
+                                            .on_press(move || {
+                                                store.navigate(Route::AlbumDetail {
+                                                    id: aid.clone(),
+                                                });
+                                            })
+                                            .on_play(move || {
+                                                let src = store.active_source();
+                                                let id = aid_play.clone();
+                                                tasks.spawn(async move {
+                                                    if let Ok(Ok(alb_page)) =
+                                                        blocking(move || src.album(&id)).await
+                                                        && !alb_page.tracks.is_empty()
+                                                    {
+                                                        store.play_list(alb_page.tracks, 0);
+                                                    }
+                                                });
+                                            });
+                                    if !alb.released.is_empty() {
+                                        card = card.badge(alb.released.clone());
+                                    }
+                                    card.into_element()
+                                })
+                                .collect();
+                            card_grid(store, form, cards).into_element()
+                        }
+                    }
+                })
+            }));
+
+            view()
+                .w_full()
+                .gap_6()
+                .child(hero)
+                .child(
                     view()
                         .w_full()
                         .gap_3()
-                        .child(section_header(
-                            move || store.t("nav.albums"),
-                            None,
-                            None,
-                            None,
-                        ))
-                        .child(card_grid(store, form, cards)),
-                );
-            }
-
-            stack.into_element()
+                        .child(section_bar)
+                        .child(section_body),
+                )
+                .into_element()
         })
     }));
 
     page_scroll(form, body)
+}
+
+fn artist_tab_item(
+    store: AppStore,
+    form: DeviceForm,
+    active_tab: Signal<ArtistTab>,
+    kind: ArtistTab,
+    label_key: &'static str,
+) -> impl IntoElement {
+    let is_sel = move || active_tab.get() == kind;
+    tab()
+        .selected(is_sel)
+        .on_press(move |_: &()| active_tab.set(kind))
+        .when(form.is_phone(), |t| t.flex_1())
+        .min_h(px(if form.is_touch() { 44.0 } else { 32.0 }))
+        .px_3p5()
+        .py_1p5()
+        .items_center()
+        .justify_center()
+        .child(
+            text(move || store.t(label_key))
+                .number_of_lines(1)
+                .text_size(px(font_size::SUBTITLE))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(move || {
+                    if is_sel() {
+                        theme::fg()
+                    } else {
+                        theme::muted_fg()
+                    }
+                }),
+        )
 }

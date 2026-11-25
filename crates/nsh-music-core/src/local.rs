@@ -98,7 +98,11 @@ impl LocalMusicSource {
     /// Creates a `LocalMusicSource` backed by the default OS `library.json`, starting
     /// empty unless persisted folders already exist.
     pub fn new() -> Self {
-        Self::with_storage(Vec::new(), default_cover_cache_dir(), Some(default_library_path()))
+        Self::with_storage(
+            Vec::new(),
+            default_cover_cache_dir(),
+            Some(default_library_path()),
+        )
     }
 
     /// Creates an in-memory `LocalMusicSource` scanning `folders` immediately.
@@ -109,7 +113,11 @@ impl LocalMusicSource {
     /// Creates a `LocalMusicSource` backed by the default `library.json`, merging any
     /// initial `folders` supplied by settings.
     pub fn with_default_storage(folders: Vec<PathBuf>) -> Self {
-        Self::with_storage(folders, default_cover_cache_dir(), Some(default_library_path()))
+        Self::with_storage(
+            folders,
+            default_cover_cache_dir(),
+            Some(default_library_path()),
+        )
     }
 
     /// Creates a `LocalMusicSource` with explicit `folders`, cover cache directory,
@@ -482,7 +490,9 @@ impl MusicSource for LocalMusicSource {
                 }],
                 ..Browse::default()
             }),
-            other => Err(SourceError::Unavailable(format!("unknown browse page: {other}"))),
+            other => Err(SourceError::Unavailable(format!(
+                "unknown browse page: {other}"
+            ))),
         }
     }
 
@@ -585,7 +595,9 @@ impl MusicSource for LocalMusicSource {
     fn create_playlist(&self, name: &str) -> Result<Playlist, SourceError> {
         let trimmed = name.trim();
         if trimmed.is_empty() {
-            return Err(SourceError::Message("playlist name cannot be empty".to_owned()));
+            return Err(SourceError::Message(
+                "playlist name cannot be empty".to_owned(),
+            ));
         }
         let mut guard = self.state.write().expect("local library lock poisoned");
         guard.next_id_counter += 1;
@@ -603,7 +615,9 @@ impl MusicSource for LocalMusicSource {
     fn rename_playlist(&self, id: &str, name: &str) -> Result<(), SourceError> {
         let trimmed = name.trim();
         if trimmed.is_empty() {
-            return Err(SourceError::Message("playlist name cannot be empty".to_owned()));
+            return Err(SourceError::Message(
+                "playlist name cannot be empty".to_owned(),
+            ));
         }
         let mut guard = self.state.write().expect("local library lock poisoned");
         let pl = guard
@@ -621,7 +635,9 @@ impl MusicSource for LocalMusicSource {
         let before = guard.user_playlists.len();
         guard.user_playlists.retain(|p| p.id != id);
         if guard.user_playlists.len() == before {
-            return Err(SourceError::Unavailable(format!("playlist not found: {id}")));
+            return Err(SourceError::Unavailable(format!(
+                "playlist not found: {id}"
+            )));
         }
         persist_state(&guard);
         Ok(())
@@ -653,7 +669,8 @@ impl MusicSource for LocalMusicSource {
             .iter_mut()
             .find(|p| p.id == id)
             .ok_or_else(|| SourceError::Unavailable(format!("playlist not found: {id}")))?;
-        pl.track_ids.retain(|tid| !remove_set.contains(tid.as_str()));
+        pl.track_ids
+            .retain(|tid| !remove_set.contains(tid.as_str()));
         persist_state(&guard);
         Ok(())
     }
@@ -923,12 +940,11 @@ fn walk_audio_folder(
     }
 }
 
-fn scan_audio_file(
-    path: &Path,
-    cover_cache_dir: &Path,
-) -> Result<(Track, LocalTrackMeta), String> {
+fn scan_audio_file(path: &Path, cover_cache_dir: &Path) -> Result<(Track, LocalTrackMeta), String> {
     let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let file_size = fs::metadata(&canonical).map(|m| m.len() as i64).unwrap_or(0);
+    let file_size = fs::metadata(&canonical)
+        .map(|m| m.len() as i64)
+        .unwrap_or(0);
     let media_type = mime_for_extension(canonical.extension().and_then(|e| e.to_str())).to_owned();
 
     let tagged_file = Probe::open(&canonical)
@@ -1008,10 +1024,7 @@ fn scan_audio_file(
         None => Vec::new(),
     };
 
-    let album_artist_key = artists
-        .first()
-        .map(|a| a.name.as_str())
-        .unwrap_or("");
+    let album_artist_key = artists.first().map(|a| a.name.as_str()).unwrap_or("");
     let album_id = if album_name.is_empty() {
         String::new()
     } else {
@@ -1167,7 +1180,8 @@ mod tests {
     fn empty_local_library_has_no_mock_tracks_and_strict_capabilities() {
         let cover_dir = temp_dir("empty-covers");
         let lib_path = temp_dir("empty-lib").join("library.json");
-        let src = LocalMusicSource::with_storage(Vec::new(), cover_dir.clone(), Some(lib_path.clone()));
+        let src =
+            LocalMusicSource::with_storage(Vec::new(), cover_dir.clone(), Some(lib_path.clone()));
 
         assert_eq!(src.local_track_count(), 0);
         assert!(src.all_tracks().is_empty());
@@ -1248,13 +1262,23 @@ mod tests {
             assert_eq!(src.local_track_count(), 2);
 
             let tracks = src.all_tracks();
-            let first = tracks.iter().find(|t| t.name == "Local Acoustic Test").unwrap().clone();
-            let second = tracks.iter().find(|t| t.name == "Second Wave").unwrap().clone();
+            let first = tracks
+                .iter()
+                .find(|t| t.name == "Local Acoustic Test")
+                .unwrap()
+                .clone();
+            let second = tracks
+                .iter()
+                .find(|t| t.name == "Second Wave")
+                .unwrap()
+                .clone();
             assert_eq!(first.artist_names(), "Test Performer");
             assert!(first.url.starts_with("file://"));
             assert!(!first.local_cover.is_empty());
 
-            let stream = src.stream(&first.id, Quality::Lossless).expect("local stream");
+            let stream = src
+                .stream(&first.id, Quality::Lossless)
+                .expect("local stream");
             assert_eq!(stream.media_type, "audio/wav");
 
             let lyrics = src.lyrics(&first.id).expect("sidecar lyrics");
@@ -1263,13 +1287,17 @@ mod tests {
             let home = src.home().expect("home");
             assert!(!home.sections.is_empty());
 
-            let search_res = src.search("acoustic", SearchKind::Tracks, 0).expect("search");
+            let search_res = src
+                .search("acoustic", SearchKind::Tracks, 0)
+                .expect("search");
             assert_eq!(search_res.tracks.len(), 1);
 
             src.like(&first.id, true).expect("like");
             src.played(&first);
 
-            let pl = src.create_playlist("Session Favorites").expect("create playlist");
+            let pl = src
+                .create_playlist("Session Favorites")
+                .expect("create playlist");
             src.add_to_playlist(&pl.id, &[first.id.clone(), second.id.clone()])
                 .expect("add");
             src.move_playlist_track(&pl.id, 0, 1).expect("move");
@@ -1281,11 +1309,8 @@ mod tests {
         }
 
         // Reload from persisted library.json and verify state survived intact.
-        let reloaded = LocalMusicSource::with_storage(
-            Vec::new(),
-            cover_dir.clone(),
-            Some(lib_path.clone()),
-        );
+        let reloaded =
+            LocalMusicSource::with_storage(Vec::new(), cover_dir.clone(), Some(lib_path.clone()));
         assert_eq!(reloaded.local_track_count(), 2);
         assert_eq!(reloaded.liked(0).unwrap().tracks.len(), 1);
         assert_eq!(reloaded.recent().unwrap().len(), 1);

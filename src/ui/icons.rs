@@ -62,6 +62,15 @@ pub enum Icon {
     ArrowUp,
     ArrowDown,
     Cast,
+    ThumbUp,
+    ThumbUpFilled,
+    Database,
+    Info,
+    Palette,
+    Sliders,
+    Keyboard,
+    Shield,
+    Music,
 }
 
 nsh_core::static_reactive!(Icon: Icon);
@@ -378,10 +387,7 @@ impl Icon {
             Icon::External => {
                 let p = polyline(p, &[14.0, 4.5, 19.5, 4.5, 19.5, 10.0]);
                 let p = polyline(p, &[11.0, 13.0, 19.5, 4.5]);
-                polyline(
-                    p,
-                    &[17.5, 14.0, 17.5, 19.0, 5.0, 19.0, 5.0, 6.5, 10.0, 6.5],
-                )
+                polyline(p, &[17.5, 14.0, 17.5, 19.0, 5.0, 19.0, 5.0, 6.5, 10.0, 6.5])
             }
 
             Icon::Vinyl => {
@@ -532,15 +538,136 @@ impl Icon {
 
             Icon::Cast => {
                 let p = polyline(p, &[4.0, 9.0, 4.0, 5.5, 20.0, 5.5, 20.0, 18.5, 13.0, 18.5]);
-                let p = p
-                    .begin_path()
-                    .arc(4.2, 18.8, 4.2, -1.55, 0.0)
-                    .stroke();
-                let p = p
-                    .begin_path()
-                    .arc(4.2, 18.8, 7.6, -1.55, 0.0)
-                    .stroke();
+                let p = p.begin_path().arc(4.2, 18.8, 4.2, -1.55, 0.0).stroke();
+                let p = p.begin_path().arc(4.2, 18.8, 7.6, -1.55, 0.0).stroke();
                 circle(p, 4.5, 18.5, 1.3, true)
+            }
+
+            Icon::ThumbUp => {
+                let p = stroke_round_rect(p, 3.5, 10.6, 3.6, 8.8, 1.2);
+                p.begin_path()
+                    .move_to(7.1, 11.4)
+                    .line_to(10.8, 4.8)
+                    .bezier_curve_to(pt(11.6, 3.6), pt(13.6, 4.1), pt(13.6, 5.8))
+                    .line_to(13.2, 9.8)
+                    .line_to(18.2, 9.8)
+                    .bezier_curve_to(pt(19.9, 9.8), pt(20.8, 11.1), pt(20.4, 12.6))
+                    .line_to(19.2, 17.6)
+                    .bezier_curve_to(pt(18.9, 18.8), pt(17.9, 19.4), pt(16.6, 19.4))
+                    .line_to(7.1, 19.4)
+                    .close_path()
+                    .stroke()
+            }
+
+            Icon::ThumbUpFilled => {
+                let p = fill_round_rect(p, 3.5, 10.6, 3.6, 8.8, 1.2);
+                p.begin_path()
+                    .move_to(8.4, 11.2)
+                    .line_to(11.0, 4.8)
+                    .bezier_curve_to(pt(11.7, 3.5), pt(13.8, 4.0), pt(13.8, 5.8))
+                    .line_to(13.4, 9.6)
+                    .line_to(18.3, 9.6)
+                    .bezier_curve_to(pt(20.0, 9.6), pt(21.0, 11.0), pt(20.5, 12.6))
+                    .line_to(19.3, 17.7)
+                    .bezier_curve_to(pt(19.0, 18.9), pt(17.9, 19.6), pt(16.6, 19.6))
+                    .line_to(8.4, 19.6)
+                    .close_path()
+                    .fill()
+            }
+
+            Icon::Database => {
+                let p = p
+                    .begin_path()
+                    .ellipse(
+                        pt(12.0, 6.2),
+                        size(px(7.6), px(2.6)),
+                        Radians(0.0),
+                        Radians(0.0),
+                        Radians(TAU),
+                        false,
+                    )
+                    .stroke();
+                let p = polyline(p, &[4.4, 6.2, 4.4, 17.8]);
+                let p = polyline(p, &[19.6, 6.2, 19.6, 17.8]);
+                let p = p
+                    .begin_path()
+                    .ellipse(
+                        pt(12.0, 12.0),
+                        size(px(7.6), px(2.6)),
+                        Radians(0.0),
+                        Radians(0.0),
+                        Radians(PI),
+                        false,
+                    )
+                    .stroke();
+                p.begin_path()
+                    .ellipse(
+                        pt(12.0, 17.8),
+                        size(px(7.6), px(2.6)),
+                        Radians(0.0),
+                        Radians(0.0),
+                        Radians(PI),
+                        false,
+                    )
+                    .stroke()
+            }
+
+            Icon::Info => {
+                let p = circle(p, 12.0, 12.0, 8.6, false);
+                let p = circle(p, 12.0, 8.2, 1.0, true);
+                polyline(p, &[12.0, 11.4, 12.0, 16.4])
+            }
+
+            Icon::Palette => {
+                let p = p
+                    .begin_path()
+                    .arc(12.0, 12.0, 8.6, PI * 0.45, TAU - PI * 0.04)
+                    .bezier_curve_to(pt(20.2, 13.8), pt(18.0, 14.2), pt(16.2, 14.2))
+                    .bezier_curve_to(pt(14.4, 14.2), pt(13.8, 15.2), pt(14.0, 16.8))
+                    .bezier_curve_to(pt(14.2, 18.8), pt(13.2, 20.4), pt(10.7, 20.5))
+                    .stroke();
+                let p = circle(p, 8.2, 10.6, 1.2, true);
+                let p = circle(p, 11.4, 7.6, 1.2, true);
+                let p = circle(p, 15.6, 8.8, 1.2, true);
+                circle(p, 8.6, 15.0, 1.2, true)
+            }
+
+            Icon::Sliders => {
+                let p = polyline(p, &[4.0, 6.8, 8.2, 6.8]);
+                let p = polyline(p, &[12.8, 6.8, 20.0, 6.8]);
+                let p = circle(p, 10.5, 6.8, 2.2, false);
+                let p = polyline(p, &[4.0, 12.0, 13.8, 12.0]);
+                let p = polyline(p, &[18.4, 12.0, 20.0, 12.0]);
+                let p = circle(p, 16.1, 12.0, 2.2, false);
+                let p = polyline(p, &[4.0, 17.2, 6.2, 17.2]);
+                let p = polyline(p, &[10.8, 17.2, 20.0, 17.2]);
+                circle(p, 8.5, 17.2, 2.2, false)
+            }
+
+            Icon::Keyboard => {
+                let p = stroke_round_rect(p, 3.0, 6.0, 18.0, 12.0, 2.4);
+                let p = polyline(p, &[6.6, 9.8, 7.2, 9.8]);
+                let p = polyline(p, &[10.4, 9.8, 11.0, 9.8]);
+                let p = polyline(p, &[14.2, 9.8, 14.8, 9.8]);
+                let p = polyline(p, &[17.4, 9.8, 18.0, 9.8]);
+                polyline(p, &[7.5, 14.2, 16.5, 14.2])
+            }
+
+            Icon::Shield => p
+                .begin_path()
+                .move_to(12.0, 3.8)
+                .line_to(19.0, 6.6)
+                .line_to(19.0, 11.6)
+                .bezier_curve_to(pt(19.0, 16.0), pt(15.8, 18.8), pt(12.0, 20.2))
+                .bezier_curve_to(pt(8.2, 18.8), pt(5.0, 16.0), pt(5.0, 11.6))
+                .line_to(5.0, 6.6)
+                .close_path()
+                .stroke(),
+
+            Icon::Music => {
+                let p = polyline(p, &[9.2, 17.2, 9.2, 6.4, 18.4, 4.6, 18.4, 15.2]);
+                let p = circle(p, 7.0, 17.4, 2.3, false);
+                circle(p, 16.2, 15.4, 2.3, false)
             }
         }
     }

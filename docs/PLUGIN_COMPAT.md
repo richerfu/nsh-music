@@ -13,9 +13,9 @@ Static analysis (`compat.rs`) inspects `plugin.json` and the plugin's JS/TS sour
 | Tier (`CompatTier`) | Core Level (`PluginCompatLevel`) | Meaning / 含义 | Platforms / 平台支持 |
 |---|---|---|---|
 | **`Full`** | `FullNative` | Pure JS/TS + `host.fetch` / `host.crypto` / `host.storage` / QR auth | Desktop + iOS + Android + HarmonyOS |
-| **`Full` (Virtual FFmpeg)** | `VirtualFfmpeg` | Calls `host.spawn("ffmpeg", ...)` — transparently intercepted in-process by `VirtualFfmpegShim` | Desktop + iOS + Android + HarmonyOS (zero external binary needed!) |
-| **`Partial`** | `FullNative` / `VirtualFfmpeg` | Uses `host.webSignIn(...)` where mobile WebViews may restrict `HttpOnly` cookies — works via embedded WebView + manual cookie fallback | Desktop (full) / Mobile (WebView + manual cookie fallback) |
-| **`MigrationRequired`** | `DesktopProcessLimited` | Invokes arbitrary external CLI binaries (e.g. `yt-dlp`, `python`, custom binaries) via `host.spawn` | Desktop only; returns structured `MobileSandboxError` on mobile/OHOS |
+| **`Full` (Virtual Shims)** | `VirtualFfmpeg` | Calls `host.spawn("ffmpeg" \| "yt-dlp", ...)` — transparently intercepted in-process by `VirtualFfmpegShim` / `VirtualYtdlpShim` | Desktop + iOS + Android + HarmonyOS (zero external binary needed!) |
+| **`Partial`** | `FullNative` / `VirtualFfmpeg` | Uses `host.webSignIn(...)` where mobile WebViews may restrict `HttpOnly` cookies — works via embedded WebView + native cookie store / manual fallback | Desktop (full) / Mobile (WebView + native cookie store / manual fallback) |
+| **`MigrationRequired`** | `DesktopProcessLimited` | Invokes arbitrary unvirtualized external CLI binaries (e.g. `python3`, custom scripts) via `host.spawn` | Desktop only; returns structured `MobileSandboxError` on mobile/OHOS |
 
 ---
 
@@ -83,8 +83,8 @@ Every plugin executes in its own isolated QuickJS worker thread with `globalThis
 | `host.crypto` | `md5`, `sha256`, `hmacSha256`, `aesEcbEncrypt`, `aesEcbDecrypt`, `aesCbcEncrypt`, `aesCbcDecrypt`, `base64Encode`, `base64Decode`, `base64UrlEncode`, `base64UrlDecode`, `hexEncode`, `hexDecode` | 100% pure Rust (AES-128/192/256 PKCS#7, FIPS-180-4 SHA-256, RFC 2104 HMAC) |
 | `host.log` | `debug`, `info`, `warn`, `error` | Routed to Rust `log` target `plugin::<id>` (also aliased to `console.*`) |
 | `host.i18n` | `t(key, params?)`, `locale()` | Loads `locales/<lang>.json` (`zh-CN`, `en`, automatic fallback) |
-| `host.capabilities` | `{ platform, isMobile, embeddedFfmpeg: true, canSpawnExternal, webSignInMode }` | Runtime feature detection for adaptive plugins |
-| `host.spawn(cmd, args?, opts?)` | Handle: `stdout()`, `stderr()`, `errorOutput()`, `wait()`, `kill()`, `isRunning()` | Always intercepts `ffmpeg` via `VirtualFfmpegShim`; desktop allows external CLIs; mobile throws `MobileSandboxError` |
+| `host.capabilities` | `{ platform, isMobile, embeddedFfmpeg: true, embeddedYtdlp: true, virtualProcesses: ["ffmpeg", "yt-dlp"], nativeCodecs, openUrl: true, canSpawnExternal, webSignInMode }` | Runtime feature detection for adaptive plugins |
+| `host.spawn(cmd, args?, opts?)` | Handle: `stdout()`, `stderr()`, `errorOutput()`, `readLine()`, `write()`, `closeStdin()`, `wait()`, `kill()`, `isRunning()` | Virtualizes `ffmpeg` (`VirtualFfmpegShim`) and `yt-dlp` (`VirtualYtdlpShim`) in-process across all platforms; prefers real desktop binaries when `Allow Programs` is granted and installed; mobile blocks other CLIs with `MobileSandboxError` |
 | `host.webSignIn(opts)` | `{ url, title?, incognito?, userAgent?, evalJs?, cookieNames?, allowManualCookie? }` | Invokes native embedded `web_view()` via `SignInPromptCallback` / `WebSignInHandler` |
 | `host.prompt({ qr, text })` | Emits QR code / instruction prompt to UI | Used by NetEase / Bilibili / QQ QR-code login flows |
 | `host.sleep(ms)` | Returns `Promise<void>` | Non-blocking Tokio timer |
@@ -155,18 +155,37 @@ On iOS, Android, and HarmonyOS, spawning external executables is prohibited by t
 
 ---
 
+## 5.1 How `VirtualYtdlpShim` Enables `host.spawn("yt-dlp", ...)` on Mobile & Desktop Without Python
+
+### 虚拟 yt-dlp 代理如何在移动端与无 Python 环境下零修改运行 `yt-dlp` 调用
+
+Plugins such as `youtube-music` fall back to `host.spawn("yt-dlp", ...)` (passing session cookies over stdin via `--config-locations -` and requesting `--print "%(.{url,http_headers})j"`, `-g`, or `-j`). On iOS, Android, HarmonyOS, and desktops without `yt-dlp` installed, `nsh-music` intercepts `yt-dlp` via `YtdlpVirtualShim` (`crates/nsh-music-plugin/src/virtual_ytdlp.rs`, advertised via `host.capabilities.embeddedYtdlp === true`):
+
+1. **Desktop vs Mobile Routing**:
+   - On Desktop when `Allow Programs` is granted and a real `yt-dlp` executable is found in `PATH` / `/opt/homebrew/bin` / `/usr/local/bin`, the real binary is spawned.
+   - On iOS, Android, HarmonyOS — or on Desktop when `yt-dlp` is not installed or `Allow Programs` is off — `VirtualYtdlpShim` runs completely in-process with zero Python/subprocess requirement.
+2. **CLI & Stdin Config Compatibility**:
+   - `--version` immediately emits `2026.03.01 (nsh-virtual-ytdlp)` and exits `0`.
+   - `--config-locations -` waits for `proc.closeStdin()` and parses quoted flags (`--add-headers "Cookie:..."`, `--add-header`, `--user-agent`, `--cookies`) merged with CLI flags (`-f`/`--format`, `--extractor-args`, `--print`, `-g`/`--get-url`, `-j`/`--dump-json`).
+3. **Pure-Rust InnerTube Multi-Client Cascade**:
+   - Uses `HostContext`'s `rustls-tls` `reqwest::Client` and pure-Rust SHA-1 `SAPISIDHASH` authentication (`__Secure-3PAPISID` / `SAPISID`) with cached `visitorData`.
+   - Cascades across `ANDROID_VR` -> `IOS` -> `ANDROID_MUSIC` -> `TVHTML5_SIMPLY_EMBEDDED_PLAYER` -> `VISIONOS` to locate direct non-ciphered `streamingData.adaptiveFormats` audio streams playable via `VirtualFfmpegShim` + `nsh-music-audio` (preferring Symphonia-decodable `audio/mp4` AAC-LC on mobile, falling back to `hlsManifestUrl` only if no direct audio URL is present).
+   - Emits exact `%(.{url,http_headers})j`, `-g`, or `-j` output lines on stdout and standard `ERROR: [youtube] <id>: <reason>` diagnostics on stderr when unavailable or sign-in is required.
+
+---
+
 ## 6. Mobile Migration Guide / 移动端迁移指南
 
-### Case A: Plugin calls an external CLI (`yt-dlp`, `python`, `node`, etc.) — `MigrationRequired`
+### Case A: Plugin calls an unvirtualized external CLI (`python3`, `node`, custom binaries, etc.) — `MigrationRequired`
 
-On iOS, Android, and HarmonyOS, calling `host.spawn("yt-dlp", ...)` throws a structured `MobileSandboxError`:
+On iOS, Android, and HarmonyOS, calling `host.spawn("python3", ...)` (any binary outside `host.capabilities.virtualProcesses`, i.e., not `ffmpeg` or `yt-dlp`) throws a structured `MobileSandboxError`:
 ```json
 {
   "name": "MobileSandboxError",
   "code": "MOBILE_SANDBOX_ERROR",
-  "command": "yt-dlp",
+  "command": "python3",
   "platform": "harmonyos",
-  "migrationPath": "Replace external binary calls with host.fetch + host.crypto, return direct stream URLs with headers, or check host.capabilities.canSpawnExternal before spawning."
+  "migrationPath": "Spawning external binary `python3` is prohibited by the harmonyos mobile sandbox (not permitted on mobile). Check `host.capabilities.canSpawnExternal` first; replace external HTTP/signing CLIs with `host.fetch` + `host.crypto`, return direct stream URLs with `headers`, or rely on `host.spawn(\"ffmpeg\" | \"yt-dlp\", ...)` which are virtualized in-process. See docs/PLUGIN_COMPAT.md for migration steps."
 }
 ```
 

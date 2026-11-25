@@ -201,7 +201,12 @@ pub trait MusicSource: Send + Sync {
         Err(SourceError::Unsupported)
     }
 
-    fn like_comment(&self, _track_id: &str, _comment_id: &str, _on: bool) -> Result<(), SourceError> {
+    fn like_comment(
+        &self,
+        _track_id: &str,
+        _comment_id: &str,
+        _on: bool,
+    ) -> Result<(), SourceError> {
         Err(SourceError::Unsupported)
     }
 
@@ -217,7 +222,12 @@ pub trait MusicSource: Send + Sync {
         Err(SourceError::Unsupported)
     }
 
-    fn remote_play(&self, _ids: &[String], _start: usize, _position: i64) -> Result<(), SourceError> {
+    fn remote_play(
+        &self,
+        _ids: &[String],
+        _start: usize,
+        _position: i64,
+    ) -> Result<(), SourceError> {
         Err(SourceError::Unsupported)
     }
 

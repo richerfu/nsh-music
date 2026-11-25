@@ -1,9 +1,16 @@
-//! Three selectable centerpiece artwork modes (`NowPlayingMode`):
-//! - `Cover`: Crisp elevated album art with subtle audio-reactive halo
-//! - `Vinyl`: Detailed `canvas`-drawn 33 RPM turntable with concentric grooves,
-//!   spinning center label at smooth 60fps, specular highlight, and spring tonearm
-//! - `Cassette`: Detailed `canvas`-drawn retro cassette deck with twin 60fps
-//!   rotating tape reels, tape window fill reflecting playback progress, and label strip
+//! Three selectable centerpiece artwork presentations (`NowPlayingMode`)
+//! aligned 1:1 with `egoist/mygo-music` (`ui_cover.go`, `ui_retro.go`, `retro_render.go`):
+//! - `Cover`: Elevated `16pt`-rounded album art with breathing scale (`1.0` playing /
+//!   `0.88` paused), subtle hover lift/3D tilt, and pointer-tracking glare
+//! - `Vinyl`: Square `size × size` turntable deck with concentric grooves, spinning
+//!   30fps cover label, strobe red lamp, `START / 33 / 45` indicators, and track-progress-
+//!   driven tonearm sweeping smoothly from outer groove to inner label
+//! - `Cassette`: Retro cassette shell with printed cover thumbnail, italic handwritten
+//!   label strip, physically area-conserving wound magnetic tape spools
+//!   (`sqrt(hub^2 + (full^2 - hub^2) * f)`), and twin 30fps rotating hubs
+//!
+//! Performance: spin timers run at 30fps ONLY while `now_playing_open && is_playing
+//! && !reduce_motion()`, stopping cleanly when paused so idle CPU usage is 0%.
 
 use std::{
     f32::consts::{FRAC_PI_2, PI, TAU},
@@ -14,6 +21,7 @@ use nsh_core::{
     canvas::{CanvasGradient, CanvasTextAlign, CanvasTextBaseline, LineCap, LineJoin},
     geometry::{percentage, point, size},
     prelude::*,
+    time::now,
 };
 
 use crate::{
@@ -21,24 +29,49 @@ use crate::{
     ui::{
         icons::{Icon, icon},
         motion,
-        theme::{self, Elevated, Elevation, colors, radius},
+        theme::{self, Elevated, Elevation, colors},
     },
 };
 
-/// 33⅓ RPM turntable speed: 200°/s -> 3.2° per 16ms frame.
-const VINYL_DEG_PER_FRAME: f32 = 3.2;
+/// 30fps frame interval matching `mygo-music` `retroFrameRate = 30`.
+const RETRO_FRAME_MS: u64 = 33;
 
-/// Retro cassette reel speed: ~106°/s -> 1.70° per 16ms frame.
-const CASSETTE_DEG_PER_FRAME: f32 = 1.70;
+/// Turntable platter angular speed: 33⅓ RPM = 200°/s (`vinylTurn = 200`).
+const VINYL_DEG_PER_SEC: f32 = 200.0;
 
-/// Renders the active centerpiece artwork presentation (`Cover`, `Vinyl`, or `Cassette`).
+/// Cassette reel angular speed: 150°/s (`reelTurn = 150`).
+const REEL_DEG_PER_SEC: f32 = 150.0;
+
+/// Turntable geometry constants in units of deck width (`retro_render.go:571-587`).
+const DECK_CX: f32 = 0.445;
+const DECK_CY: f32 = 0.50;
+const DECK_PIVOT_X: f32 = 0.835;
+const DECK_PIVOT_Y: f32 = 0.185;
+const DECK_PLATTER: f32 = 0.415;
+const DECK_RECORD: f32 = 0.385;
+const DECK_LABEL: f32 = 0.36;
+const DECK_REST: f32 = FRAC_PI_2 - 0.08;
+const DECK_LAMP_X: f32 = 0.127;
+const DECK_LAMP_Y: f32 = 0.818;
+const ARM_TUBE: f32 = 0.49;
+const HEADSHELL_TURN: f32 = 20.0 * PI / 180.0;
+const STYLUS_AT: f32 = 0.10;
+
+/// Cassette geometry constants in units of shell width (`retro_render.go:898-909`).
+const TAPE_HEIGHT: f32 = 0.64;
+const TAPE_REEL_Y: f32 = 0.315;
+const TAPE_REEL_L: f32 = 0.2875;
+const TAPE_REEL_R: f32 = 0.7125;
+const TAPE_HUB: f32 = 0.055;
+const TAPE_FULL: f32 = 0.19;
+const TAPE_CORNER: f32 = 0.035;
+const TAPE_LABEL_Y0: f32 = 0.045;
+const TAPE_LABEL_Y1: f32 = 0.445;
+
+/// Renders the active square centerpiece artwork presentation (`Cover`, `Vinyl`, or `Cassette`).
 pub fn retro_centerpiece(store: AppStore, size_pt: f32) -> View {
-    let box_w = (size_pt * 1.18).max(size_pt + 28.0);
-    let box_h = size_pt + 24.0;
-
     view()
-        .w(px(box_w))
-        .h(px(box_h))
+        .size(px(size_pt))
         .flex_shrink_0()
         .items_center()
         .justify_center()
@@ -52,29 +85,15 @@ pub fn retro_centerpiece(store: AppStore, size_pt: f32) -> View {
         }))
 }
 
-fn current_track_seed(store: AppStore) -> String {
-    store.current_track.with(|t| {
-        t.as_ref()
-            .map(|tr| {
-                if !tr.album.id.is_empty() {
-                    tr.album.id.clone()
-                } else {
-                    tr.id.clone()
-                }
-            })
-            .unwrap_or_else(|| "nsh-music".to_owned())
-    })
-}
-
 fn has_renderable_art(uri: &SharedString) -> bool {
     !uri.is_empty()
 }
 
-/// Smoothly springs opacity & subtle scale when switching between Cover / Vinyl / Cassette.
+/// Smooth entrance opacity/scale when switching between Cover / Vinyl / Cassette.
 fn mode_entrance_animations() -> (AnimatedValue, AnimatedValue) {
     let reduced = reduce_motion();
     let opacity = animated_value(if reduced { 1.0 } else { 0.0 });
-    let scale = animated_value(if reduced { 1.0 } else { 0.94 });
+    let scale = animated_value(if reduced { 1.0 } else { 0.95 });
     if !reduced {
         motion::animate_timing(&opacity, 1.0, motion::timing_fast());
         motion::animate_spring(&scale, 1.0, motion::spring_gentle());
@@ -82,604 +101,820 @@ fn mode_entrance_animations() -> (AnimatedValue, AnimatedValue) {
     (opacity, scale)
 }
 
-/// Drives a local rotation angle in degrees at 60fps ONLY while playing and
-/// `!reduce_motion()`, keeping paused/reduced-motion states at zero idle redraws.
-fn smooth_spin_signal(store: AppStore, deg_per_frame: f32) -> Signal<f32> {
-    let spin_deg = signal(0.0_f32);
-    set_interval(Duration::from_millis(16), move || {
-        if store.is_playing.get_untracked() && !reduce_motion() {
-            let next = (spin_deg.try_get().unwrap_or(0.0) + deg_per_frame).rem_euclid(360.0);
-            let _ = spin_deg.try_set(next);
+/// Gated 30fps rotation signal (degrees in `[0, 360)`) that runs a `spawn`
+/// timer loop ONLY while `now_playing_open && is_playing && !reduce_motion()`,
+/// exiting cleanly on pause/close so idle CPU usage is 0%.
+fn gated_spin_signal(store: AppStore, deg_per_sec: f32) -> Signal<f32> {
+    let initial_deg = untracked(|| {
+        if reduce_motion() {
+            0.0_f32
+        } else {
+            ((store.position_ms.get() as f32 / 1000.0) * deg_per_sec).rem_euclid(360.0)
         }
     });
+    let spin_deg = signal(initial_deg);
+    let running = stored(false);
+
+    effect(move || {
+        let should_run = store.now_playing_open.get() && store.is_playing.get() && !reduce_motion();
+        if !should_run {
+            return;
+        }
+        let started = running.with(|r| {
+            if *r {
+                false
+            } else {
+                *r = true;
+                true
+            }
+        });
+        if started {
+            spawn(async move {
+                let mut last_tick = now();
+                loop {
+                    let active = store.now_playing_open.get_untracked()
+                        && store.is_playing.get_untracked()
+                        && !reduce_motion();
+                    if !active {
+                        running.with(|r| *r = false);
+                        break;
+                    }
+                    let cur = now();
+                    let dt = cur
+                        .saturating_duration_since(last_tick)
+                        .as_secs_f32()
+                        .clamp(0.0, 0.1);
+                    last_tick = cur;
+                    let next =
+                        (spin_deg.try_get().unwrap_or(0.0) + deg_per_sec * dt).rem_euclid(360.0);
+                    if !spin_deg.try_set(next) {
+                        running.with(|r| *r = false);
+                        break;
+                    }
+                    timer(Duration::from_millis(RETRO_FRAME_MS)).await;
+                }
+            });
+        }
+    });
+
     spin_deg
 }
 
+/// Quantized track playback progress in `[0.0, 1.0]` stepped every 0.5% so
+/// tonearm & tape spools stay smooth without rebuilding on every audio tick.
+fn quantized_progress(store: AppStore) -> Memo<f32> {
+    computed(move || {
+        let dur = store.duration_ms.get();
+        if dur == 0 {
+            0.0_f32
+        } else {
+            let raw = (store.position_ms.get() as f32 / dur as f32).clamp(0.0, 1.0);
+            (raw * 200.0).round() / 200.0
+        }
+    })
+}
+
 // -----------------------------------------------------------------------------
-// 1. Cover Mode: Crisp elevated album art with subtle audio-reactive halo
+// 1. Cover Mode (`ui_cover.go`): Breathing scale, 16pt corners, hover tilt & glare
 // -----------------------------------------------------------------------------
 
 fn cover_mode(store: AppStore, size_pt: f32) -> View {
-    let halo_box = size_pt + 36.0;
     let initial_playing = untracked(|| store.is_playing.get());
     let (enter_opacity, enter_scale) = mode_entrance_animations();
-    let cover_scale = animated_value(if initial_playing || reduce_motion() {
+
+    let hovered = signal(false);
+    let pointer = signal((size_pt * 0.5, size_pt * 0.5));
+
+    let breathe_scale = animated_value(if initial_playing || reduce_motion() {
         1.0
     } else {
-        0.95
+        0.88
     });
-    let prev_playing = stored(initial_playing);
+    let prev_target = stored(if initial_playing || reduce_motion() {
+        1.0_f32
+    } else {
+        0.88_f32
+    });
 
     effect(move || {
         let playing = store.is_playing.get();
-        if prev_playing.replace(playing) != playing {
-            let target = if playing || reduce_motion() { 1.0 } else { 0.95 };
-            motion::animate_spring(&cover_scale, target, motion::spring_gentle());
+        let over = hovered.get();
+        let target = if reduce_motion() {
+            1.0
+        } else {
+            let base = if playing { 1.0 } else { 0.88 };
+            if over { base * 1.02 } else { base }
+        };
+        if (prev_target.get() - target).abs() > 0.001 {
+            prev_target.replace(target);
+            motion::animate_spring(&breathe_scale, target, motion::spring_gentle());
         }
     });
 
+    let has_art = computed(move || has_renderable_art(&store.current_artwork_uri.get()));
+
     view()
-        .size(px(halo_box))
+        .size(px(size_pt))
         .items_center()
         .justify_center()
         .bind_opacity(&enter_opacity)
         .bind_scale(&enter_scale)
-        // Subtle audio-reactive halo behind the album cover
-        .child(
-            canvas(move || {
-                let accent = store.current_accent.get();
-                let playing = store.is_playing.get();
-                let reduced = reduce_motion();
-                let spectrum = if playing && !reduced {
-                    store.spectrum.get()
-                } else {
-                    [0.0; 16]
-                };
-                let energy =
-                    ((spectrum[0] + spectrum[1] + spectrum[2] + spectrum[3]) * 0.25).clamp(0.0, 1.0);
-                paint_cover_halo(
-                    halo_box,
-                    size_pt,
-                    accent,
-                    &spectrum,
-                    energy,
-                    playing && !reduced,
-                )
-            })
-            .absolute()
-            .inset_0()
-            .size_full()
-            .pointer_events(PointerEvents::None),
-        )
-        // Elevated album art frame
+        .on_mouse_enter(move |ev: &MouseEvent| {
+            hovered.set(true);
+            pointer.set((ev.position.x.0, ev.position.y.0));
+        })
+        .on_mouse_move(move |ev: &MouseEvent| {
+            if hovered.get_untracked() && !reduce_motion() {
+                pointer.set((ev.position.x.0, ev.position.y.0));
+            }
+        })
+        .on_mouse_leave(move |_: &MouseEvent| {
+            hovered.set(false);
+        })
         .child(
             Elevated::elevation(
                 view()
                     .size(px(size_pt))
-                    .rounded(px(radius::XL))
+                    .rounded(px(16.0))
                     .overflow_hidden()
-                    .border_1()
-                    .border_color(theme::np_border),
+                    .bg(theme::np_surface)
+                    .bind_scale(&breathe_scale)
+                    .perspective(px(900.0))
+                    .rotate_y(move || {
+                        if !hovered.get() || reduce_motion() {
+                            deg(0.0)
+                        } else {
+                            let (px_x, _) = pointer.get();
+                            let tx = ((px_x / size_pt.max(1.0)) * 2.0 - 1.0).clamp(-1.0, 1.0);
+                            deg(tx * 6.0)
+                        }
+                    })
+                    .rotate_x(move || {
+                        if !hovered.get() || reduce_motion() {
+                            deg(0.0)
+                        } else {
+                            let (_, px_y) = pointer.get();
+                            let ty = ((px_y / size_pt.max(1.0)) * 2.0 - 1.0).clamp(-1.0, 1.0);
+                            deg(-ty * 6.0)
+                        }
+                    })
+                    .transition_transform()
+                    .duration(move || motion::transition_ms(220.0))
+                    .items_center()
+                    .justify_center(),
                 Elevation::Modal,
             )
-            .bind_scale(&cover_scale)
-            .bg_linear_to_br()
-            .gradient_from(move || {
-                let (a, _) = theme::fallback_cover_gradient(&current_track_seed(store));
-                AdaptiveColor::from(a)
-            })
-            .gradient_to(move || {
-                let (_, b) = theme::fallback_cover_gradient(&current_track_seed(store));
-                AdaptiveColor::from(b)
-            })
-            .items_center()
-            .justify_center()
-            .child(
-                icon(Icon::Disc, (size_pt * 0.34).clamp(40.0, 92.0), colors::NP_MUTED)
-                    .opacity(0.62),
-            )
+            // Missing cover calm placeholder (avoids flashing disc while remote cover loads)
             .child(when(
-                move || has_renderable_art(&store.current_artwork_uri.get()),
+                move || !has_art.get(),
                 move || {
-                    image(move || store.current_artwork_uri.get())
-                        .object_fit(ResizeMode::Cover)
+                    view()
                         .absolute()
                         .inset_0()
-                        .size_full()
+                        .bg(theme::np_surface)
+                        .border_1()
+                        .border_color(move || theme::np_fg().opacity(0.07))
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            icon(
+                                Icon::Disc,
+                                (size_pt * 0.30).clamp(40.0, 88.0),
+                                colors::NP_FG,
+                            )
+                            .opacity(0.32),
+                        )
+                },
+            ))
+            // Cover image
+            .child(when(has_art, move || {
+                image(move || store.current_artwork_uri.get())
+                    .object_fit(ResizeMode::Cover)
+                    .absolute()
+                    .inset_0()
+                    .size_full()
+            }))
+            // Subtle glass hairline rim so dark covers separate cleanly from dark backdrops
+            .child(
+                view()
+                    .absolute()
+                    .inset_0()
+                    .rounded(px(16.0))
+                    .border_1()
+                    .border_color(move || theme::np_fg().opacity(0.10))
+                    .pointer_events(PointerEvents::None),
+            )
+            // Soft pointer-tracking card glare (mounted ONLY while hovered & !reduce_motion())
+            .child(when(
+                move || hovered.get() && !reduce_motion(),
+                move || {
+                    canvas(move || {
+                        let (gx, gy) = pointer.get();
+                        paint_cover_glare(size_pt, gx, gy)
+                    })
+                    .absolute()
+                    .inset_0()
+                    .size_full()
+                    .pointer_events(PointerEvents::None)
                 },
             )),
         )
 }
 
-fn paint_cover_halo(
-    box_size: f32,
-    cover_size: f32,
-    accent: Hsla,
-    spectrum: &[f32; 16],
-    energy: f32,
-    animate: bool,
-) -> Painter {
-    let c = box_size * 0.5;
-    let inner_r = cover_size * 0.36;
-    let outer_r = (box_size * 0.50).min(cover_size * 0.5 + 16.0 + energy * 10.0);
-
-    let glow_core = accent
-        .saturate(0.24)
-        .lighten(0.18)
-        .alpha((0.28 + energy * 0.28).clamp(0.0, 0.58));
-    let glow_edge = accent.alpha(0.0);
-
+fn paint_cover_glare(size_pt: f32, gx: f32, gy: f32) -> Painter {
+    let fg = color(theme::np_fg());
+    let radius = (size_pt * 0.56).max(60.0);
     let grad = CanvasGradient::radial(
-        point(px(c), px(c)),
-        px(inner_r),
-        point(px(c), px(c)),
-        px(outer_r),
+        point(px(gx), px(gy)),
+        px(size_pt * 0.04),
+        point(px(gx), px(gy)),
+        px(radius),
     )
-    .add_color_stop(percentage(0.0), glow_core)
-    .add_color_stop(percentage(1.0), glow_edge);
+    .add_color_stop(percentage(0.0), fg.alpha(0.24))
+    .add_color_stop(percentage(0.45), fg.alpha(0.08))
+    .add_color_stop(percentage(1.0), fg.alpha(0.0));
 
-    let mut p = Painter::new()
+    Painter::new()
         .fill_style(grad)
-        .begin_path()
-        .arc(c, c, outer_r, 0.0, TAU)
-        .fill();
-
-    // Subtle 16-segment reactive rim ticks when actively playing
-    if animate {
-        let rim_r = cover_size * 0.5 + 7.0;
-        let tick_col = accent.lighten(0.32).alpha(0.36);
-        p = p
-            .stroke_color(tick_col)
-            .line_width(2.0)
-            .line_cap(LineCap::Round);
-        for (i, &band) in spectrum.iter().enumerate() {
-            let amp = band.clamp(0.0, 1.0);
-            if amp < 0.08 {
-                continue;
-            }
-            let theta = (i as f32 / spectrum.len() as f32) * TAU - FRAC_PI_2;
-            let (sin, cos) = theta.sin_cos();
-            let r0 = rim_r;
-            let r1 = rim_r + 2.0 + amp * 8.0;
-            p = p
-                .begin_path()
-                .move_to(c + cos * r0, c + sin * r0)
-                .line_to(c + cos * r1, c + sin * r1)
-                .stroke();
-        }
-    }
-
-    p
+        .fill_rect(0.0, 0.0, size_pt, size_pt)
 }
 
 // -----------------------------------------------------------------------------
-// 2. Vinyl Mode: 33 RPM turntable with grooves, 60fps spinning label & spring tonearm
+// 2. Vinyl Mode (`ui_retro.go` + `retro_render.go`): Square turntable deck
 // -----------------------------------------------------------------------------
 
+/// Computes exact tonearm angle (radians, 0 = +X right, PI/2 = +Y down) for
+/// `engaged` (`0.0` parked -> `1.0` playing) and track `progress` (`0.0..=1.0`),
+/// using the exact law-of-cosines stylus geometry from `mygo-music` `ui_retro.go:3193-3201`.
+fn compute_tonearm_rad(engaged: bool, progress: f32) -> f32 {
+    if !engaged {
+        return DECK_REST;
+    }
+    let stx = ARM_TUBE - 0.005 + STYLUS_AT * HEADSHELL_TURN.cos();
+    let sty = STYLUS_AT * HEADSHELL_TURN.sin();
+    let reach = stx.hypot(sty);
+    let offset = sty.atan2(stx);
+    let dist = (DECK_CX - DECK_PIVOT_X).hypot(DECK_CY - DECK_PIVOT_Y);
+    let outer = DECK_RECORD * 0.955;
+    let inner = DECK_RECORD * DECK_LABEL * 1.20;
+    let needle = outer + (inner - outer) * progress.clamp(0.0, 1.0);
+    let cos_v =
+        ((reach * reach + dist * dist - needle * needle) / (2.0 * reach * dist)).clamp(-1.0, 1.0);
+    let toward = (DECK_CY - DECK_PIVOT_Y).atan2(DECK_CX - DECK_PIVOT_X);
+    toward - cos_v.acos() - offset
+}
+
 fn vinyl_mode(store: AppStore, size_pt: f32) -> View {
-    let w = (size_pt * 1.16).max(size_pt + 28.0);
-    let h = size_pt + 16.0;
-    let cx = w * 0.44;
-    let cy = h * 0.52;
-    let disc_r = (size_pt * 0.45).min(cx - 10.0).min(cy - 8.0);
-    let label_r = disc_r * 0.36;
+    let s = size_pt;
+    let cx = DECK_CX * s;
+    let cy = DECK_CY * s;
+    let label_r = DECK_RECORD * DECK_LABEL * s;
 
     let (enter_opacity, enter_scale) = mode_entrance_animations();
-    let spin_deg = smooth_spin_signal(store, VINYL_DEG_PER_FRAME);
+    let spin_deg = gated_spin_signal(store, VINYL_DEG_PER_SEC);
+    let progress = quantized_progress(store);
 
     let initial_playing = untracked(|| store.is_playing.get());
-    let tonearm_engaged = animated_value(if initial_playing { 1.0 } else { 0.0 });
-    let prev_playing = stored(initial_playing);
+    let initial_prog = untracked(|| progress.get());
+    let arm_rad = animated_value(compute_tonearm_rad(initial_playing, initial_prog));
+    let prev_arm_state = stored((initial_playing, initial_prog));
 
     effect(move || {
         let playing = store.is_playing.get();
-        if prev_playing.replace(playing) != playing {
-            motion::animate_spring(
-                &tonearm_engaged,
-                if playing { 1.0 } else { 0.0 },
-                motion::spring_gentle(),
-            );
+        let prog = progress.get();
+        let (was_playing, last_prog) = prev_arm_state.get();
+        if playing != was_playing || (playing && (prog - last_prog).abs() >= 0.005) {
+            prev_arm_state.replace((playing, prog));
+            let target = compute_tonearm_rad(playing, prog);
+            if playing != was_playing {
+                motion::animate_spring(&arm_rad, target, motion::spring_gentle());
+            } else {
+                motion::animate_timing(&arm_rad, target, motion::timing_base());
+            }
         }
     });
 
-    // Tonearm angle interpolated on UI thread (radians clockwise from vertical down):
-    // 0.0 (parked) -> -0.14 rad (resting on cradle); 1.0 (engaged) -> 0.34 rad (stylus on grooves)
-    let tonearm_angle = tonearm_engaged.interpolate(&[0.0, 1.0], &[-0.14, 0.34]);
+    let has_art = computed(move || has_renderable_art(&store.current_artwork_uri.get()));
 
-    let spin_radians = move || {
-        if reduce_motion() {
-            0.0_f32
-        } else {
-            spin_deg.get().to_radians()
-        }
-    };
-
-    view()
-        .w(px(w))
-        .h(px(h))
-        .relative()
-        .bind_opacity(&enter_opacity)
-        .bind_scale(&enter_scale)
-        // Platter, grooves, specular sheen, spinning center label backdrop
-        .child(
-            canvas(move || {
-                let accent = store.current_accent.get();
-                let seed = current_track_seed(store);
-                let angle = spin_radians();
-                let playing = store.is_playing.get();
-                paint_vinyl_platter(w, h, cx, cy, disc_r, label_r, accent, &seed, angle, playing)
-            })
+    Elevated::elevation(
+        view()
+            .size(px(s))
+            .relative()
+            .rounded(px(16.0))
+            .overflow_hidden()
+            .bind_opacity(&enter_opacity)
+            .bind_scale(&enter_scale),
+        Elevation::Modal,
+    )
+    // Layer 1: Static brushed plinth, aluminum platter, strobe dots, vinyl grooves,
+    // controls (START / 33 / 45), strobe lamp, anti-skate, cue lever, pitch fader.
+    // Redraws ONLY on play/pause or accent change (ZERO 30fps canvas redraws!).
+    .child(
+        canvas(move || {
+            let playing = store.is_playing.get();
+            let accent = store.current_accent.get();
+            paint_vinyl_deck(s, accent, playing)
+        })
+        .absolute()
+        .inset_0()
+        .size_full()
+        .pointer_events(PointerEvents::None),
+    )
+    // Layer 2: Spinning circular cover label (pure GPU rotation at 30fps, zero canvas redraws!)
+    .child(
+        view()
             .absolute()
-            .inset_0()
-            .size_full()
-            .pointer_events(PointerEvents::None),
-        )
-        // Spinning circular artwork label overlay (rotates smoothly at 60fps in sync with platter)
-        .child(
-            view()
-                .absolute()
-                .left(px(cx - label_r))
-                .top(px(cy - label_r))
-                .size(px(label_r * 2.0))
-                .rounded_full()
-                .overflow_hidden()
-                .border_1()
-                .border_color(theme::np_border)
-                .rotate(move || Radians(spin_radians()))
-                .pointer_events(PointerEvents::None)
-                .child(when(
-                    move || has_renderable_art(&store.current_artwork_uri.get()),
-                    move || {
-                        image(move || store.current_artwork_uri.get())
-                            .object_fit(ResizeMode::Cover)
-                            .size_full()
-                    },
-                )),
-        )
-        // Foreground spindle cap + spring-animated tonearm drawn ABOVE the rotating label
-        .child(
-            canvas(move || {
-                let playing = store.is_playing.get();
-                let accent = store.current_accent.get();
-                paint_vinyl_spindle_and_tonearm(
-                    w,
-                    h,
-                    cx,
-                    cy,
-                    disc_r,
-                    accent,
-                    playing,
-                    &tonearm_angle,
-                )
-            })
-            .absolute()
-            .inset_0()
-            .size_full()
-            .pointer_events(PointerEvents::None),
-        )
+            .left(px(cx - label_r))
+            .top(px(cy - label_r))
+            .size(px(label_r * 2.0))
+            .rounded_full()
+            .overflow_hidden()
+            .bg(move || AdaptiveColor::from(store.current_accent.get()))
+            .rotate(move || deg(spin_deg.get()))
+            .pointer_events(PointerEvents::None)
+            .child(when(
+                move || !has_art.get(),
+                move || {
+                    // Plain label rotation band matching `ui_retro.go:3161`
+                    view()
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .top(px(label_r * 0.84))
+                        .h(px(label_r * 0.32))
+                        .bg(move || theme::np_fg().opacity(0.22))
+                },
+            ))
+            .child(when(has_art, move || {
+                image(move || store.current_artwork_uri.get())
+                    .object_fit(ResizeMode::Cover)
+                    .size_full()
+            })),
+    )
+    // Layer 3: Matte paper lighting, chrome center spindle, and UI-thread-animated tonearm
+    .child(
+        canvas(move || {
+            let playing = store.is_playing.get();
+            paint_vinyl_spindle_and_arm(s, playing, &arm_rad)
+        })
+        .absolute()
+        .inset_0()
+        .size_full()
+        .pointer_events(PointerEvents::None),
+    )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn paint_vinyl_platter(
-    w: f32,
-    h: f32,
-    cx: f32,
-    cy: f32,
-    disc_r: f32,
-    label_r: f32,
-    accent: Hsla,
-    seed: &str,
-    angle: f32,
-    playing: bool,
-) -> Painter {
-    let stage_dark = color(theme::np_bg());
+fn paint_vinyl_deck(s: f32, accent: Hsla, playing: bool) -> Painter {
+    let dark = color(theme::np_bg());
     let fg = color(theme::np_fg());
-    let amber = color(theme::amber());
-    let (grad_a, grad_b) = theme::fallback_cover_gradient(seed);
+    let danger = color(theme::danger());
+    let primary = color(theme::primary());
+    let cx = DECK_CX * s;
+    let cy = DECK_CY * s;
+    let platter_r = DECK_PLATTER * s;
+    let record_r = DECK_RECORD * s;
+    let label_r = record_r * DECK_LABEL;
 
-    let plinth_pad = 4.0;
-    let plinth_bounds = Bounds::new(
-        point(px(plinth_pad), px(plinth_pad)),
-        size(px(w - plinth_pad * 2.0), px(h - plinth_pad * 2.0)),
-    );
-
-    // Subtle dark brushed turntable plinth deck
-    let plinth_fill = CanvasGradient::linear(point(px(0.0), px(0.0)), point(px(w), px(h)))
-        .add_color_stop(percentage(0.0), stage_dark.lighten(0.14).alpha(0.72))
-        .add_color_stop(percentage(1.0), stage_dark.alpha(0.86));
+    // Brushed black anodized aluminum plinth
+    let plinth_grad = CanvasGradient::linear(point(px(0.0), px(0.0)), point(px(s), px(s)))
+        .add_color_stop(percentage(0.0), dark.lighten(0.14))
+        .add_color_stop(percentage(0.55), dark.lighten(0.07))
+        .add_color_stop(percentage(1.0), dark.lighten(0.03));
 
     let mut p = Painter::new()
-        .fill_style(plinth_fill)
-        .begin_path()
-        .round_rect(plinth_bounds, px(radius::XL))
-        .fill()
+        .fill_style(plinth_grad)
+        .fill_rect(0.0, 0.0, s, s)
         .stroke_color(fg.alpha(0.12))
         .line_width(1.0)
         .begin_path()
-        .round_rect(plinth_bounds, px(radius::XL))
+        .round_rect(
+            Bounds::new(point(px(0.5), px(0.5)), size(px(s - 1.0), px(s - 1.0))),
+            px(16.0),
+        )
         .stroke();
 
-    // Aluminum platter base ring + strobe speed dots
-    let platter_r = disc_r + 6.0;
+    // Soft platter drop shadow
+    let shadow_grad = CanvasGradient::radial(
+        point(px(cx + 0.008 * s), px(cy + 0.014 * s)),
+        px(platter_r * 0.85),
+        point(px(cx + 0.008 * s), px(cy + 0.014 * s)),
+        px(platter_r * 1.08),
+    )
+    .add_color_stop(percentage(0.0), dark.alpha(0.75))
+    .add_color_stop(percentage(1.0), dark.alpha(0.0));
     p = p
-        .fill_color(stage_dark.lighten(0.22).alpha(0.92))
+        .fill_style(shadow_grad)
         .begin_path()
-        .arc(cx, cy, platter_r, 0.0, TAU)
-        .fill()
-        .stroke_color(fg.alpha(0.22))
-        .line_width(1.5)
-        .begin_path()
-        .arc(cx, cy, platter_r, 0.0, TAU)
-        .stroke();
+        .arc(cx + 0.008 * s, cy + 0.014 * s, platter_r * 1.08, 0.0, TAU)
+        .fill();
 
-    let dot_count: usize = 36;
-    p = p.fill_color(fg.alpha(0.32));
+    // Brushed aluminum platter rim
+    let rim_grad = CanvasGradient::linear(
+        point(px(cx - platter_r), px(cy - platter_r)),
+        point(px(cx + platter_r), px(cy + platter_r)),
+    )
+    .add_color_stop(percentage(0.0), fg.alpha(0.58))
+    .add_color_stop(percentage(0.5), fg.alpha(0.30))
+    .add_color_stop(percentage(1.0), fg.alpha(0.46));
+
+    p = p
+        .fill_style(rim_grad)
+        .begin_path()
+        .arc(cx, cy, platter_r, 0.0, TAU)
+        .fill();
+
+    // Strobe speed dots along platter rim
+    let dot_count: usize = 60;
+    p = p.fill_color(dark.alpha(0.45));
     for i in 0..dot_count {
-        let theta = (i as f32 / dot_count as f32) * TAU + angle;
+        let theta = (i as f32 / dot_count as f32) * TAU;
         let (sin, cos) = theta.sin_cos();
-        let rx = cx + cos * (platter_r - 2.6);
-        let ry = cy + sin * (platter_r - 2.6);
-        p = p.begin_path().arc(rx, ry, 1.0, 0.0, TAU).fill();
+        let r_mid = record_r + (platter_r - record_r) * 0.52;
+        p = p
+            .begin_path()
+            .arc(
+                cx + cos * r_mid,
+                cy + sin * r_mid,
+                (0.0036 * s).max(1.0),
+                0.0,
+                TAU,
+            )
+            .fill();
     }
 
-    // Main vinyl record body with subtle radial sheen
-    let vinyl_grad = CanvasGradient::radial(
-        point(px(cx - disc_r * 0.22), px(cy - disc_r * 0.22)),
-        px(label_r * 0.6),
-        point(px(cx), px(cy)),
-        px(disc_r),
-    )
-    .add_color_stop(percentage(0.0), stage_dark.lighten(0.18))
-    .add_color_stop(percentage(0.58), stage_dark.lighten(0.06))
-    .add_color_stop(percentage(1.0), stage_dark);
-
+    // Rubber mat rim & black vinyl record body
     p = p
-        .fill_style(vinyl_grad)
+        .fill_color(dark.lighten(0.04))
         .begin_path()
-        .arc(cx, cy, disc_r, 0.0, TAU)
+        .arc(cx, cy, record_r + 0.004 * s, 0.0, TAU)
         .fill()
-        .stroke_color(fg.alpha(0.16))
-        .line_width(1.2)
+        .fill_color(dark.lighten(0.015))
         .begin_path()
-        .arc(cx, cy, disc_r - 0.8, 0.0, TAU)
-        .stroke();
+        .arc(cx, cy, record_r, 0.0, TAU)
+        .fill();
 
-    // Concentric micro-grooves across the playable band
-    let groove_start = label_r + 8.0;
-    let groove_end = disc_r - 5.0;
-    let groove_count: usize = 18;
+    // Concentric vinyl grooves with subtle track separator bands
+    let groove_start = label_r * 1.18;
+    let groove_end = record_r * 0.97;
+    let groove_count: usize = 22;
     for i in 0..groove_count {
         let t = i as f32 / (groove_count - 1).max(1) as f32;
         let r = groove_start + (groove_end - groove_start) * t;
-        // Subtle wider track separator bands at 32% and 68%
-        let is_break = i == 5 || i == 12;
-        let alpha = if is_break {
-            0.14
+        let is_track_gap = i == 5 || i == 11 || i == 16;
+        let alpha = if is_track_gap {
+            0.13
         } else if i.is_multiple_of(2) {
-            0.075
+            0.065
         } else {
-            0.035
+            0.03
         };
-        let width = if is_break { 1.2 } else { 0.65 };
         p = p
             .stroke_color(fg.alpha(alpha))
-            .line_width(width)
+            .line_width(if is_track_gap { 1.1 } else { 0.6 })
             .begin_path()
             .arc(cx, cy, r, 0.0, TAU)
             .stroke();
     }
 
-    // Specular diagonal light reflection across the vinyl grooves (fixed to studio lamp)
+    // Diagonal specular light reflection wedges across vinyl grooves (room key light)
     p = p.save().translate(cx, cy);
     for offset in [0.0_f32, PI] {
-        let a0 = -0.82 + offset;
-        let a1 = -0.28 + offset;
+        let a0 = -1.05 + offset;
+        let a1 = -0.35 + offset;
         let sheen = CanvasGradient::linear(
-            point(px(a0.cos() * disc_r), px(a0.sin() * disc_r)),
-            point(px(a1.cos() * disc_r), px(a1.sin() * disc_r)),
+            point(px(a0.cos() * record_r), px(a0.sin() * record_r)),
+            point(px(a1.cos() * record_r), px(a1.sin() * record_r)),
         )
         .add_color_stop(percentage(0.0), fg.alpha(0.0))
-        .add_color_stop(percentage(0.5), fg.alpha(0.14))
+        .add_color_stop(percentage(0.5), fg.alpha(0.18))
         .add_color_stop(percentage(1.0), fg.alpha(0.0));
-
         p = p
             .fill_style(sheen)
             .begin_path()
             .move_to(0.0, 0.0)
-            .arc(0.0, 0.0, disc_r - 1.5, a0, a1)
+            .arc(0.0, 0.0, record_r - 1.0, a0, a1)
             .close_path()
             .fill();
     }
     p = p.restore();
 
-    // Spinning center label (visible natively AND beneath circular artwork image)
-    p = p.save().translate(cx, cy).rotate(angle);
-    let label_grad = CanvasGradient::linear(
-        point(px(-label_r), px(-label_r)),
-        point(px(label_r), px(label_r)),
-    )
-    .add_color_stop(percentage(0.0), grad_a.mix(accent, 0.45))
-    .add_color_stop(percentage(1.0), grad_b);
-
+    // Tonearm gimbal boss plate (upper-right)
+    let px_p = DECK_PIVOT_X * s;
+    let py_p = DECK_PIVOT_Y * s;
     p = p
-        .fill_style(label_grad)
-        .begin_path()
-        .arc(0.0, 0.0, label_r, 0.0, TAU)
-        .fill()
-        .stroke_color(fg.alpha(0.32))
+        .fill_color(dark.lighten(0.11))
+        .stroke_color(fg.alpha(0.28))
         .line_width(1.2)
         .begin_path()
-        .arc(0.0, 0.0, label_r - 4.5, 0.0, TAU)
-        .stroke()
-        // Subtle rotation cue notch on the label ring so 33 RPM motion is unmistakable
-        .stroke_color(fg.alpha(0.75))
-        .line_width(2.0)
-        .line_cap(LineCap::Round)
-        .begin_path()
-        .arc(0.0, 0.0, label_r - 8.5, -0.45, 0.45)
-        .stroke()
-        .fill_color(fg.alpha(0.85))
-        .font("700 8px sans-serif")
-        .text_align(CanvasTextAlign::Center)
-        .text_baseline(CanvasTextBaseline::Middle)
-        .fill_text("33⅓ RPM", 0.0, -label_r * 0.42)
-        .fill_text("SIDE A", 0.0, label_r * 0.46)
-        .restore();
-
-    // Power / speed indicator LED at bottom-left corner of plinth
-    let led_x = 18.0;
-    let led_y = h - 18.0;
-    let led_col = if playing { amber } else { fg.alpha(0.24) };
-    p = p
-        .fill_color(led_col.alpha(if playing { 0.28 } else { 0.0 }))
-        .begin_path()
-        .arc(led_x, led_y, 7.0, 0.0, TAU)
+        .arc(px_p, py_p, 0.088 * s, 0.0, TAU)
         .fill()
-        .fill_color(led_col)
+        .stroke()
+        .fill_color(fg.alpha(0.38))
         .begin_path()
-        .arc(led_x, led_y, 2.8, 0.0, TAU)
+        .arc(px_p, py_p, 0.064 * s, 0.0, TAU)
+        .fill()
+        .fill_color(dark.lighten(0.05))
+        .begin_path()
+        .arc(px_p, py_p, 0.044 * s, 0.0, TAU)
         .fill();
 
-    p
-}
-
-#[allow(clippy::too_many_arguments)]
-fn paint_vinyl_spindle_and_tonearm(
-    w: f32,
-    h: f32,
-    cx: f32,
-    cy: f32,
-    disc_r: f32,
-    accent: Hsla,
-    playing: bool,
-    tonearm_angle: &AnimatedNode,
-) -> Painter {
-    let fg = color(theme::np_fg());
-    let dark = color(theme::np_bg());
-    let primary = color(theme::primary());
-    let muted = color(theme::np_muted());
-
-    // Center brushed metal spindle pin drawn over the artwork label
-    let mut p = Painter::new()
-        .fill_color(dark.alpha(0.85))
-        .begin_path()
-        .arc(cx, cy, 7.0, 0.0, TAU)
-        .fill()
-        .fill_color(fg.alpha(0.88))
-        .begin_path()
-        .arc(cx, cy, 3.6, 0.0, TAU)
-        .fill()
-        .fill_color(dark.alpha(0.55))
-        .begin_path()
-        .arc(cx - 0.8, cy - 0.8, 1.2, 0.0, TAU)
-        .fill();
-
-    // Tonearm gimbal pivot in upper-right corner of the plinth
-    let pivot_x = (w - 28.0).max(cx + disc_r * 0.72);
-    let pivot_y = (cy - disc_r * 0.68).max(28.0);
-    let arm_len = (h * 0.56).min(disc_r * 1.18);
-
-    // Armrest dock marker beneath the parked arm position
-    let rest_x = pivot_x - 3.0;
-    let rest_y = pivot_y + arm_len * 0.68;
+    // Armrest dock post, cue lever, anti-skating knob, and pitch fader
+    let rest_x = (DECK_PIVOT_X + 0.42 * DECK_REST.cos()) * s;
+    let rest_y = (DECK_PIVOT_Y + 0.42 * DECK_REST.sin()) * s;
     p = p
-        .fill_color(dark.lighten(0.18).alpha(0.9))
-        .stroke_color(fg.alpha(0.24))
-        .line_width(1.2)
+        .fill_color(fg.alpha(0.45))
+        .begin_path()
+        .arc(rest_x, rest_y, 0.015 * s, 0.0, TAU)
+        .fill()
+        .fill_color(dark.lighten(0.05))
         .begin_path()
         .round_rect(
             Bounds::new(
-                point(px(rest_x - 5.0), px(rest_y - 3.0)),
-                size(px(10.0), px(6.0)),
+                point(px(rest_x - 0.02 * s), px(rest_y - 0.01 * s)),
+                size(px(0.04 * s), px(0.02 * s)),
             ),
-            px(2.5),
+            px(0.005 * s),
         )
         .fill()
-        .stroke();
+        // Anti-skate knob
+        .fill_color(dark.lighten(0.14))
+        .stroke_color(fg.alpha(0.25))
+        .line_width(1.0)
+        .begin_path()
+        .arc(0.94 * s, 0.30 * s, 0.025 * s, 0.0, TAU)
+        .fill()
+        .stroke()
+        // Cue lever
+        .stroke_color(fg.alpha(0.55))
+        .line_width((0.01 * s).max(2.0))
+        .line_cap(LineCap::Round)
+        .begin_path()
+        .move_to(0.915 * s, 0.50 * s)
+        .line_to(0.965 * s, 0.50 * s)
+        .stroke()
+        // Pitch fader slot & slider cap
+        .fill_color(dark)
+        .begin_path()
+        .round_rect(
+            Bounds::new(
+                point(px(0.922 * s), px(0.80 * s)),
+                size(px(0.014 * s), px(0.155 * s)),
+            ),
+            px(0.006 * s),
+        )
+        .fill()
+        .fill_color(fg.alpha(0.48))
+        .begin_path()
+        .round_rect(
+            Bounds::new(
+                point(px(0.906 * s), px(0.862 * s)),
+                size(px(0.046 * s), px(0.032 * s)),
+            ),
+            px(0.005 * s),
+        )
+        .fill();
 
-    // Static gimbal base plate
+    // Strobe lamp housing & warm red/coral glow when playing (`ui_retro.go:3180-3188`)
+    let lx = DECK_LAMP_X * s;
+    let ly = DECK_LAMP_Y * s;
     p = p
-        .fill_color(dark.lighten(0.16))
-        .stroke_color(fg.alpha(0.32))
+        .fill_color(dark.lighten(0.11))
+        .begin_path()
+        .arc(lx, ly, 0.027 * s, 0.0, TAU)
+        .fill()
+        .fill_color(danger.darken(0.28))
+        .begin_path()
+        .arc(lx, ly, 0.015 * s, 0.0, TAU)
+        .fill();
+    if playing {
+        let strobe_col = danger.mix(primary, 0.35);
+        let glow = CanvasGradient::radial(
+            point(px(lx), px(ly)),
+            px(0.0),
+            point(px(lx), px(ly)),
+            px(0.062 * s),
+        )
+        .add_color_stop(percentage(0.0), strobe_col.alpha(0.78))
+        .add_color_stop(percentage(0.32), strobe_col.alpha(0.26))
+        .add_color_stop(percentage(1.0), strobe_col.alpha(0.0));
+        p = p
+            .fill_style(glow)
+            .begin_path()
+            .arc(lx, ly, 0.062 * s, 0.0, TAU)
+            .fill()
+            .fill_color(strobe_col.lighten(0.32))
+            .begin_path()
+            .arc(lx, ly, 0.009 * s, 0.0, TAU)
+            .fill();
+    }
+
+    // Bottom-left START / 33 / 45 deck buttons + 33 RPM status LED (`ui_retro.go:3213-3231`)
+    p = p
+        .fill_color(fg.alpha(0.58))
+        .begin_path()
+        .round_rect(
+            Bounds::new(
+                point(px(0.035 * s), px(0.905 * s)),
+                size(px(0.125 * s), px(0.058 * s)),
+            ),
+            px(0.01 * s),
+        )
+        .fill()
+        .fill_color(dark.lighten(0.12))
+        .begin_path()
+        .round_rect(
+            Bounds::new(
+                point(px(0.178 * s), px(0.918 * s)),
+                size(px(0.054 * s), px(0.038 * s)),
+            ),
+            px(0.008 * s),
+        )
+        .fill()
+        .begin_path()
+        .round_rect(
+            Bounds::new(
+                point(px(0.246 * s), px(0.918 * s)),
+                size(px(0.054 * s), px(0.038 * s)),
+            ),
+            px(0.008 * s),
+        )
+        .fill();
+
+    let btn_font = format!("700 {:.1}px sans-serif", (0.018 * s).max(7.0));
+    p = p
+        .font(&btn_font)
+        .text_align(CanvasTextAlign::Center)
+        .text_baseline(CanvasTextBaseline::Middle)
+        .fill_color(dark.alpha(0.75))
+        .fill_text("START", 0.0975 * s, 0.934 * s)
+        .fill_color(fg.alpha(0.78))
+        .fill_text("33", 0.205 * s, 0.937 * s)
+        .fill_color(fg.alpha(0.45))
+        .fill_text("45", 0.273 * s, 0.937 * s);
+
+    // 33 RPM indicator LED above "33" button
+    let led_x = 0.205 * s;
+    let led_y = 0.904 * s;
+    let led_col = if playing {
+        danger.mix(accent, 0.15).lighten(0.12)
+    } else {
+        danger.darken(0.35)
+    };
+    if playing {
+        let led_glow = CanvasGradient::radial(
+            point(px(led_x), px(led_y)),
+            px(0.0),
+            point(px(led_x), px(led_y)),
+            px(0.016 * s),
+        )
+        .add_color_stop(percentage(0.0), led_col.alpha(0.65))
+        .add_color_stop(percentage(1.0), led_col.alpha(0.0));
+        p = p
+            .fill_style(led_glow)
+            .begin_path()
+            .arc(led_x, led_y, 0.016 * s, 0.0, TAU)
+            .fill();
+    }
+    p.fill_color(led_col)
+        .begin_path()
+        .arc(led_x, led_y, (0.004 * s).max(1.5), 0.0, TAU)
+        .fill()
+}
+
+fn paint_vinyl_spindle_and_arm(s: f32, playing: bool, arm_rad: &AnimatedValue) -> Painter {
+    let dark = color(theme::np_bg());
+    let fg = color(theme::np_fg());
+    let danger = color(theme::danger());
+    let cx = DECK_CX * s;
+    let cy = DECK_CY * s;
+    let label_r = DECK_RECORD * DECK_LABEL * s;
+
+    // Matte paper shading & recessed ring over the spinning label
+    let paper_grad = CanvasGradient::linear(
+        point(px(cx - label_r), px(cy - label_r)),
+        point(px(cx + label_r), px(cy + label_r)),
+    )
+    .add_color_stop(percentage(0.0), fg.alpha(0.11))
+    .add_color_stop(percentage(1.0), dark.alpha(0.20));
+
+    let sp = (0.013 * s).max(4.0);
+    let mut p = Painter::new()
+        .fill_style(paper_grad)
+        .begin_path()
+        .arc(cx, cy, label_r, 0.0, TAU)
+        .fill()
+        .stroke_color(dark.alpha(0.38))
         .line_width(1.6)
         .begin_path()
-        .arc(pivot_x, pivot_y, 17.0, 0.0, TAU)
-        .fill()
+        .arc(cx, cy, label_r - 0.8, 0.0, TAU)
         .stroke()
-        .stroke_color(accent.lighten(0.24).alpha(0.45))
-        .line_width(1.0)
+        // Chrome spindle & shadow
+        .fill_color(dark.alpha(0.55))
         .begin_path()
-        .arc(pivot_x, pivot_y, 12.0, 0.0, TAU)
-        .stroke();
+        .arc(cx + sp * 0.35, cy + sp * 0.5, sp * 1.4, 0.0, TAU)
+        .fill()
+        .fill_color(fg.alpha(0.88))
+        .begin_path()
+        .arc(cx, cy, sp, 0.0, TAU)
+        .fill()
+        .fill_color(dark.alpha(0.45))
+        .begin_path()
+        .arc(cx + sp * 0.2, cy + sp * 0.2, sp * 0.42, 0.0, TAU)
+        .fill();
 
-    // Animated rotating tonearm assembly (runs smoothly on UI thread via AnimatedNode!)
+    // Tonearm assembly pivoted at (DECK_PIVOT_X, DECK_PIVOT_Y) along +X in arm frame
+    let px_p = DECK_PIVOT_X * s;
+    let py_p = DECK_PIVOT_Y * s;
+    let tube_len = ARM_TUBE * s;
+    let hs_len = (STYLUS_AT + 0.018) * s;
+
     p = p
         .save()
-        .translate(pivot_x, pivot_y)
-        .rotate(tonearm_angle)
+        .translate(px_p, py_p)
+        .rotate(arm_rad)
         // Rear counterweight cylinder
-        .fill_color(fg.alpha(0.55))
-        .stroke_color(dark.alpha(0.75))
+        .fill_color(fg.alpha(0.42))
+        .stroke_color(dark.alpha(0.70))
         .line_width(1.0)
         .begin_path()
         .round_rect(
-            Bounds::new(point(px(-5.5), px(-22.0)), size(px(11.0), px(14.0))),
-            px(3.0),
+            Bounds::new(
+                point(px(-0.155 * s), px(-0.032 * s)),
+                size(px(0.088 * s), px(0.064 * s)),
+            ),
+            px(0.008 * s),
         )
         .fill()
         .stroke()
-        // Main S-shaped / angled brushed aluminum tonearm shaft (dark drop edge + metallic highlight)
+        // Tonearm shadow & chrome tube
         .line_cap(LineCap::Round)
         .line_join(LineJoin::Round)
-        .stroke_color(dark.alpha(0.60))
-        .line_width(6.2)
+        .stroke_color(dark.alpha(0.45))
+        .line_width((0.022 * s).max(4.5))
         .begin_path()
-        .move_to(0.0, -8.0)
-        .line_to(0.0, arm_len * 0.68)
-        .line_to(-14.0, arm_len * 0.92)
+        .move_to(-0.07 * s, 0.01 * s)
+        .line_to(tube_len, 0.012 * s)
         .stroke()
-        .stroke_color(fg.alpha(0.84))
-        .line_width(3.6)
+        .stroke_color(fg.alpha(0.85))
+        .line_width((0.016 * s).max(3.2))
         .begin_path()
-        .move_to(0.0, -8.0)
-        .line_to(0.0, arm_len * 0.68)
-        .line_to(-14.0, arm_len * 0.92)
+        .move_to(-0.07 * s, 0.0)
+        .line_to(tube_len, 0.0)
         .stroke()
-        // Headshell cartridge housing
+        // Angled brushed aluminum headshell & cartridge nose
         .save()
-        .translate(-14.0, arm_len * 0.92)
-        .rotate(0.42)
-        .fill_color(dark.lighten(0.22))
-        .stroke_color(fg.alpha(0.55))
-        .line_width(1.2)
+        .translate(tube_len - 0.005 * s, 0.0)
+        .rotate(HEADSHELL_TURN)
+        .fill_color(fg.alpha(0.72))
+        .stroke_color(dark.alpha(0.55))
+        .line_width(1.0)
         .begin_path()
         .round_rect(
-            Bounds::new(point(px(-6.0), px(-3.0)), size(px(12.0), px(22.0))),
-            px(3.0),
+            Bounds::new(
+                point(px(-0.01 * s), px(-0.022 * s)),
+                size(px(hs_len * 0.85), px(0.044 * s)),
+            ),
+            px(0.008 * s),
         )
         .fill()
         .stroke()
-        // Finger lift wire
-        .stroke_color(fg.alpha(0.72))
-        .line_width(1.4)
+        // Finger lift
+        .stroke_color(fg.alpha(0.78))
+        .line_width(1.5)
         .begin_path()
-        .move_to(6.0, 5.0)
-        .line_to(12.0, 8.0)
+        .move_to(0.055 * s, -0.02 * s)
+        .line_to(0.075 * s, -0.042 * s)
         .stroke()
-        // Stylus tip indicator dot
-        .fill_color(if playing { primary } else { muted })
+        // Cartridge body & red stylus tip
+        .fill_color(dark.lighten(0.12))
         .begin_path()
-        .arc(0.0, 16.0, 2.2, 0.0, TAU)
+        .round_rect(
+            Bounds::new(
+                point(px(hs_len * 0.72), px(-0.014 * s)),
+                size(px(0.024 * s), px(0.028 * s)),
+            ),
+            px(0.004 * s),
+        )
+        .fill()
+        .fill_color(if playing { danger } else { danger.darken(0.28) })
+        .begin_path()
+        .round_rect(
+            Bounds::new(
+                point(px(hs_len * 0.88), px(-0.008 * s)),
+                size(px(0.009 * s), px(0.016 * s)),
+            ),
+            px(0.003 * s),
+        )
         .fill()
         .restore()
-        // Pivot top cap jewel
-        .fill_color(fg.alpha(0.9))
+        // Gimbal top dome cap
+        .fill_color(dark.lighten(0.12))
         .begin_path()
-        .arc(0.0, 0.0, 5.0, 0.0, TAU)
+        .arc(0.0, 0.0, 0.038 * s, 0.0, TAU)
         .fill()
-        .fill_color(dark.lighten(0.18))
+        .fill_color(fg.alpha(0.84))
         .begin_path()
-        .arc(0.0, 0.0, 2.2, 0.0, TAU)
+        .arc(0.0, 0.0, 0.026 * s, 0.0, TAU)
         .fill()
         .restore();
 
@@ -687,437 +922,398 @@ fn paint_vinyl_spindle_and_tonearm(
 }
 
 // -----------------------------------------------------------------------------
-// 3. Cassette Mode: Retro cassette deck with 60fps twin reels, tape window & label strip
+// 3. Cassette Mode (`ui_retro.go` + `retro_render.go`): Wound spools, cover thumb & italic label
 // -----------------------------------------------------------------------------
 
 fn cassette_mode(store: AppStore, size_pt: f32) -> View {
-    let w = (size_pt * 1.18).max(size_pt + 28.0);
-    let h = (w * 0.66).min(size_pt + 12.0);
+    let w = size_pt;
+    let h = size_pt * TAPE_HEIGHT;
     let (enter_opacity, enter_scale) = mode_entrance_animations();
-    let spin_deg = smooth_spin_signal(store, CASSETTE_DEG_PER_FRAME);
+    let spin_deg = gated_spin_signal(store, REEL_DEG_PER_SEC);
+    let progress = quantized_progress(store);
+    let has_art = computed(move || has_renderable_art(&store.current_artwork_uri.get()));
+
+    let hub_diam = TAPE_HUB * 2.0 * w;
+    let left_hub_x = TAPE_REEL_L * w - hub_diam * 0.5;
+    let right_hub_x = TAPE_REEL_R * w - hub_diam * 0.5;
+    let hub_y = TAPE_REEL_Y * w - hub_diam * 0.5;
+
+    let thumb_size = 0.095 * w;
+    let thumb_x = 0.088 * w;
+    let thumb_y = 0.262 * w;
 
     view()
-        .w(px(w))
-        .h(px(h))
+        .size(px(size_pt))
         .items_center()
         .justify_center()
         .bind_opacity(&enter_opacity)
         .bind_scale(&enter_scale)
         .child(
-            canvas(move || {
-                let accent = store.current_accent.get();
-                let playing = store.is_playing.get();
-                let pos_ms = store.position_ms.get();
-                let dur_ms = store.duration_ms.get().max(1);
-                let progress = (pos_ms as f32 / dur_ms as f32).clamp(0.0, 1.0);
-                let reduced = reduce_motion();
-
-                let unknown_artist = store.t("track.unknown_artist").to_string();
-                let (title, artist) = store.current_track.with(|t| {
-                    t.as_ref()
-                        .map(|tr| {
-                            let names = tr.artist_names();
-                            let artist_str = if names.is_empty() {
-                                unknown_artist.clone()
-                            } else {
-                                names
-                            };
-                            (tr.name.clone(), artist_str)
-                        })
-                        .unwrap_or_else(|| ("NSH Music".to_owned(), "Side A".to_owned()))
-                });
-
-                let vu_level = if playing && !reduced {
-                    let s = store.spectrum.get();
-                    ((s[1] + s[3] + s[5] + s[7]) * 0.25).clamp(0.0, 1.0)
-                } else {
-                    0.0
-                };
-
-                let reel_angle = if reduced {
-                    0.0
-                } else {
-                    spin_deg.get().to_radians()
-                };
-
-                paint_cassette_deck(
-                    w,
-                    h,
-                    accent,
-                    &title,
-                    &artist,
-                    progress,
-                    reel_angle,
-                    vu_level,
-                    playing,
-                )
-            })
-            .size_full()
-            .pointer_events(PointerEvents::None),
+            Elevated::elevation(
+                view()
+                    .w(px(w))
+                    .h(px(h))
+                    .relative()
+                    .rounded(px(w * TAPE_CORNER))
+                    .overflow_hidden(),
+                Elevation::Modal,
+            )
+            // Layer 1: Cassette shell, cream ruled paper label, accent stripes,
+            // tape window & physically area-conserving wound tape spools.
+            // Redraws ONLY on 0.5% progress steps or accent change (ZERO 30fps redraws!).
+            .child(
+                canvas(move || {
+                    let accent = store.current_accent.get();
+                    let prog = progress.get();
+                    paint_cassette_shell_and_tape(w, h, accent, prog)
+                })
+                .absolute()
+                .inset_0()
+                .size_full()
+                .pointer_events(PointerEvents::None),
+            )
+            // Layer 2: Twin 30fps GPU-rotated 6-tooth reel hubs (zero canvas redraws!)
+            .child(cassette_hub_view(left_hub_x, hub_y, hub_diam, spin_deg))
+            .child(cassette_hub_view(right_hub_x, hub_y, hub_diam, spin_deg))
+            // Layer 3: Cover art thumbnail printed beside the tape window (`ui_retro.go:3303-3309`)
+            .child(
+                view()
+                    .absolute()
+                    .left(px(thumb_x))
+                    .top(px(thumb_y))
+                    .size(px(thumb_size))
+                    .overflow_hidden()
+                    .bg(move || AdaptiveColor::from(store.current_accent.get()))
+                    .border_1()
+                    .border_color(move || theme::np_bg().opacity(0.28))
+                    .pointer_events(PointerEvents::None)
+                    .child(when(has_art, move || {
+                        image(move || store.current_artwork_uri.get())
+                            .object_fit(ResizeMode::Cover)
+                            .size_full()
+                    })),
+            )
+            // Layer 4: Italic pen-written title, artist & bold "A" side mark (`ui_retro.go:3312-3319`)
+            .child(
+                text(move || {
+                    store.current_track.with(|t| {
+                        t.as_ref()
+                            .map(|tr| SharedString::from(tr.name.clone()))
+                            .unwrap_or_else(|| store.t("player.idle_title"))
+                    })
+                })
+                .absolute()
+                .top(px(w * 0.094))
+                .left(px(w * 0.10))
+                .right(px(w * 0.10))
+                .number_of_lines(1)
+                .text_size(px((w * 0.044).max(11.0)))
+                .font_weight(FontWeight::SEMIBOLD)
+                .italic()
+                .text_color(move || AdaptiveColor::from(color(theme::np_bg()).lighten(0.18)))
+                .pointer_events(PointerEvents::None),
+            )
+            .child(
+                text(move || {
+                    let unknown = store.t("track.unknown_artist");
+                    store.current_track.with(|t| {
+                        t.as_ref()
+                            .map(|tr| {
+                                let names = tr.artist_names();
+                                if names.is_empty() {
+                                    unknown.clone()
+                                } else {
+                                    SharedString::from(names)
+                                }
+                            })
+                            .unwrap_or_default()
+                    })
+                })
+                .absolute()
+                .top(px(w * 0.164))
+                .left(px(w * 0.10))
+                .right(px(w * 0.10))
+                .number_of_lines(1)
+                .text_size(px((w * 0.030).max(9.0)))
+                .font_weight(FontWeight::MEDIUM)
+                .italic()
+                .text_color(move || AdaptiveColor::from(color(theme::np_bg()).lighten(0.28)))
+                .pointer_events(PointerEvents::None),
+            )
+            .child(
+                text("A")
+                    .absolute()
+                    .top(px(w * 0.258))
+                    .left(px(w * 0.835))
+                    .text_size(px((w * 0.075).max(16.0)))
+                    .font_weight(FontWeight::EXTRA_BOLD)
+                    .text_color(move || AdaptiveColor::from(color(theme::np_bg()).lighten(0.16)))
+                    .pointer_events(PointerEvents::None),
+            ),
         )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn paint_cassette_deck(
-    w: f32,
-    h: f32,
-    accent: Hsla,
-    title: &str,
-    artist: &str,
-    progress: f32,
-    reel_angle: f32,
-    vu_level: f32,
-    playing: bool,
-) -> Painter {
-    let dark = color(theme::np_bg());
+fn cassette_hub_view(x: f32, y: f32, diam: f32, spin_deg: Signal<f32>) -> View {
+    let r = diam * 0.5;
+    view()
+        .absolute()
+        .left(px(x))
+        .top(px(y))
+        .size(px(diam))
+        .rotate(move || deg(spin_deg.get()))
+        .pointer_events(PointerEvents::None)
+        .child(
+            canvas(move || paint_tape_hub(diam, r))
+                .size_full()
+                .pointer_events(PointerEvents::None),
+        )
+}
+
+fn paint_tape_hub(diam: f32, r: f32) -> Painter {
     let fg = color(theme::np_fg());
-    let primary = color(theme::primary());
-    let amber = color(theme::amber());
-
-    let pad = 6.0;
-    let cw = w - pad * 2.0;
-    let ch = h - pad * 2.0;
-    let shell_rect = Bounds::new(point(px(pad), px(pad)), size(px(cw), px(ch)));
-
-    // Translucent smoky cassette shell gradient
-    let shell_grad = CanvasGradient::linear(point(px(pad), px(pad)), point(px(pad), px(pad + ch)))
-        .add_color_stop(percentage(0.0), dark.lighten(0.22).alpha(0.95))
-        .add_color_stop(percentage(0.55), dark.lighten(0.12).alpha(0.96))
-        .add_color_stop(percentage(1.0), dark.lighten(0.06).alpha(0.98));
+    let dark = color(theme::np_bg());
+    let c = diam * 0.5;
 
     let mut p = Painter::new()
-        .fill_style(shell_grad)
-        .begin_path()
-        .round_rect(shell_rect, px(14.0))
-        .fill()
-        .stroke_color(fg.alpha(0.22))
-        .line_width(1.5)
-        .begin_path()
-        .round_rect(shell_rect, px(14.0))
-        .stroke();
-
-    // Inner recessed bevel frame
-    let inner_rect = Bounds::new(
-        point(px(pad + 6.0), px(pad + 6.0)),
-        size(px(cw - 12.0), px(ch - 12.0)),
-    );
-    p = p
-        .stroke_color(fg.alpha(0.08))
-        .line_width(1.0)
-        .begin_path()
-        .round_rect(inner_rect, px(10.0))
-        .stroke();
-
-    // 4 Corner cassette screws
-    let screw_inset = 13.0;
-    for (sx, sy) in [
-        (pad + screw_inset, pad + screw_inset),
-        (pad + cw - screw_inset, pad + screw_inset),
-        (pad + screw_inset, pad + ch - screw_inset),
-        (pad + cw - screw_inset, pad + ch - screw_inset),
-    ] {
-        p = p
-            .fill_color(dark.lighten(0.28))
-            .stroke_color(fg.alpha(0.32))
-            .line_width(0.9)
-            .begin_path()
-            .arc(sx, sy, 4.0, 0.0, TAU)
-            .fill()
-            .stroke()
-            .stroke_color(dark.alpha(0.7))
-            .line_width(1.0)
-            .begin_path()
-            .move_to(sx - 2.0, sy)
-            .line_to(sx + 2.0, sy)
-            .move_to(sx, sy - 2.0)
-            .line_to(sx, sy + 2.0)
-            .stroke();
-    }
-
-    // Track Label Strip (upper 66% body with warm accent band + ruled paper top)
-    let label_x = pad + 18.0;
-    let label_y = pad + 16.0;
-    let label_w = cw - 36.0;
-    let label_h = ch * 0.62;
-    let label_rect = Bounds::new(
-        point(px(label_x), px(label_y)),
-        size(px(label_w), px(label_h)),
-    );
-
-    let strip_grad = CanvasGradient::linear(
-        point(px(label_x), px(label_y)),
-        point(px(label_x + label_w), px(label_y + label_h)),
-    )
-    .add_color_stop(percentage(0.0), accent.lighten(0.18).saturate(0.12))
-    .add_color_stop(percentage(1.0), accent.darken(0.22));
-
-    p = p
-        .fill_style(strip_grad)
-        .begin_path()
-        .round_rect(label_rect, px(8.0))
-        .fill()
-        .stroke_color(fg.alpha(0.22))
-        .line_width(1.0)
-        .begin_path()
-        .round_rect(label_rect, px(8.0))
-        .stroke();
-
-    // Cream/porcelain upper title writing strip inside label
-    let header_h = (label_h * 0.34).max(30.0);
-    let header_rect = Bounds::new(
-        point(px(label_x + 4.0), px(label_y + 4.0)),
-        size(px(label_w - 8.0), px(header_h)),
-    );
-    p = p
         .fill_color(fg.alpha(0.90))
         .begin_path()
-        .round_rect(header_rect, px(5.0))
+        .arc(c, c, r, 0.0, TAU)
         .fill()
-        // Subtle ruled writing line
-        .stroke_color(dark.alpha(0.16))
-        .line_width(0.8)
-        .begin_path()
-        .move_to(label_x + 12.0, label_y + 4.0 + header_h * 0.56)
-        .line_to(label_x + label_w - 12.0, label_y + 4.0 + header_h * 0.56)
-        .stroke();
-
-    // Side A badge + track title & artist printed on the label strip
-    let badge_rect = Bounds::new(
-        point(px(label_x + 10.0), px(label_y + 9.0)),
-        size(px(22.0), px(18.0)),
-    );
-    p = p
-        .fill_color(dark.lighten(0.10))
-        .begin_path()
-        .round_rect(badge_rect, px(3.5))
-        .fill()
-        .fill_color(fg)
-        .font("700 10px sans-serif")
-        .text_align(CanvasTextAlign::Center)
-        .text_baseline(CanvasTextBaseline::Middle)
-        .fill_text("A", label_x + 21.0, label_y + 18.0)
-        // Track title
-        .fill_color(dark.lighten(0.08))
-        .font("700 11px sans-serif")
-        .text_align(CanvasTextAlign::Left)
-        .text_baseline(CanvasTextBaseline::Middle)
-        .fill_text_max_width(
-            title,
-            label_x + 38.0,
-            label_y + 4.0 + header_h * 0.32,
-            px((label_w - 54.0).max(40.0)),
-        )
-        // Artist subtitle
-        .fill_color(dark.lighten(0.28))
-        .font("500 9px sans-serif")
-        .fill_text_max_width(
-            artist,
-            label_x + 38.0,
-            label_y + 4.0 + header_h * 0.76,
-            px((label_w - 54.0).max(40.0)),
-        );
-
-    // Central transparent tape window cut-out
-    let win_w = label_w * 0.76;
-    let win_h = (label_h - header_h - 16.0).max(38.0);
-    let win_x = label_x + (label_w - win_w) * 0.5;
-    let win_y = label_y + header_h + 10.0;
-    let win_rect = Bounds::new(point(px(win_x), px(win_y)), size(px(win_w), px(win_h)));
-
-    p = p
-        .fill_color(dark.alpha(0.92))
-        .stroke_color(fg.alpha(0.24))
-        .line_width(1.2)
-        .begin_path()
-        .round_rect(win_rect, px(win_h * 0.48))
-        .fill()
-        .stroke();
-
-    // Clip to tape window so tape packs stay cleanly inside window aperture
-    p = p
-        .save()
-        .begin_path()
-        .round_rect(win_rect, px(win_h * 0.48))
-        .clip();
-
-    let reel_cy = win_y + win_h * 0.5;
-    let left_rx = win_x + win_w * 0.24;
-    let right_rx = win_x + win_w * 0.76;
-    let hub_r = (win_h * 0.30).clamp(10.0, 18.0);
-    let max_tape_r = (win_h * 0.62).max(hub_r + 14.0);
-
-    // Tape spool fill reflects playback progress:
-    // left supply reel unwinds (1 - progress), right take-up reel fills (progress)
-    let left_tape_r = hub_r + 3.0 + (max_tape_r - hub_r - 3.0) * (1.0 - progress * 0.84);
-    let right_tape_r = hub_r + 3.0 + (max_tape_r - hub_r - 3.0) * (0.16 + progress * 0.84);
-
-    let tape_col = dark.lighten(0.18).mix(amber, 0.14);
-    let tape_edge = fg.alpha(0.14);
-
-    // Left & right magnetic tape rolls
-    p = p
-        .fill_color(tape_col)
-        .stroke_color(tape_edge)
+        .stroke_color(dark.alpha(0.22))
         .line_width(1.0)
         .begin_path()
-        .arc(left_rx, reel_cy, left_tape_r, 0.0, TAU)
-        .fill()
+        .arc(c, c, r * 0.85, 0.0, TAU)
         .stroke()
+        .fill_color(dark.lighten(0.04))
         .begin_path()
-        .arc(right_rx, reel_cy, right_tape_r, 0.0, TAU)
+        .arc(c, c, r * 0.58, 0.0, TAU)
         .fill()
-        .stroke()
-        // Subtle tape layer rings on each spool
-        .stroke_color(fg.alpha(0.06))
-        .line_width(0.8)
-        .begin_path()
-        .arc(left_rx, reel_cy, (hub_r + left_tape_r) * 0.5, 0.0, TAU)
-        .stroke()
-        .begin_path()
-        .arc(right_rx, reel_cy, (hub_r + right_tape_r) * 0.5, 0.0, TAU)
-        .stroke();
-
-    // Central tape bridge gauge window with progress bar
-    let gauge_w = (right_rx - left_rx - hub_r * 2.2).max(24.0);
-    let gauge_x = (left_rx + right_rx) * 0.5 - gauge_w * 0.5;
-    let gauge_y = reel_cy - 6.0;
-    let gauge_rect = Bounds::new(point(px(gauge_x), px(gauge_y)), size(px(gauge_w), px(12.0)));
-    p = p
-        .fill_color(dark.alpha(0.75))
-        .stroke_color(fg.alpha(0.16))
-        .line_width(0.8)
-        .begin_path()
-        .round_rect(gauge_rect, px(3.0))
-        .fill()
-        .stroke()
-        // Progress fill inside tape window
-        .fill_color(primary.alpha(0.82))
-        .begin_path()
-        .round_rect(
-            Bounds::new(
-                point(px(gauge_x + 2.0), px(gauge_y + 3.0)),
-                size(px(((gauge_w - 4.0) * progress).max(2.0)), px(6.0)),
-            ),
-            px(2.0),
-        )
-        .fill();
-
-    // Scale tick marks across central window
-    p = p.stroke_color(fg.alpha(0.28)).line_width(0.8);
-    for tick in 0..=4 {
-        let tx = gauge_x + (gauge_w * tick as f32 / 4.0);
-        p = p
-            .begin_path()
-            .move_to(tx, gauge_y - 4.0)
-            .line_to(tx, gauge_y - 1.0)
-            .stroke();
-    }
-
-    // Twin rotating 6-tooth reel hubs (right reel turns slightly different speed proportionally)
-    p = draw_tape_hub(p, left_rx, reel_cy, hub_r, reel_angle, fg, dark);
-    p = draw_tape_hub(p, right_rx, reel_cy, hub_r, reel_angle * 1.12, fg, dark);
-
-    p = p.restore(); // end tape window clip
-
-    // Bottom magnetic head trapezoid bay
-    let bay_w = cw * 0.58;
-    let bay_h = ch * 0.21;
-    let bay_x = pad + (cw - bay_w) * 0.5;
-    let bay_y = pad + ch - bay_h;
-    p = p
-        .fill_color(dark.lighten(0.16))
-        .stroke_color(fg.alpha(0.20))
-        .line_width(1.2)
-        .begin_path()
-        .move_to(bay_x + 12.0, bay_y)
-        .line_to(bay_x + bay_w - 12.0, bay_y)
-        .line_to(bay_x + bay_w, bay_y + bay_h)
-        .line_to(bay_x, bay_y + bay_h)
-        .close_path()
-        .fill()
-        .stroke();
-
-    // Capstan & guide holes inside bottom trapezoid bay
-    let hole_y = bay_y + bay_h * 0.55;
-    for &(hx, r) in &[
-        (bay_x + bay_w * 0.22, 4.2),
-        (bay_x + bay_w * 0.36, 2.8),
-        (bay_x + bay_w * 0.64, 2.8),
-        (bay_x + bay_w * 0.78, 4.2),
-    ] {
-        p = p
-            .fill_color(dark)
-            .stroke_color(fg.alpha(0.24))
-            .line_width(1.0)
-            .begin_path()
-            .arc(hx, hole_y, r, 0.0, TAU)
-            .fill()
-            .stroke();
-    }
-
-    // Subtle analog VU meter LEDs flanking the bottom bay
-    let led_count: usize = 4;
-    for i in 0..led_count {
-        let threshold = (i as f32 + 0.5) / led_count as f32;
-        let lit = playing && vu_level >= threshold * 0.72;
-        let col = if lit {
-            if i == led_count - 1 { primary } else { amber }
-        } else {
-            fg.alpha(0.14)
-        };
-        let lx = pad + 24.0 + i as f32 * 8.0;
-        let rx = pad + cw - 24.0 - i as f32 * 8.0;
-        let ly = bay_y + bay_h * 0.55;
-        p = p
-            .fill_color(col)
-            .begin_path()
-            .arc(lx, ly, 2.2, 0.0, TAU)
-            .fill()
-            .begin_path()
-            .arc(rx, ly, 2.2, 0.0, TAU)
-            .fill();
-    }
-
-    p
-}
-
-fn draw_tape_hub(
-    p: Painter,
-    cx: f32,
-    cy: f32,
-    r: f32,
-    angle: f32,
-    fg: Hsla,
-    dark: Hsla,
-) -> Painter {
-    let mut p = p
-        .save()
-        .translate(cx, cy)
-        .rotate(angle)
-        // Outer white/silver hub collar
-        .fill_color(fg.alpha(0.88))
-        .begin_path()
-        .arc(0.0, 0.0, r, 0.0, TAU)
-        .fill()
-        // Inner dark spindle hole
-        .fill_color(dark)
-        .begin_path()
-        .arc(0.0, 0.0, r * 0.58, 0.0, TAU)
-        .fill()
-        // 6 Hub sprocket teeth
         .stroke_color(fg.alpha(0.92))
-        .line_width(2.2)
+        .line_width((r * 0.14).max(1.8))
         .line_cap(LineCap::Round);
 
-    for i in 0..6 {
+    for i in 0..6_usize {
         let theta = (i as f32 / 6.0) * TAU;
         let (sin, cos) = theta.sin_cos();
         p = p
             .begin_path()
-            .move_to(cos * (r * 0.34), sin * (r * 0.34))
-            .line_to(cos * (r * 0.64), sin * (r * 0.64))
+            .move_to(c + cos * (r * 0.36), c + sin * (r * 0.36))
+            .line_to(c + cos * (r * 0.62), c + sin * (r * 0.62))
+            .stroke();
+    }
+    p
+}
+
+fn paint_cassette_shell_and_tape(w: f32, h: f32, accent: Hsla, progress: f32) -> Painter {
+    let dark = color(theme::np_bg());
+    let fg = color(theme::np_fg());
+    let amber = color(theme::amber());
+
+    // Black textured plastic shell
+    let shell_grad = CanvasGradient::linear(point(px(0.0), px(0.0)), point(px(w), px(h)))
+        .add_color_stop(percentage(0.0), dark.lighten(0.14))
+        .add_color_stop(percentage(1.0), dark.lighten(0.05));
+
+    let mut p = Painter::new()
+        .fill_style(shell_grad)
+        .fill_rect(0.0, 0.0, w, h)
+        .stroke_color(fg.alpha(0.14))
+        .line_width(1.2)
+        .begin_path()
+        .round_rect(
+            Bounds::new(point(px(0.6), px(0.6)), size(px(w - 1.2), px(h - 1.2))),
+            px(w * TAPE_CORNER),
+        )
+        .stroke();
+
+    // Cream paper label with ruled writing lines & accent footer stripes
+    let lx = 0.06 * w;
+    let ly = TAPE_LABEL_Y0 * w;
+    let lw = 0.88 * w;
+    let lh = (TAPE_LABEL_Y1 - TAPE_LABEL_Y0) * w;
+    let label_rect = Bounds::new(point(px(lx), px(ly)), size(px(lw), px(lh)));
+    let paper = fg.mix(amber, 0.09);
+
+    p = p
+        .fill_color(paper)
+        .begin_path()
+        .round_rect(label_rect, px(0.018 * w))
+        .fill()
+        // Inner ruled border
+        .stroke_color(dark.alpha(0.24))
+        .line_width(0.8)
+        .begin_path()
+        .round_rect(
+            Bounds::new(
+                point(px(0.075 * w), px((TAPE_LABEL_Y0 + 0.015) * w)),
+                size(px(0.85 * w), px((TAPE_LABEL_Y1 - TAPE_LABEL_Y0 - 0.03) * w)),
+            ),
+            px(0.01 * w),
+        )
+        .stroke()
+        // Ruled writing lines
+        .stroke_color(dark.alpha(0.20))
+        .line_width(0.8)
+        .begin_path()
+        .move_to(0.09 * w, 0.155 * w)
+        .line_to(0.91 * w, 0.155 * w)
+        .move_to(0.09 * w, 0.212 * w)
+        .line_to(0.91 * w, 0.212 * w)
+        .stroke()
+        // Twin cover-accent stripes along label foot (`ui_retro.go:3298-3301`)
+        .save()
+        .begin_path()
+        .round_rect(label_rect, px(0.018 * w))
+        .clip()
+        .fill_color(accent.alpha(0.88))
+        .fill_rect(lx, 0.398 * w, lw, 0.020 * w)
+        .fill_color(accent.mix(fg, 0.40).alpha(0.88))
+        .fill_rect(lx, 0.418 * w, lw, 0.014 * w)
+        .restore();
+
+    // Central tape window (`0.20..0.80`, `0.24..0.39`, radius `0.075 * w`)
+    let wx = 0.20 * w;
+    let wy = 0.24 * w;
+    let ww = 0.60 * w;
+    let wh = 0.15 * w;
+    let win_r = 0.075 * w;
+    let win_rect = Bounds::new(point(px(wx), px(wy)), size(px(ww), px(wh)));
+
+    p = p
+        .fill_color(dark.lighten(0.03))
+        .begin_path()
+        .round_rect(win_rect, px(win_r))
+        .fill()
+        .save()
+        .begin_path()
+        .round_rect(win_rect, px(win_r))
+        .clip();
+
+    // Physically area-conserving magnetic tape spools (`sqrt(hub^2 + (full^2 - hub^2) * f)`)
+    let hub = TAPE_HUB * w;
+    let full = TAPE_FULL * w;
+    let done = progress.clamp(0.0, 1.0);
+    let wound = |f: f32| -> f32 { (hub * hub + (full * full - hub * hub) * f).sqrt() };
+    let tape_brown = dark.lighten(0.11).mix(amber.darken(0.32), 0.38);
+
+    for (rx_u, f) in [(TAPE_REEL_L, 1.0 - done), (TAPE_REEL_R, done)] {
+        let rx = rx_u * w;
+        let ry = TAPE_REEL_Y * w;
+        let t = wound(f);
+        p = p
+            .fill_color(dark.alpha(0.55))
+            .begin_path()
+            .arc(rx + 2.0, ry + 3.0, t + 4.0, 0.0, TAU)
+            .fill()
+            .fill_color(tape_brown)
+            .begin_path()
+            .arc(rx, ry, t, 0.0, TAU)
+            .fill()
+            .stroke_color(dark.alpha(0.50))
+            .line_width(1.0)
+            .begin_path()
+            .arc(rx, ry, t, 0.0, TAU)
+            .stroke();
+        for k in 1..6_usize {
+            let g = hub + (t - hub) * (k as f32 / 6.0);
+            let a = if k.is_multiple_of(2) { 0.12 } else { 0.18 };
+            p = p
+                .stroke_color(dark.alpha(a))
+                .line_width(0.6)
+                .begin_path()
+                .arc(rx, ry, g, 0.0, TAU)
+                .stroke();
+        }
+    }
+
+    // Diagonal glass reflection streak across window
+    p = p
+        .stroke_color(fg.alpha(0.10))
+        .line_width(0.03 * w)
+        .begin_path()
+        .move_to(wx + ww * 0.18, wy - 4.0)
+        .line_to(wx + ww * 0.36, wy + wh + 4.0)
+        .stroke()
+        .restore()
+        .stroke_color(fg.alpha(0.16))
+        .line_width(1.0)
+        .begin_path()
+        .round_rect(win_rect, px(win_r))
+        .stroke();
+
+    // Raised bottom trapezoidal head bay (`y = 0.52..0.64`)
+    let bay_y = 0.52 * w;
+    p = p
+        .fill_color(dark.lighten(0.12))
+        .stroke_color(fg.alpha(0.14))
+        .line_width(1.0)
+        .begin_path()
+        .move_to(0.235 * w, bay_y)
+        .line_to(0.765 * w, bay_y)
+        .line_to(0.830 * w, h)
+        .line_to(0.170 * w, h)
+        .close_path()
+        .fill()
+        .stroke();
+
+    // Capstan & guide openings + felt pad
+    for &(hx, hy, r) in &[
+        (0.29 * w, 0.585 * w, 0.020 * w),
+        (0.71 * w, 0.585 * w, 0.020 * w),
+        (0.42 * w, 0.580 * w, 0.014 * w),
+        (0.58 * w, 0.580 * w, 0.014 * w),
+    ] {
+        p = p
+            .fill_color(dark)
+            .stroke_color(fg.alpha(0.18))
+            .line_width(0.9)
+            .begin_path()
+            .arc(hx, hy, r, 0.0, TAU)
+            .fill()
+            .stroke();
+    }
+    p = p
+        .fill_color(dark)
+        .begin_path()
+        .round_rect(
+            Bounds::new(
+                point(px(0.45 * w), px(0.60 * w)),
+                size(px(0.10 * w), px(0.04 * w)),
+            ),
+            px(0.004 * w),
+        )
+        .fill()
+        .fill_color(fg.mix(amber, 0.15).alpha(0.65))
+        .fill_rect(0.48 * w, 0.602 * w, 0.04 * w, 0.011 * w)
+        .fill_color(tape_brown)
+        .fill_rect(0.455 * w, 0.614 * w, 0.09 * w, 0.012 * w);
+
+    // 5 cassette screws
+    let sr = (0.0125 * w).max(2.6);
+    for &(sx, sy) in &[
+        (0.04 * w, 0.04 * w),
+        (0.96 * w, 0.04 * w),
+        (0.04 * w, 0.60 * w),
+        (0.96 * w, 0.60 * w),
+        (0.50 * w, 0.535 * w),
+    ] {
+        p = p
+            .fill_color(fg.alpha(0.36))
+            .stroke_color(dark.alpha(0.65))
+            .line_width(0.9)
+            .begin_path()
+            .arc(sx, sy, sr, 0.0, TAU)
+            .fill()
+            .stroke()
+            .stroke_color(dark.alpha(0.70))
+            .line_width(1.0)
+            .begin_path()
+            .move_to(sx - sr * 0.55, sy)
+            .line_to(sx + sr * 0.55, sy)
+            .move_to(sx, sy - sr * 0.55)
+            .line_to(sx, sy + sr * 0.55)
             .stroke();
     }
 
-    p.restore()
+    p
 }

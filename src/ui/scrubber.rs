@@ -2,7 +2,11 @@
 //! progress indicator, hover/drag thumb expansion, multi-wisp comet smoke,
 //! and tabular elapsed/remaining time labels.
 
-use std::{rc::Rc, time::Duration};
+use std::{
+    f32::consts::TAU,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 use nsh_base::{SliderValue, slider};
 use nsh_core::{
@@ -17,10 +21,12 @@ use super::{
     track_row::format_duration_ms,
 };
 
+/// Exact constants matching `egoist/mygo-music` `ui_player.go:1959-1989`.
 const SMOKE_LIFE_SECS: f32 = 1.4;
-const SMOKE_WISPS: usize = 24;
-const SMOKE_PAD_X: f32 = 16.0;
-const SMOKE_HEADROOM_Y: f32 = 26.0;
+const SMOKE_WISPS: usize = 36;
+const SMOKE_FADE_SECS: f32 = 0.60;
+const SMOKE_PAD_X: f32 = 24.0;
+const SMOKE_HEADROOM_Y: f32 = 34.0;
 
 fn wisp_rand(k: f32, offset: f32) -> f32 {
     let x = (k * 127.1 + offset * 311.7).sin() * 43_758.547;
@@ -52,10 +58,7 @@ pub fn scrubber(
 }
 
 impl Scrubber {
-    pub fn new(
-        position_ms: impl IntoReactive<u64>,
-        duration_ms: impl IntoReactive<u64>,
-    ) -> Self {
+    pub fn new(position_ms: impl IntoReactive<u64>, duration_ms: impl IntoReactive<u64>) -> Self {
         Self {
             position_ms: position_ms.into_reactive(),
             duration_ms: duration_ms.into_reactive(),
@@ -148,6 +151,9 @@ impl IntoElement for Scrubber {
         let drag_preview = signal(None::<u64>);
         let track_size = signal((240.0_f32, 20.0_f32));
         let smoke_time = signal(0.0_f32);
+        let smoke_opacity = signal(0.0_f32);
+        let smoke_running = stored(false);
+        let owner = Owner::current();
 
         let displayed_ms = {
             let pos = position_ms.clone();
@@ -165,7 +171,7 @@ impl IntoElement for Scrubber {
         });
 
         let dur_for_smoke = duration_ms.clone();
-        let is_smoking = computed(move || {
+        let want_smoke = computed(move || {
             smoke_mode.get()
                 && playing.get()
                 && dur_for_smoke.get() > 0
@@ -173,10 +179,81 @@ impl IntoElement for Scrubber {
                 && !reduce_motion()
         });
 
-        set_interval(Duration::from_millis(33), move || {
-            if is_smoking.get_untracked() {
-                smoke_time.update(|t| *t = (*t + 0.033) % 1000.0);
+        // On-demand 30fps smoke driver: spawns ONLY while smoking or fading out
+        // (~600ms smooth fade-in/out matching `mygo-music`), exiting completely
+        // with zero timers and zero CPU when paused, idle, dragging, or disabled.
+        effect(move || {
+            let active = want_smoke.get();
+            if reduce_motion() {
+                smoke_opacity.set(0.0);
+                return;
             }
+            if !active && smoke_opacity.get_untracked() <= 0.005 {
+                return;
+            }
+            let already = smoke_running.with(|running| {
+                if *running {
+                    true
+                } else {
+                    *running = true;
+                    false
+                }
+            });
+            if already {
+                return;
+            }
+            owner.run(move || {
+                spawn(async move {
+                    let mut last = Instant::now();
+                    loop {
+                        timer(Duration::from_millis(33)).await;
+                        if reduce_motion() {
+                            smoke_opacity.set(0.0);
+                            smoke_running.with(|running| *running = false);
+                            break;
+                        }
+                        let current = Instant::now();
+                        let dt = current
+                            .saturating_duration_since(last)
+                            .as_secs_f32()
+                            .clamp(0.004, 0.10);
+                        last = current;
+
+                        let target_on = want_smoke.get_untracked();
+                        let prev = smoke_opacity.get_untracked();
+                        let next = if target_on {
+                            (prev + dt / SMOKE_FADE_SECS).min(1.0)
+                        } else {
+                            (prev - dt / SMOKE_FADE_SECS).max(0.0)
+                        };
+
+                        if !target_on && next <= 0.005 {
+                            smoke_opacity.set(0.0);
+                            smoke_running.with(|running| *running = false);
+                            break;
+                        }
+
+                        if (next - prev).abs() > 1e-4 {
+                            smoke_opacity.set(next);
+                        }
+                        smoke_time.update(|t| *t = (*t + dt) % 10_000.0);
+                    }
+                });
+            });
+        });
+
+        // Effective visible smoke strength: zero at 0:00 (prevents any resting
+        // smudge at track start) and smoothly fades in/out with `smoke_opacity`.
+        let effective_smoke = computed(move || {
+            let op = smoke_opacity.get();
+            if op <= 0.01 {
+                return 0.0_f32;
+            }
+            let ms = displayed_ms.get();
+            if ms == 0 {
+                return 0.0_f32;
+            }
+            (op * (ms as f32 / 350.0).clamp(0.0, 1.0)).clamp(0.0, 1.0)
         });
 
         let max_val = {
@@ -230,113 +307,143 @@ impl IntoElement for Scrubber {
                     bounds.size.height.0.max(20.0),
                 ));
             })
-            .child(when(is_smoking, move || {
-                let ratio_rx = progress_ratio;
-                let acc_rx = acc_rx.clone();
-                let spec_rx = spec_rx.clone();
-                canvas(move || {
-                    let (w, h) = track_size.get();
-                    let ratio = ratio_rx.get();
-                    let t = smoke_time.get();
-                    let s = spec_rx.get();
-                    let bass = ((s[0] + s[1] + s[2] + s[3]) * 0.25).clamp(0.0, 1.0);
-                    let base_col = if on_dark_stage {
-                        acc_rx.get().lighten(0.24)
-                    } else {
-                        color(theme::primary())
-                    };
-                    let head_x = SMOKE_PAD_X + w * ratio;
-                    let cy = SMOKE_HEADROOM_Y + h * 0.5;
+            .child(when(
+                move || effective_smoke.get() > 0.01,
+                move || {
+                    let ratio_rx = progress_ratio;
+                    let acc_rx = acc_rx.clone();
+                    let spec_rx = spec_rx.clone();
+                    canvas(move || {
+                        let shown = effective_smoke.get();
+                        if shown <= 0.01 {
+                            return Painter::new();
+                        }
+                        let (w, h) = track_size.get();
+                        let ratio = ratio_rx.get();
+                        let t = smoke_time.get();
+                        let s = spec_rx.get();
+                        // Match `mygo-music` `st.level.group(0, 6)` bass average.
+                        let bass = ((s[0] + s[1] + s[2] + s[3] + s[4] + s[5]) / 6.0)
+                            .clamp(0.0, 1.0);
+                        let smoke_col = if on_dark_stage {
+                            theme::artwork_np_accent(acc_rx.get())
+                        } else {
+                            color(theme::primary())
+                        };
+                        let fill_col = color(fill_color());
+                        let head_x = SMOKE_PAD_X + w * ratio;
+                        let cy = SMOKE_HEADROOM_Y + h * 0.5;
+                        let thick = 4.0_f32;
 
-                    let mut painter = Painter::new();
+                        let mut painter = Painter::new();
 
-                    // Brightening comet streak along played portion.
-                    if head_x > SMOKE_PAD_X + 2.0 {
+                        // Luminous comet streak brightening from tail (0.3) to head (`ui_player.go:1921-1922`).
+                        let played_w = (head_x - SMOKE_PAD_X).max(thick);
                         let streak = CanvasGradient::linear(
                             point(px(SMOKE_PAD_X), px(cy)),
-                            point(px(head_x), px(cy)),
+                            point(px(SMOKE_PAD_X + played_w), px(cy)),
                         )
-                        .add_color_stop(percentage(0.0), base_col.alpha(0.15))
-                        .add_color_stop(percentage(1.0), base_col.alpha(0.75));
+                        .add_color_stop(
+                            percentage(0.0),
+                            theme::mix_color(fill_col, smoke_col, shown).alpha(0.30 * shown),
+                        )
+                        .add_color_stop(
+                            percentage(1.0),
+                            theme::mix_color(fill_col, smoke_col, 0.80 * shown).alpha(0.95 * shown),
+                        );
                         painter = painter
                             .fill_style(streak)
                             .begin_path()
                             .round_rect(
                                 Bounds::new(
-                                    point(px(SMOKE_PAD_X), px(cy - 2.0)),
-                                    size(px(head_x - SMOKE_PAD_X), px(4.0)),
+                                    point(px(SMOKE_PAD_X), px(cy - thick * 0.5)),
+                                    size(px(played_w), px(thick)),
                                 ),
-                                px(2.0),
+                                px(thick * 0.5),
                             )
                             .fill();
-                    }
 
-                    // Rising smoke wisps trailing from playhead (ported from mygo-music drawSmoke).
-                    let interval = SMOKE_LIFE_SECS / SMOKE_WISPS as f32;
-                    let first = (t / interval).floor();
-                    for j in 0..SMOKE_WISPS {
-                        let k = first - j as f32;
-                        let age = t - k * interval;
-                        if !(0.0..=SMOKE_LIFE_SECS).contains(&age) {
-                            continue;
-                        }
-                        if wisp_rand(k, 5.0) > 0.62 + 0.38 * bass {
-                            continue;
-                        }
-                        let f = age / SMOKE_LIFE_SECS;
-                        let wx = head_x - age * (10.0 + 20.0 * wisp_rand(k, 1.0));
-                        let curl = ((age * (2.5 + 2.0 * wisp_rand(k, 3.0))
-                            + wisp_rand(k, 4.0) * std::f32::consts::TAU)
-                            .sin())
-                            * 4.5
-                            * f;
-                        let wy = cy - age * (10.0 + 16.0 * wisp_rand(k, 2.0)) + curl;
-                        let r = 2.5 + f * (9.0 + 7.0 * wisp_rand(k, 4.0));
-                        let alpha = (0.36 * (1.0 - f).powf(1.6) * (0.7 + 0.5 * bass)).clamp(0.0, 0.55);
+                        // Rising smoke wisps trailing from playhead (`ui_player.go:1966-1989`).
+                        let interval = SMOKE_LIFE_SECS / SMOKE_WISPS as f32;
+                        let first = (t / interval).floor();
+                        for j in 0..SMOKE_WISPS {
+                            let k = first - j as f32;
+                            let age = t - k * interval;
+                            if !(0.0..=SMOKE_LIFE_SECS).contains(&age) {
+                                continue;
+                            }
+                            if wisp_rand(k, 5.0) > 0.60 + 0.40 * bass {
+                                continue;
+                            }
+                            let f = age / SMOKE_LIFE_SECS;
+                            let wx = head_x - age * (12.0 + 22.0 * wisp_rand(k, 1.0));
+                            let curl = (age * (2.5 + 2.0 * wisp_rand(k, 3.0))
+                                + wisp_rand(k, 4.0) * TAU)
+                                .sin()
+                                * 6.0
+                                * f;
+                            let wy = cy - age * (12.0 + 18.0 * wisp_rand(k, 2.0)) + curl;
+                            let wisp_r = (3.0 + f * (12.0 + 10.0 * wisp_rand(k, 4.0))) * 0.65;
+                            let alpha = (0.50
+                                * (1.0 - f).powf(1.4)
+                                * shown
+                                * (0.75 + 0.50 * bass))
+                                .clamp(0.0, 0.68);
 
-                        let wisp_grad = CanvasGradient::radial(
-                            point(px(wx), px(wy)),
+                            let wisp_grad = CanvasGradient::radial(
+                                point(px(wx), px(wy)),
+                                px(0.0),
+                                point(px(wx), px(wy)),
+                                px(wisp_r),
+                            )
+                            .add_color_stop(percentage(0.0), smoke_col.alpha(alpha))
+                            .add_color_stop(percentage(0.55), smoke_col.alpha(alpha * 0.38))
+                            .add_color_stop(percentage(1.0), smoke_col.alpha(0.0));
+                            painter = painter
+                                .fill_style(wisp_grad)
+                                .begin_path()
+                                .arc(wx, wy, wisp_r, 0.0, TAU)
+                                .fill();
+                        }
+
+                        // Playhead bass-reactive glow halo (`glow := 9 + 8*bass`) and crisp core (`thick*(1 + 0.25*bass)`).
+                        let glow_r = 9.0 + 8.0 * bass;
+                        let halo = CanvasGradient::radial(
+                            point(px(head_x), px(cy)),
                             px(0.0),
-                            point(px(wx), px(wy)),
-                            px(r),
+                            point(px(head_x), px(cy)),
+                            px(glow_r),
                         )
-                        .add_color_stop(percentage(0.0), base_col.alpha(alpha))
-                        .add_color_stop(percentage(1.0), base_col.alpha(0.0));
-                        painter = painter
-                            .fill_style(wisp_grad)
+                        .add_color_stop(
+                            percentage(0.0),
+                            smoke_col.alpha((0.78 * shown).clamp(0.0, 0.95)),
+                        )
+                        .add_color_stop(
+                            percentage(0.45),
+                            smoke_col.alpha((0.32 * shown).clamp(0.0, 0.60)),
+                        )
+                        .add_color_stop(percentage(1.0), smoke_col.alpha(0.0));
+                        let core_r = (thick * (1.0 + 0.25 * bass)) * 0.5;
+                        let core_col =
+                            theme::mix_color(color(colors::NP_FG), smoke_col, 0.15).alpha(shown);
+                        painter
+                            .fill_style(halo)
                             .begin_path()
-                            .arc(wx, wy, r, 0.0, std::f32::consts::TAU)
-                            .fill();
-                    }
-
-                    // Soft comet head glow & crisp luminous core dot.
-                    let halo_r = 7.0 + 5.0 * bass;
-                    let halo = CanvasGradient::radial(
-                        point(px(head_x), px(cy)),
-                        px(0.0),
-                        point(px(head_x), px(cy)),
-                        px(halo_r),
-                    )
-                    .add_color_stop(percentage(0.0), base_col.alpha(0.55 + 0.25 * bass))
-                    .add_color_stop(percentage(1.0), base_col.alpha(0.0));
-                    let core_r = 2.4 + 0.8 * bass;
-                    painter
-                        .fill_style(halo)
-                        .begin_path()
-                        .arc(head_x, cy, halo_r, 0.0, std::f32::consts::TAU)
-                        .fill()
-                        .fill_style(base_col.lighten(0.32).alpha(0.92))
-                        .begin_path()
-                        .arc(head_x, cy, core_r, 0.0, std::f32::consts::TAU)
-                        .fill()
-                })
-                .absolute()
-                .left(px(-SMOKE_PAD_X))
-                .right(px(-SMOKE_PAD_X))
-                .top(px(-SMOKE_HEADROOM_Y))
-                .h(move || px(track_size.get().1 + SMOKE_HEADROOM_Y))
-                .pointer_events(PointerEvents::None)
-            }))
+                            .arc(head_x, cy, glow_r, 0.0, TAU)
+                            .fill()
+                            .fill_style(core_col)
+                            .begin_path()
+                            .arc(head_x, cy, core_r, 0.0, TAU)
+                            .fill()
+                    })
+                    .absolute()
+                    .left(px(-SMOKE_PAD_X))
+                    .right(px(-SMOKE_PAD_X))
+                    .top(px(-SMOKE_HEADROOM_Y))
+                    .h(move || px(track_size.get().1 + SMOKE_HEADROOM_Y))
+                    .pointer_events(PointerEvents::None)
+                },
+            ))
             .child(
                 // Buffered bar drawn behind the slider indicator rail.
                 view()
@@ -346,6 +453,9 @@ impl IntoElement for Scrubber {
                     .h(px(4.0))
                     .rounded_full()
                     .overflow_hidden()
+                    .transition_all()
+                    .duration(move || motion::transition_ms(140.0))
+                    .group_hover(|s| s.h(px(6.0)))
                     .pointer_events(PointerEvents::None)
                     .child(
                         view()
@@ -391,9 +501,13 @@ impl IntoElement for Scrubber {
                             .bg(rail_color)
                             .transition_all()
                             .duration(move || motion::transition_ms(140.0))
-                            .group_hover(|s| s.h(px(5.5)))
+                            .group_hover(|s| s.h(px(6.0)))
                     })
-                    .range_style(move |s| s.rounded_full().bg(fill_color))
+                    .range_style(move |s| {
+                        s.rounded_full()
+                            .bg(fill_color)
+                            .opacity(move || 1.0 - effective_smoke.get())
+                    })
                     .thumb_class("active:opacity-100 active:scale-125 focus-visible:opacity-100 focus-visible:outline-2 focus-visible:outline-ring")
                     .thumb_style(move |s| {
                         s.size(px(12.0))
@@ -444,12 +558,7 @@ impl IntoElement for Scrubber {
                 .flex_row()
                 .items_center()
                 .gap_2p5()
-                .child(
-                    view()
-                        .min_w(px(36.0))
-                        .items_end()
-                        .child(elapsed_label),
-                )
+                .child(view().min_w(px(36.0)).items_end().child(elapsed_label))
                 .child(track_stack.flex_1().min_w(px(80.0)))
                 .child(view().min_w(px(40.0)).child(remaining_label))
                 .into_element();

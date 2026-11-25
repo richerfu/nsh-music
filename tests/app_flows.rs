@@ -62,10 +62,7 @@ struct DirBackup {
 impl DirBackup {
     fn stash(path: PathBuf, suffix: u64) -> Self {
         let backup = if path.exists() {
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("dir");
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("dir");
             let dest = path.with_file_name(format!(
                 "{name}.nsh-test-backup-{}-{suffix}",
                 std::process::id()
@@ -204,6 +201,9 @@ fn write_fixture_js_plugin(dir: &Path) {
             "author": "Verifier Suite",
             "description": "Local JS fixture plugin for headless integration tests",
             "main": "index.js",
+            "navigation": [
+                { "title": "Favorites", "page": "favlist", "icon": "heart" }
+            ],
             "permissions": {
                 "network": ["api.fixture.invalid"]
             }
@@ -214,37 +214,69 @@ fn write_fixture_js_plugin(dir: &Path) {
     fs::write(
         dir.join("index.js"),
         r#"
+const SAMPLE_TRACK = {
+    id: "fw-1",
+    name: "Signal Drift",
+    artists: [{ id: "ar-1", name: "Wave Runner" }],
+    album: { id: "al-1", name: "Test Signals" },
+    duration: 180000
+};
+
 export async function getHome() {
     return {
         title: "Fixture Home",
         sections: [
             {
                 title: "Fixture Picks",
-                tracks: [
-                    {
-                        id: "fw-1",
-                        name: "Signal Drift",
-                        artists: [{ id: "ar-1", name: "Wave Runner" }],
-                        album: { id: "al-1", name: "Test Signals" },
-                        duration: 180000
-                    }
-                ]
+                tracks: [SAMPLE_TRACK]
             }
         ]
     };
 }
 
+export async function browse(arg) {
+    const page = typeof arg === "string" ? arg : (arg && arg.page) || "";
+    if (page === "favlist") {
+        return {
+            title: "Favorites",
+            sections: [
+                {
+                    title: "Favorite Waves",
+                    tracks: [SAMPLE_TRACK]
+                }
+            ]
+        };
+    }
+    return {
+        title: "Fixture Browse",
+        sections: [
+            {
+                title: "Browse All",
+                tracks: [SAMPLE_TRACK]
+            }
+        ]
+    };
+}
+
+export async function getBrowse(page) {
+    return browse(page);
+}
+
+export async function suggest(arg) {
+    const q = typeof arg === "string" ? arg : (arg && arg.query) || "";
+    if (!q.trim()) {
+        return [];
+    }
+    return ["Signal Drift", "Signal Wave", "Signal Acoustic"];
+}
+
+export async function searchSuggestions(query) {
+    return suggest(query);
+}
+
 export async function search(query) {
     return {
-        tracks: [
-            {
-                id: "fw-1",
-                name: "Signal Drift",
-                artists: [{ id: "ar-1", name: "Wave Runner" }],
-                album: { id: "al-1", name: "Test Signals" },
-                duration: 180000
-            }
-        ],
+        tracks: [SAMPLE_TRACK],
         more: false
     };
 }
@@ -269,11 +301,120 @@ export async function getComments() {
     .expect("write fixture index.js");
 }
 
+fn write_fixture_phone_auth_plugin(dir: &Path) {
+    fs::write(
+        dir.join("plugin.json"),
+        r#"{
+            "id": "fixture-phone-auth",
+            "name": "Fixture Phone Auth",
+            "version": "1.0.0",
+            "author": "Verifier Suite",
+            "description": "Phone single-header and WebSignIn fixture plugin",
+            "main": "index.js",
+            "navigation": [
+                { "title": "Favorites", "page": "favlist", "icon": "heart" }
+            ],
+            "permissions": {
+                "network": ["music.youtube.com"]
+            }
+        }"#,
+    )
+    .expect("write fixture phone auth plugin.json");
+
+    fs::write(
+        dir.join("index.js"),
+        r#"
+const TRACK = {
+    id: "pa-1",
+    name: "Harbor Echo",
+    artists: [{ id: "ar-pa", name: "Port Synth" }],
+    album: { id: "al-pa", name: "Night Dock" },
+    duration: 185000
+};
+
+let signedIn = false;
+
+export async function home() {
+    return {
+        title: "Fixture Home",
+        sections: [
+            {
+                title: "Featured Dock",
+                tracks: [TRACK]
+            }
+        ]
+    };
+}
+
+export async function browse(arg) {
+    const page = typeof arg === "string" ? arg : (arg && arg.page) || "";
+    if (page === "favlist") {
+        return {
+            title: "Favorites",
+            sections: [
+                {
+                    title: "Favorite Waves",
+                    tracks: [TRACK]
+                }
+            ]
+        };
+    }
+    return {
+        title: "Fixture Browse",
+        sections: [
+            {
+                title: "Browse All",
+                tracks: [TRACK]
+            }
+        ]
+    };
+}
+
+export async function stations() {
+    return [{ id: "st-1", name: "Synth FM" }];
+}
+
+export async function shows() {
+    return [{ id: "sh-1", name: "Sound Lab", publisher: "Studio" }];
+}
+
+export async function signIn() {
+    const res = await host.webSignIn({
+        url: "https://music.youtube.com/",
+        title: "Fixture Web Sign In",
+        cookiesOf: "https://music.youtube.com",
+        until: ["SAPISID", "__Secure-3PSID"],
+        allowManualCookie: true
+    });
+    if (!res || res.cancelled || !res.cookie) {
+        throw new Error("sign-in cancelled");
+    }
+    const hasSapisid = (res.cookies && res.cookies.SAPISID) || res.cookie.includes("SAPISID=");
+    const hasPsid = (res.cookies && res.cookies["__Secure-3PSID"]) || res.cookie.includes("__Secure-3PSID=");
+    if (!hasSapisid || !hasPsid) {
+        throw new Error("missing required cookies");
+    }
+    signedIn = true;
+    return { id: "u-99", name: "Verified Listener" };
+}
+
+export async function account() {
+    if (!signedIn) {
+        return null;
+    }
+    // Simulate transient network failure so store.refresh_sources() must preserve cached account.
+    throw new Error("transient account probe error");
+}
+"#,
+    )
+    .expect("write fixture phone auth index.js");
+}
+
 fn start_viewport(width: f32, height: f32, os: Os, idiom: Idiom) -> Headless {
     let viewport = Size::new(Points(width), Points(height));
     let root = Root::of::<nsh_app_music::App>()
         .tokens(nsh_app_music::app_tokens())
-        .app_id("com.southorange.nshmusic.test");
+        .app_id("com.richerfu.nshmusic.test");
     let env = Environment {
         window: viewport,
         os,
@@ -309,6 +450,17 @@ fn check_min_bounds(app: &Headless, test_id: &str, min_w: f32, min_h: f32) -> Re
     Ok(())
 }
 
+fn node_origin_y(app: &Headless, test_id: &str) -> Result<f32, String> {
+    let nodes = app.screen().layout_nodes();
+    let Some(node) = nodes
+        .iter()
+        .find(|n| !n.hidden && n.test_id.as_deref() == Some(test_id))
+    else {
+        return Err(format!("missing visible LayoutNode `{test_id}`"));
+    };
+    Ok(node.bounds.origin.y.0)
+}
+
 fn check_min_touch_targets(app: &Headless, test_ids: &[&str]) -> Vec<String> {
     test_ids
         .iter()
@@ -330,6 +482,12 @@ fn desktop_zero_mock_empty_boot_settings_and_locale() {
     app.wait_for("安装插件").unwrap();
     app.wait_for("id:player-bar >> text:未在播放").unwrap();
 
+    // Standalone `nav-plugins` has been unified into the Desktop Settings window.
+    assert!(
+        !app.screen().matches("id:nav-plugins").unwrap(),
+        "standalone `nav-plugins` must be absent from desktop sidebar"
+    );
+
     // Confirm zero leftover mock/demo strings are displayed on boot.
     for forbidden in [
         "Harbor Lights",
@@ -338,6 +496,7 @@ fn desktop_zero_mock_empty_boot_settings_and_locale() {
         "霓虹港湾",
         "内置试听",
         "早上好",
+        "MyGo Music",
     ] {
         assert!(
             !app.screen().shows(forbidden),
@@ -345,15 +504,33 @@ fn desktop_zero_mock_empty_boot_settings_and_locale() {
         );
     }
 
-    // 2. Navigate to Settings: test search filter, appearance theme toggle,
-    // experiments, cache section, and live zh-CN <-> en locale switch.
+    // 2. Clicking `nav-settings` opens the native Desktop Settings child window.
+    assert!(
+        app.window_state("settings").unwrap().is_none(),
+        "settings window should start closed"
+    );
     app.press("id:nav-settings").unwrap();
+    app.wait_for("id:settings-sidebar").unwrap();
     app.wait_for("id:settings-search-input").unwrap();
-    app.wait_for("外观与界面").unwrap();
-    app.wait_for("实验性功能").unwrap();
-    app.wait_for("缓存").unwrap();
+    app.wait_for("id:settings-detail-pane").unwrap();
+    assert!(
+        app.window_state("settings").unwrap().is_some(),
+        "clicking nav-settings must open the native `settings` child window"
+    );
 
-    // Theme toggles: Light -> Dark -> System.
+    // Verify all 6 unified Settings sections exist inside the Settings sidebar.
+    for section_id in [
+        "id:settings-nav-general",
+        "id:settings-nav-plugins",
+        "id:settings-nav-playback",
+        "id:settings-nav-cache",
+        "id:settings-nav-experiments",
+        "id:settings-nav-about",
+    ] {
+        app.wait_for(section_id).unwrap();
+    }
+
+    // Theme toggles in General: Light -> Dark -> System.
     app.press("role:button[浅色]").unwrap();
     assert!(app.screen().selected("role:button[浅色]").unwrap());
     app.press("role:button[深色]").unwrap();
@@ -361,23 +538,48 @@ fn desktop_zero_mock_empty_boot_settings_and_locale() {
     app.press("role:button[跟随系统]").unwrap();
     assert!(app.screen().selected("role:button[跟随系统]").unwrap());
 
-    // Live locale switch: zh-CN -> en -> zh-CN.
+    // Live locale switch: zh-CN -> en -> verify About brand is strictly `NSH Music`.
     app.press("role:button[English]").unwrap();
-    app.wait_for("Appearance").unwrap();
-    app.wait_for("Experiments").unwrap();
-    app.wait_for("Ambient Fog Backdrop").unwrap();
+    app.wait_for("id:settings-nav-general >> text:General")
+        .unwrap();
+    app.wait_for("id:settings-nav-plugins >> text:Plugins")
+        .unwrap();
     app.wait_for("id:nav-home >> text:Discover").unwrap();
 
-    // Filter Settings via live search input.
+    // Filter Settings via live search input inside the Settings child window.
     app.type_text("id:settings-search-input", "Fog").unwrap();
     app.wait_for("Ambient Fog Backdrop").unwrap();
     app.clear("id:settings-search-input").unwrap();
-    app.wait_for("Appearance").unwrap();
 
-    // Switch back to zh-CN.
+    // Verify About section strictly displays `NSH Music`.
+    app.press("id:settings-nav-about").unwrap();
+    app.wait_for("id:settings-detail-pane >> text:NSH Music")
+        .unwrap();
+    assert!(
+        !app.screen().shows("MyGo Music"),
+        "About pane must never show `MyGo Music`"
+    );
+
+    // Switch back to General & zh-CN.
+    app.press("id:settings-nav-general").unwrap();
     app.press("role:button[简体中文]").unwrap();
-    app.wait_for("外观与界面").unwrap();
     app.wait_for("id:nav-home >> text:发现").unwrap();
+
+    // Close the Settings child window and confirm `mod+,` re-opens it cleanly.
+    app.press_window_close("settings").unwrap();
+    app.wait_for_gone("id:settings-sidebar", GONE_TIMEOUT)
+        .unwrap();
+    assert!(app.window_state("settings").unwrap().is_none());
+
+    app.press_key("mod+,").unwrap();
+    app.wait_for("id:settings-sidebar").unwrap();
+    assert!(
+        app.window_state("settings").unwrap().is_some(),
+        "`mod+,` shortcut must open the Desktop Settings child window"
+    );
+    app.press_window_close("settings").unwrap();
+    app.wait_for_gone("id:settings-sidebar", GONE_TIMEOUT)
+        .unwrap();
 }
 
 #[test]
@@ -446,7 +648,7 @@ fn desktop_local_wav_scan_playback_and_capability_gated_now_playing() {
         .unwrap();
 
     app.press("id:now-playing-overlay >> label:队列").unwrap();
-    app.wait_for("id:now-playing-overlay >> text:播放队列")
+    app.wait_for("id:now-playing-overlay >> text:/即将播放/")
         .unwrap();
 
     app.press("id:now-playing-overlay >> label:歌词").unwrap();
@@ -496,15 +698,18 @@ fn desktop_modal_layout_regression_and_staged_plugin_install() {
 
     let mut app = start_viewport(1280.0, 800.0, Os::MacOs, Idiom::Desktop);
     app.wait_for("id:desktop-shell").unwrap();
+    assert!(!app.screen().matches("id:nav-plugins").unwrap());
 
-    // 1. Navigate to Plugins screen and verify import toolbar buttons.
-    app.press("id:nav-plugins").unwrap();
+    // 1. Open Desktop Settings window -> Plugins section and verify import toolbar buttons.
+    app.press("id:nav-settings").unwrap();
+    app.wait_for("id:settings-nav-plugins").unwrap();
+    app.press("id:settings-nav-plugins").unwrap();
     app.wait_for("id:plugins-btn-github").unwrap();
     app.wait_for("id:plugins-btn-folder").unwrap();
     app.wait_for("id:plugins-btn-zip").unwrap();
     app.wait_for("id:plugins-btn-open-dir").unwrap();
 
-    // 2. Open ActiveModal::InstallPlugin and assert non-0px modal child layout bounds.
+    // 2. Open ActiveModal::InstallPlugin inside Settings window and assert non-0px bounds.
     app.press("id:plugins-btn-github").unwrap();
     app.wait_for("id:install-plugin-input").unwrap();
     app.wait_for("id:install-plugin-submit").unwrap();
@@ -535,20 +740,107 @@ fn desktop_modal_layout_regression_and_staged_plugin_install() {
         panic!("ConfirmPluginInstall modal layout regression: {e}");
     });
 
-    // 4. Confirm installation -> plugin appears in Plugins list and Source Switcher!
+    // 4. Confirm installation -> plugin appears in Settings Plugins list, then close Settings.
     app.press("id:confirm-plugin-install-btn").unwrap();
     app.wait_for_gone("id:confirm-plugin-install-btn", GONE_TIMEOUT)
         .unwrap();
-    app.wait_for("Fixture Wave Music").unwrap();
+    app.wait_for("id:settings-detail-pane >> text:Fixture Wave Music")
+        .unwrap();
+    app.press_window_close("settings").unwrap();
+    app.wait_for_gone("id:settings-sidebar", GONE_TIMEOUT)
+        .unwrap();
 
+    // Switch active source to the newly installed plugin and verify its home feed & custom nav load.
     app.press("id:desktop-source-switcher").unwrap();
     app.wait_for("切换音乐源").unwrap();
     app.wait_for("Fixture Wave Music").unwrap();
-
-    // Select installed plugin as active source and verify its home feed loads.
     app.press("role:button[/Fixture Wave Music/]").unwrap();
-    app.press("id:nav-home").unwrap();
     app.wait_for("Signal Drift").unwrap();
+    app.wait_for("id:desktop-sidebar >> role:button[Favorites]")
+        .unwrap();
+
+    // 5. Regression (#116): Back/Forward across Browse + custom plugin nav highlights <= 1 item.
+    let assert_single_selection = |app: &Headless,
+                                   expected_browse: bool,
+                                   expected_fav: bool,
+                                   expected_home: bool,
+                                   step: &str| {
+        let browse_sel = app.screen().selected("id:nav-browse").unwrap();
+        let fav_sel = app
+            .screen()
+            .selected("id:desktop-sidebar >> role:button[Favorites]")
+            .unwrap();
+        let home_sel = app.screen().selected("id:nav-home").unwrap();
+        let total = usize::from(browse_sel) + usize::from(fav_sel) + usize::from(home_sel);
+        assert!(
+            total <= 1,
+            "[{step}] multiple nav items highlighted simultaneously (browse={browse_sel}, fav={fav_sel}, home={home_sel})"
+        );
+        assert_eq!(
+            browse_sel, expected_browse,
+            "[{step}] nav-browse active mismatch"
+        );
+        assert_eq!(fav_sel, expected_fav, "[{step}] Favorites active mismatch");
+        assert_eq!(home_sel, expected_home, "[{step}] nav-home active mismatch");
+    };
+
+    app.press("id:nav-browse").unwrap();
+    assert_single_selection(&app, true, false, false, "click Browse");
+
+    app.press("id:desktop-sidebar >> role:button[Favorites]")
+        .unwrap();
+    assert_single_selection(&app, false, true, false, "click custom Favorites");
+
+    app.press("id:nav-home").unwrap();
+    assert_single_selection(&app, false, false, true, "click Home");
+
+    // Back -> Favorites (nav-browse MUST NOT be selected!).
+    app.press("id:desktop-back-btn").unwrap();
+    assert_single_selection(&app, false, true, false, "Back -> Favorites");
+
+    // Back -> Browse (nav-browse IS selected, Favorites is NOT!).
+    app.press("id:desktop-back-btn").unwrap();
+    assert_single_selection(&app, true, false, false, "Back -> Browse");
+
+    // Forward -> Favorites (still strictly single selection).
+    app.press("id:desktop-forward-btn").unwrap();
+    assert_single_selection(&app, false, true, false, "Forward -> Favorites");
+
+    // 6. Regression (#116 + #115): Floating search suggestions cause 0px shift on sidebar nav,
+    // and Search page renders results cleanly without an inline suggestion pill wall.
+    let nav_home_y_before = node_origin_y(&app, "nav-home").unwrap();
+    let nav_browse_y_before = node_origin_y(&app, "nav-browse").unwrap();
+
+    app.type_text("id:desktop-search-input", "Signal").unwrap();
+    app.wait_for("id:desktop-search-suggestions").unwrap();
+    app.wait_for("id:desktop-search-suggestions >> text:Signal Drift")
+        .unwrap();
+
+    let nav_home_y_after = node_origin_y(&app, "nav-home").unwrap();
+    let nav_browse_y_after = node_origin_y(&app, "nav-browse").unwrap();
+    assert!(
+        (nav_home_y_after - nav_home_y_before).abs() < 0.5,
+        "sidebar `nav-home` shifted vertically when suggestions opened ({nav_home_y_before} -> {nav_home_y_after})"
+    );
+    assert!(
+        (nav_browse_y_after - nav_browse_y_before).abs() < 0.5,
+        "sidebar `nav-browse` shifted vertically when suggestions opened ({nav_browse_y_before} -> {nav_browse_y_after})"
+    );
+
+    // Selecting a suggestion closes the floating popover and opens clean Desktop Search results.
+    app.press("id:desktop-search-suggestions >> text:Signal Drift")
+        .unwrap();
+    app.wait_for_gone("id:desktop-search-suggestions", GONE_TIMEOUT)
+        .unwrap();
+    app.wait_for("id:search-page-input").unwrap();
+    app.wait_for("id:desktop-main-viewport >> text:Signal Drift")
+        .unwrap();
+    assert!(
+        !app.screen()
+            .matches("id:desktop-main-viewport >> text:搜索建议")
+            .unwrap(),
+        "Desktop Search page should not render an inline suggestion pill wall above results"
+    );
 }
 
 #[test]
@@ -564,6 +856,12 @@ fn pad_landscape_and_portrait_adaptive_flows() {
     app.wait_for("id:pad-icon-rail").unwrap();
     app.wait_for("id:pad-player-dock").unwrap();
     app.wait_for("还没有音乐").unwrap();
+
+    // Standalone `pad-nav-plugins` is removed (unified inside Settings split view).
+    assert!(
+        !app.screen().matches("id:pad-nav-plugins").unwrap(),
+        "standalone `pad-nav-plugins` must be absent on Pad"
+    );
 
     // Capability-gated nav items: Local supports Browse (albums/local), but NOT Radio/Podcasts.
     app.wait_for("id:pad-nav-browse").unwrap();
@@ -583,7 +881,6 @@ fn pad_landscape_and_portrait_adaptive_flows() {
             "pad-nav-browse",
             "pad-nav-library",
             "pad-nav-search",
-            "pad-nav-plugins",
             "pad-nav-settings",
             "pad-source-switcher",
             "pad-search-btn",
@@ -605,15 +902,40 @@ fn pad_landscape_and_portrait_adaptive_flows() {
     app.wait_for("id:pad-player-dock >> text:Acoustic Sunrise")
         .unwrap();
 
-    // Navigate Pad destinations & verify Back/Forward history controls.
+    // Navigate Pad destinations & verify iPadOS 2-column split Settings with unified Plugins.
     app.press("id:pad-nav-library").unwrap();
     app.wait_for("新建歌单").unwrap();
     app.press("id:pad-nav-settings").unwrap();
-    app.wait_for("外观与界面").unwrap();
+    app.wait_for("id:pad-settings-split").unwrap();
+    for section_id in [
+        "settings-nav-general",
+        "settings-nav-plugins",
+        "settings-nav-playback",
+        "settings-nav-cache",
+        "settings-nav-experiments",
+        "settings-nav-about",
+    ] {
+        app.wait_for(&format!("id:{section_id}")).unwrap();
+    }
+    touch_violations.extend(check_min_touch_targets(
+        &app,
+        &[
+            "settings-nav-general",
+            "settings-nav-plugins",
+            "settings-nav-playback",
+            "settings-nav-cache",
+            "settings-nav-experiments",
+            "settings-nav-about",
+        ],
+    ));
+
+    app.press("id:settings-nav-plugins").unwrap();
+    app.wait_for("id:plugins-btn-github").unwrap();
+
     app.press("id:pad-back-btn").unwrap();
     app.wait_for("新建歌单").unwrap();
     app.press("id:pad-forward-btn").unwrap();
-    app.wait_for("外观与界面").unwrap();
+    app.wait_for("id:pad-settings-split").unwrap();
 
     // Open & close Now Playing overlay on Pad Landscape.
     app.press("id:pad-now-playing-trigger").unwrap();
@@ -661,19 +983,40 @@ fn phone_flows_back_press_sheet_dismiss_and_touch_targets() {
 
     let mut app = start_viewport(390.0, 844.0, Os::Ios, Idiom::Phone);
 
-    // 1. Phone shell boots cleanly in zero-mock empty state.
+    // 1. Phone shell boots cleanly in zero-mock empty state without duplicate top gear, header, or back arrow.
     app.wait_for("id:shell-phone").unwrap();
     app.wait_for("id:phone-header").unwrap();
+    app.wait_for("id:phone-refresh-btn").unwrap();
     app.wait_for("id:phone-tab-bar").unwrap();
     app.wait_for("还没有音乐").unwrap();
+    assert!(
+        !app.screen().matches("id:phone-settings-btn").unwrap(),
+        "duplicate top settings gear `phone-settings-btn` must be absent on Phone"
+    );
+    assert!(
+        !app.screen().matches("id:phone-back-btn").unwrap(),
+        "`phone-back-btn` must stay hidden on Phone root tabs"
+    );
+    assert_eq!(
+        app.screen()
+            .count("id:phone-main-viewport >> text:发现")
+            .unwrap(),
+        0,
+        "Phone Home body must not render a duplicate `发现` heading"
+    );
+    assert_eq!(
+        app.screen().count("text:本地音乐").unwrap(),
+        1,
+        "Phone Home must render strictly one `本地音乐` source switcher"
+    );
 
     // >= 44pt touch target sanity across always-visible Phone shell controls.
     let mut touch_violations = check_min_touch_targets(
         &app,
         &[
             "phone-source-switcher",
+            "phone-refresh-btn",
             "phone-search-btn",
-            "phone-settings-btn",
             "tab-home",
             "tab-browse",
             "tab-library",
@@ -681,13 +1024,75 @@ fn phone_flows_back_press_sheet_dismiss_and_touch_targets() {
         ],
     );
 
-    // 2. Open Source Switcher bottom sheet and dismiss cleanly via Phone back-press.
+    // 2. Root tab switching uses `switch_tab`: NEVER shows `phone-back-btn` and keeps `phone-tab-bar`.
+    for tab in [
+        "id:tab-browse",
+        "id:tab-library",
+        "id:tab-settings",
+        "id:tab-home",
+    ] {
+        app.press(tab).unwrap();
+        app.wait_for("id:phone-tab-bar").unwrap();
+        assert!(
+            !app.screen().matches("id:phone-back-btn").unwrap(),
+            "root tab {tab} must not display `phone-back-btn`"
+        );
+    }
+
+    // 3. Phone Settings 2-level native hierarchy: Level-1 grouped list -> Level-2 detail page.
+    app.press("id:tab-settings").unwrap();
+    app.wait_for("id:phone-settings-list").unwrap();
+    let phone_settings_rows = [
+        "phone-settings-plugins",
+        "phone-settings-general",
+        "phone-settings-playback",
+        "phone-settings-cache",
+        "phone-settings-experiments",
+        "phone-settings-about",
+    ];
+    for row_id in phone_settings_rows {
+        app.wait_for(&format!("id:{row_id}")).unwrap();
+    }
+    touch_violations.extend(check_min_touch_targets(&app, &phone_settings_rows));
+
+    // Drill down into Plugins (`Route::SettingsDetail(SettingsSection::Plugins)`).
+    app.press("id:phone-settings-plugins").unwrap();
+    app.wait_for("id:phone-settings-detail").unwrap();
+    app.wait_for("id:phone-back-btn").unwrap();
+    app.wait_for("id:phone-plugins-install-btn").unwrap();
+    assert!(
+        !app.screen().matches("id:phone-tab-bar").unwrap(),
+        "`phone-tab-bar` must be hidden on Level-2 pushed routes"
+    );
+    assert!(
+        !app.screen().matches("id:plugins-btn-open-dir").unwrap(),
+        "desktop-only `Open Plugins Folder` button must be hidden on Phone"
+    );
+    touch_violations.extend(check_min_touch_targets(
+        &app,
+        &["phone-back-btn", "phone-plugins-install-btn"],
+    ));
+
+    // Tap `<` Back -> returns cleanly to Level-1 `phone-settings-list` with `phone-tab-bar` restored.
+    app.press("id:phone-back-btn").unwrap();
+    app.wait_for("id:phone-settings-list").unwrap();
+    app.wait_for("id:phone-tab-bar").unwrap();
+    assert!(
+        !app.screen().matches("id:phone-back-btn").unwrap(),
+        "`phone-back-btn` must hide again on Level-1 `phone-settings-list`"
+    );
+
+    // Return to Home tab for Source Switcher, WAV scan, and Now Playing verification.
+    app.press("id:tab-home").unwrap();
+    app.wait_for("id:phone-source-switcher").unwrap();
+
+    // 4. Open Source Switcher bottom sheet and dismiss cleanly via Phone back-press.
     app.press("id:phone-source-switcher").unwrap();
     app.wait_for("切换音乐源").unwrap();
     app.back().unwrap();
     app.wait_for_gone("切换音乐源", GONE_TIMEOUT).unwrap();
 
-    // 3. Scan local WAV folder, play a track -> floating mini-player dock appears.
+    // 5. Scan local WAV folder, play a track -> floating mini-player dock appears.
     app.on_pick_paths(vec![music_dir]).unwrap();
     app.press("role:button[添加音乐文件夹]").unwrap();
     app.wait_for("id:phone-main-viewport >> text:Acoustic Sunrise")
@@ -704,7 +1109,7 @@ fn phone_flows_back_press_sheet_dismiss_and_touch_targets() {
         &["phone-mini-player", "phone-next-btn"],
     ));
 
-    // 4. Open Now Playing sheet from mini-player, verify capability gating & modes, dismiss via back().
+    // 6. Open Now Playing sheet from mini-player, verify capability gating & modes, dismiss via back().
     app.press("id:phone-mini-player").unwrap();
     app.wait_for("id:now-playing-overlay").unwrap();
     assert!(
@@ -735,17 +1140,337 @@ fn phone_flows_back_press_sheet_dismiss_and_touch_targets() {
     app.wait_for_gone("id:now-playing-overlay", GONE_TIMEOUT)
         .unwrap();
 
-    // 5. Navigate tabs and confirm system back-press pops navigation history.
-    app.press("id:tab-library").unwrap();
-    app.wait_for("新建歌单").unwrap();
-    app.press("id:tab-settings").unwrap();
-    app.wait_for("外观与界面").unwrap();
+    // 7. System `back()` pops pushed Level-2 screen (Search -> Home).
+    app.press("id:phone-search-btn").unwrap();
+    app.wait_for("id:phone-back-btn").unwrap();
+    assert!(!app.screen().matches("id:phone-tab-bar").unwrap());
     app.back().unwrap();
-    app.wait_for("新建歌单").unwrap();
+    app.wait_for("id:phone-tab-bar").unwrap();
+    assert!(!app.screen().matches("id:phone-back-btn").unwrap());
 
     assert!(
         touch_violations.is_empty(),
         "Phone touch target violations:\n{}",
         touch_violations.join("\n")
+    );
+}
+
+#[test]
+fn phone_single_header_and_web_sign_in_refresh() {
+    let mut guard = IsolatedStateGuard::acquire();
+    let plugin_dir = guard.make_temp_dir("phone-auth-plugin");
+    write_fixture_phone_auth_plugin(&plugin_dir);
+
+    let mut app = start_viewport(390.0, 844.0, Os::Ios, Idiom::Phone);
+    app.wait_for("id:shell-phone").unwrap();
+    app.wait_for("id:phone-header").unwrap();
+    app.wait_for("id:phone-source-switcher").unwrap();
+    app.wait_for("id:phone-refresh-btn").unwrap();
+    app.wait_for("id:phone-search-btn").unwrap();
+
+    // 1. Phone Home single header & single source switcher (zero duplicates).
+    assert_eq!(
+        app.screen().count("id:phone-header >> text:发现").unwrap(),
+        1
+    );
+    assert_eq!(
+        app.screen()
+            .count("id:phone-main-viewport >> text:发现")
+            .unwrap(),
+        0,
+        "Phone Home must not duplicate `发现` heading inside the scrollable body"
+    );
+    assert_eq!(
+        app.screen().count("text:本地音乐").unwrap(),
+        1,
+        "Phone Home must render strictly one `本地音乐` source switcher"
+    );
+
+    let mut touch_violations = check_min_touch_targets(
+        &app,
+        &[
+            "phone-source-switcher",
+            "phone-refresh-btn",
+            "phone-search-btn",
+        ],
+    );
+
+    // 2. Phone Browse root tab: `phone-refresh-btn` >= 44pt and zero duplicate `浏览` body heading.
+    app.press("id:tab-browse").unwrap();
+    app.wait_for("id:phone-refresh-btn").unwrap();
+    assert_eq!(
+        app.screen().count("id:phone-header >> text:浏览").unwrap(),
+        1
+    );
+    assert_eq!(
+        app.screen()
+            .count("id:phone-main-viewport >> text:浏览")
+            .unwrap(),
+        0,
+        "Phone Browse must not duplicate `浏览` heading inside the page body"
+    );
+    touch_violations.extend(check_min_touch_targets(&app, &["phone-refresh-btn"]));
+
+    // 3. Install fixture plugin with custom navigation, stations, shows, and WebSignIn auth.
+    app.press("id:tab-settings").unwrap();
+    app.wait_for("id:phone-settings-plugins").unwrap();
+    app.press("id:phone-settings-plugins").unwrap();
+    app.wait_for("id:phone-plugins-install-btn").unwrap();
+    app.press("id:phone-plugins-install-btn").unwrap();
+    app.wait_for("id:install-plugin-pick-folder").unwrap();
+
+    app.on_pick_paths(vec![plugin_dir]).unwrap();
+    app.press("id:install-plugin-pick-folder").unwrap();
+    app.wait_for("确认安装插件").unwrap();
+    app.press("role:button[确认]").unwrap();
+    app.wait_for_gone("确认安装插件", GONE_TIMEOUT).unwrap();
+    app.wait_for("Fixture Phone Auth").unwrap();
+
+    // 4. End-to-end WebSignIn auto-close + immediate account update + refresh_sources error preservation.
+    // Allow the Phone bottom sheet close animation to finish before tapping the plugin card underneath.
+    std::thread::sleep(Duration::from_millis(350));
+    app.press("role:button[登录]").unwrap();
+    app.wait_for("id:web-sign-in-cookie-input").unwrap();
+    app.wait_for("id:web-sign-in-submit-btn").unwrap();
+    app.wait_for("SAPISID").unwrap();
+    app.wait_for("__Secure-3PSID").unwrap();
+
+    app.type_text(
+        "id:web-sign-in-cookie-input",
+        "SAPISID=aaa; __Secure-3PSID=bbb",
+    )
+    .unwrap();
+    app.press("id:web-sign-in-submit-btn").unwrap();
+    app.wait_for_gone("id:web-sign-in-submit-btn", GONE_TIMEOUT)
+        .unwrap();
+    app.wait_for("已登录：Verified Listener").unwrap();
+
+    // Re-enter Plugins (triggers `store.refresh_sources()` whose plugin `account()` throws):
+    // cached signed-in account must remain intact and never regress to unsigned state.
+    app.press("id:phone-back-btn").unwrap();
+    app.wait_for("id:phone-settings-plugins").unwrap();
+    app.press("id:phone-settings-plugins").unwrap();
+    app.wait_for("id:phone-settings-detail").unwrap();
+    std::thread::sleep(Duration::from_millis(250));
+    app.wait_for("已登录：Verified Listener").unwrap();
+
+    // 5. Switch Phone active source to `Fixture Phone Auth` and verify single nav strip on Browse.
+    app.press("id:phone-back-btn").unwrap();
+    app.wait_for("id:tab-home").unwrap();
+    app.press("id:tab-home").unwrap();
+    app.wait_for("id:phone-source-switcher").unwrap();
+    app.press("id:phone-source-switcher").unwrap();
+    app.wait_for("切换音乐源").unwrap();
+    app.press("Fixture Phone Auth").unwrap();
+    app.wait_for_gone("切换音乐源", GONE_TIMEOUT).unwrap();
+    app.wait_for("id:phone-main-viewport >> text:Harbor Echo")
+        .unwrap();
+
+    // On Phone Home: strictly 1 source switcher, zero duplicate heading, zero shell nav strip.
+    assert_eq!(
+        app.screen().count("text:Fixture Phone Auth").unwrap(),
+        1,
+        "Phone Home must show strictly one `Fixture Phone Auth` source switcher"
+    );
+    assert_eq!(
+        app.screen()
+            .count("id:phone-main-viewport >> text:发现")
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        app.screen().count("text:Favorites").unwrap(),
+        0,
+        "Removed `phone_source_nav_strip` must not render `Favorites` on Phone Home"
+    );
+
+    // On Phone Browse: strictly a single horizontal pill bar (Radio, Podcasts, Favorites) with zero duplicates.
+    app.press("id:tab-browse").unwrap();
+    app.wait_for("id:phone-main-viewport >> text:Favorites")
+        .unwrap();
+    assert_eq!(
+        app.screen()
+            .count("id:phone-main-viewport >> text:浏览")
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        app.screen().count("text:Favorites").unwrap(),
+        1,
+        "Phone Browse must show strictly one `Favorites` pill (no duplicate shell strip + page pills)"
+    );
+    assert_eq!(
+        app.screen()
+            .count("id:phone-main-viewport >> text:电台")
+            .unwrap(),
+        1,
+        "Phone Browse should prepend capability-gated `电台` pill once"
+    );
+    assert_eq!(
+        app.screen()
+            .count("id:phone-main-viewport >> text:播客")
+            .unwrap(),
+        1,
+        "Phone Browse should prepend capability-gated `播客` pill once"
+    );
+    touch_violations.extend(check_min_touch_targets(&app, &["phone-refresh-btn"]));
+
+    // Level-2 Favorites / Radio / Podcasts routes show single header + refresh button >= 44pt.
+    app.press("id:phone-main-viewport >> text:Favorites")
+        .unwrap();
+    app.wait_for("id:phone-back-btn").unwrap();
+    app.wait_for("id:phone-refresh-btn").unwrap();
+    app.wait_for("id:phone-main-viewport >> text:Favorite Waves")
+        .unwrap();
+    touch_violations.extend(check_min_touch_targets(
+        &app,
+        &["phone-back-btn", "phone-refresh-btn"],
+    ));
+    app.press("id:phone-back-btn").unwrap();
+    app.wait_for("id:phone-main-viewport >> text:电台").unwrap();
+
+    app.press("id:phone-main-viewport >> text:电台").unwrap();
+    app.wait_for("id:phone-header >> text:电台").unwrap();
+    app.wait_for("id:phone-main-viewport >> text:Synth FM")
+        .unwrap();
+    assert_eq!(
+        app.screen()
+            .count("id:phone-main-viewport >> role:header[电台]")
+            .unwrap(),
+        0,
+        "Phone Radio page must not duplicate `电台` H1 heading in body"
+    );
+    assert_eq!(
+        app.screen()
+            .count("id:phone-main-viewport >> role:button[刷新]")
+            .unwrap(),
+        0,
+        "Phone Radio page must not render a duplicate body Refresh button"
+    );
+    touch_violations.extend(check_min_touch_targets(&app, &["phone-refresh-btn"]));
+    app.press("id:phone-back-btn").unwrap();
+    app.wait_for("id:phone-main-viewport >> text:播客").unwrap();
+
+    app.press("id:phone-main-viewport >> text:播客").unwrap();
+    app.wait_for("id:phone-header >> text:播客").unwrap();
+    app.wait_for("id:phone-main-viewport >> text:Sound Lab")
+        .unwrap();
+    assert_eq!(
+        app.screen()
+            .count("id:phone-main-viewport >> role:header[播客]")
+            .unwrap(),
+        0,
+        "Phone Podcasts page must not duplicate `播客` H1 heading in body"
+    );
+    assert_eq!(
+        app.screen()
+            .count("id:phone-main-viewport >> role:button[刷新]")
+            .unwrap(),
+        0,
+        "Phone Podcasts page must not render a duplicate body Refresh button"
+    );
+    touch_violations.extend(check_min_touch_targets(&app, &["phone-refresh-btn"]));
+
+    assert!(
+        touch_violations.is_empty(),
+        "Phone single-header touch target violations:\n{}",
+        touch_violations.join("\n")
+    );
+}
+
+#[test]
+fn phone_browse_tab_cache_and_idempotent_switch() {
+    let mut guard = IsolatedStateGuard::acquire();
+    let plugin_dir = guard.make_temp_dir("phone-browse-cache-plugin");
+    write_fixture_phone_auth_plugin(&plugin_dir);
+
+    let mut app = start_viewport(390.0, 844.0, Os::Ios, Idiom::Phone);
+    app.wait_for("id:shell-phone").unwrap();
+    app.wait_for("id:phone-tab-bar").unwrap();
+
+    // 1. Empty local library: Home -> Browse -> repeated Browse -> Library -> Browse hits cache
+    //    so `phone-refresh-btn` remains enabled (`browse_loading == false`) without skeleton flicker.
+    app.press("id:tab-browse").unwrap();
+    app.wait_for("id:phone-refresh-btn").unwrap();
+    assert!(
+        app.screen().enabled("id:phone-refresh-btn").unwrap(),
+        "Home -> Browse must hit hydrated cache with browse_loading == false"
+    );
+
+    // Repeated switch_tab onto active Browse must be a no-op with browse_loading == false.
+    app.press("id:tab-browse").unwrap();
+    app.press("id:tab-browse").unwrap();
+    assert!(
+        app.screen().enabled("id:phone-refresh-btn").unwrap(),
+        "repeated tap on active Browse tab must keep browse_loading == false"
+    );
+
+    // Home -> Browse -> Library -> Browse cache hit.
+    app.press("id:tab-library").unwrap();
+    app.wait_for("新建歌单").unwrap();
+    app.press("id:tab-browse").unwrap();
+    app.wait_for("id:phone-refresh-btn").unwrap();
+    assert!(
+        app.screen().enabled("id:phone-refresh-btn").unwrap(),
+        "Browse -> Library -> Browse must hit cache with browse_loading == false"
+    );
+
+    // 2. Populated plugin source: install fixture plugin, switch source, and verify cached
+    //    Home -> Browse -> Library -> Browse and repeated sub-pill navigation stay instant.
+    app.press("id:tab-settings").unwrap();
+    app.wait_for("id:phone-settings-plugins").unwrap();
+    app.press("id:phone-settings-plugins").unwrap();
+    app.wait_for("id:phone-plugins-install-btn").unwrap();
+    app.press("id:phone-plugins-install-btn").unwrap();
+    app.wait_for("id:install-plugin-pick-folder").unwrap();
+
+    app.on_pick_paths(vec![plugin_dir]).unwrap();
+    app.press("id:install-plugin-pick-folder").unwrap();
+    app.wait_for("确认安装插件").unwrap();
+    app.press("role:button[确认]").unwrap();
+    app.wait_for_gone("确认安装插件", GONE_TIMEOUT).unwrap();
+    app.wait_for("Fixture Phone Auth").unwrap();
+
+    app.press("id:phone-back-btn").unwrap();
+    app.wait_for("id:tab-home").unwrap();
+    app.press("id:tab-home").unwrap();
+    app.wait_for("id:phone-source-switcher").unwrap();
+    app.press("id:phone-source-switcher").unwrap();
+    app.wait_for("切换音乐源").unwrap();
+    app.press("Fixture Phone Auth").unwrap();
+    app.wait_for_gone("切换音乐源", GONE_TIMEOUT).unwrap();
+    app.wait_for("id:phone-main-viewport >> text:Harbor Echo")
+        .unwrap();
+
+    // Home -> Browse uses cached root browse data immediately (`Harbor Echo` visible, not loading).
+    app.press("id:tab-browse").unwrap();
+    app.wait_for("id:phone-main-viewport >> text:Harbor Echo")
+        .unwrap();
+    assert!(
+        app.screen().enabled("id:phone-refresh-btn").unwrap(),
+        "plugin Home -> Browse must hit browse_cache with browse_loading == false"
+    );
+
+    // Repeated tap on Browse tab keeps content intact and browse_loading == false.
+    app.press("id:tab-browse").unwrap();
+    assert!(
+        app.screen().enabled("id:phone-refresh-btn").unwrap(),
+        "repeated Browse tap on plugin source must keep browse_loading == false"
+    );
+    assert!(
+        app.screen()
+            .matches("id:phone-main-viewport >> text:Harbor Echo")
+            .unwrap()
+    );
+
+    // Browse -> Library -> Browse hits cache immediately.
+    app.press("id:tab-library").unwrap();
+    app.wait_for("id:phone-header >> text:资料库").unwrap();
+    app.press("id:tab-browse").unwrap();
+    app.wait_for("id:phone-main-viewport >> text:Harbor Echo")
+        .unwrap();
+    assert!(
+        app.screen().enabled("id:phone-refresh-btn").unwrap(),
+        "plugin Browse -> Library -> Browse must hit browse_cache with browse_loading == false"
     );
 }

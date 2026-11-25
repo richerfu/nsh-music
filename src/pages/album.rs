@@ -1,21 +1,18 @@
-//! Album detail page with artwork + ambient wash hero, capability-gated
-//! Save Album (`store.toggle_save_album`), artist jump link, shimmer loading,
-//! and album track list.
+//! Album detail page with `600px` artwork + ambient wash hero, clickable artist
+//! credits navigating to `Route::ArtistDetail`, capability-gated Save Album
+//! (`store.toggle_save_album`), shimmer loading, and virtualized album tracks.
 
 use std::rc::Rc;
 
-use nsh_base::button;
 use nsh_core::prelude::*;
 
 use crate::pages::{
-    detail_hero, page_scroll, render_track_row, shimmer_detail_hero, shimmer_track_list,
-    shuffle_and_play, track_table_header,
+    artist_links_row, detail_hero_custom_subtitle, hero_play_shuffle_buttons, page_scroll,
+    shimmer_detail_hero, shimmer_track_list, shuffle_and_play, virtual_track_list,
 };
-use crate::state::{AppStore, Route};
-use crate::ui::{
-    DeviceForm, Icon, empty_state, format_duration_ms, ghost_button, primary_button, theme,
-};
-use crate::ui::theme::{font_size, radius};
+use crate::state::AppStore;
+use crate::ui::theme::font_size;
+use crate::ui::{DeviceForm, Icon, empty_state, format_duration_ms, ghost_button};
 
 pub fn album_page(store: AppStore, form: DeviceForm, id: String) -> View {
     let body = view().w_full().child(dynamic(move || {
@@ -27,24 +24,20 @@ pub fn album_page(store: AppStore, form: DeviceForm, id: String) -> View {
                 return view()
                     .w_full()
                     .gap_6()
-                    .child(shimmer_detail_hero(form))
-                    .child(shimmer_track_list(6))
+                    .child(shimmer_detail_hero(form, false))
+                    .child(shimmer_track_list(8))
                     .into_element();
             };
 
             let album = &page.album;
-            let artist_names: String = album
-                .artists
-                .iter()
-                .map(|a| a.name.as_str())
-                .filter(|s| !s.is_empty())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let subtitle: SharedString = if artist_names.is_empty() {
-                store.t("track.unknown_artist")
-            } else {
-                artist_names.into()
-            };
+            let subtitle_view = Some(artist_links_row(
+                store,
+                &album.artists,
+                "",
+                store.t("track.unknown_artist"),
+                font_size::BODY,
+                form,
+            ));
 
             let total_ms: i64 = page.tracks.iter().map(|t| t.duration.max(0)).sum();
             let count_str = page.tracks.len().to_string();
@@ -68,28 +61,28 @@ pub fn album_page(store: AppStore, form: DeviceForm, id: String) -> View {
             let saved_now = album.saved;
             let album_id_save = album.id.clone();
             let can_save = store.active_can("saveAlbum");
-            let can_artist = store.active_can("artist");
-            let primary_artist = album.artists.first().cloned();
 
-            let actions = view()
+            let primary_actions = hero_play_shuffle_buttons(
+                store,
+                form,
+                page.tracks.is_empty(),
+                move || {
+                    if !tracks_play.is_empty() {
+                        store.play_list(tracks_play.clone(), 0);
+                    }
+                },
+                Some(Rc::new(move || {
+                    shuffle_and_play(store, tracks_shuffle.clone());
+                })),
+            );
+            let is_phone = form.is_phone();
+            let min_h = px(form.min_touch_target());
+            let secondary = view()
                 .flex_row()
                 .items_center()
+                .when(is_phone, |v| v.w_full().justify_center())
                 .flex_wrap()
-                .gap_2p5()
-                .child(
-                    primary_button(move || store.t("player.play_all"), move || {
-                        if !tracks_play.is_empty() {
-                            store.play_list(tracks_play.clone(), 0);
-                        }
-                    })
-                    .disabled(page.tracks.is_empty()),
-                )
-                .child(
-                    ghost_button(move || store.t("player.shuffle_all"), move || {
-                        shuffle_and_play(store, tracks_shuffle.clone());
-                    })
-                    .disabled(page.tracks.is_empty()),
-                )
+                .gap_2()
                 .children(can_save.then(move || {
                     ghost_button(
                         move || {
@@ -103,45 +96,45 @@ pub fn album_page(store: AppStore, form: DeviceForm, id: String) -> View {
                             store.toggle_save_album(&album_id_save, !saved_now);
                         },
                     )
+                    .min_h(min_h)
+                    .when(is_phone, |b| b.rounded_full())
                 }))
                 .child(
-                    ghost_button(move || store.t("player.add_to_queue"), move || {
-                        for tr in &tracks_queue {
-                            store.enqueue(tr.clone());
-                        }
-                    })
+                    ghost_button(
+                        move || store.t("player.add_to_queue"),
+                        move || {
+                            for tr in &tracks_queue {
+                                store.enqueue(tr.clone());
+                            }
+                        },
+                    )
+                    .min_h(min_h)
+                    .when(is_phone, |b| b.rounded_full())
                     .disabled(page.tracks.is_empty()),
-                )
-                .children(
-                    primary_artist
-                        .filter(|a| can_artist && !a.id.is_empty())
-                        .map(|art| {
-                            let aid = art.id.clone();
-                            button()
-                                .on_press(move || {
-                                    store.navigate(Route::ArtistDetail { id: aid.clone() });
-                                })
-                                .min_h(px(form.min_touch_target()))
-                                .px_3()
-                                .py_1()
-                                .rounded(px(radius::CONTROL))
-                                .hover(|s| s.bg(theme::hover))
-                                .active(|s| s.opacity(0.75))
-                                .child(
-                                    text(art.name)
-                                        .text_size(px(font_size::BODY))
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .text_color(theme::primary),
-                                )
-                        }),
                 );
 
-            let hero = detail_hero(
+            let actions = if form.is_phone() {
+                view()
+                    .w_full()
+                    .gap_2p5()
+                    .child(primary_actions)
+                    .child(secondary)
+            } else {
+                view()
+                    .flex_row()
+                    .items_center()
+                    .flex_wrap()
+                    .gap_2p5()
+                    .child(primary_actions)
+                    .child(secondary)
+            };
+
+            let hero = detail_hero_custom_subtitle(
                 store,
                 form,
                 store.t("nav.albums"),
                 album.name.clone().into(),
-                subtitle,
+                subtitle_view,
                 meta,
                 SharedString::default(),
                 album.image_url.clone().into(),
@@ -154,28 +147,7 @@ pub fn album_page(store: AppStore, form: DeviceForm, id: String) -> View {
                 empty_state(Icon::Disc, store.t("common.empty"), store.t("nav.albums"))
             } else {
                 let queue = Rc::new(page.tracks.clone());
-                let mut rows = view().w_full().gap_1();
-                if !form.is_phone() {
-                    rows = rows.child(track_table_header(store, form, false));
-                }
-                for (idx, tr) in page.tracks.iter().enumerate() {
-                    rows = rows.child(render_track_row(
-                        store,
-                        tr.clone(),
-                        Some(idx),
-                        Rc::clone(&queue),
-                        idx,
-                        false,
-                    ));
-                }
-                view()
-                    .w_full()
-                    .p_2()
-                    .rounded(px(radius::CARD))
-                    .bg(theme::card)
-                    .border_1()
-                    .border_color(theme::border)
-                    .child(rows)
+                virtual_track_list(store, form, queue, false, false, None, None)
             };
 
             view()

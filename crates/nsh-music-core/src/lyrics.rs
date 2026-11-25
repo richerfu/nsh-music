@@ -102,7 +102,9 @@ impl ParsedLyrics {
         if !self.synced || self.lines.is_empty() {
             return None;
         }
-        let idx = self.lines.partition_point(|line| line.start_ms <= position_ms);
+        let idx = self
+            .lines
+            .partition_point(|line| line.start_ms <= position_ms);
         idx.checked_sub(1)
     }
 
@@ -156,9 +158,14 @@ impl ParsedLyrics {
             return;
         }
         if self.synced && romaji.synced {
-            align_secondary_lines(&mut self.lines, &romaji.lines, max_delta_ms, |line, text| {
-                line.romaji = Some(text);
-            });
+            align_secondary_lines(
+                &mut self.lines,
+                &romaji.lines,
+                max_delta_ms,
+                |line, text| {
+                    line.romaji = Some(text);
+                },
+            );
         } else if romaji.lines.len() == self.lines.len() {
             for (line, r) in self.lines.iter_mut().zip(romaji.lines) {
                 if !r.text.is_empty() {
@@ -173,7 +180,11 @@ impl ParsedLyrics {
         Lyrics {
             lrc: String::new(),
             translation: String::new(),
-            lines: self.lines.iter().map(ParsedLyricLine::to_model_line).collect(),
+            lines: self
+                .lines
+                .iter()
+                .map(ParsedLyricLine::to_model_line)
+                .collect(),
         }
     }
 }
@@ -348,10 +359,7 @@ pub fn parse_lrc(input: &str) -> ParsedLyrics {
         // 3. Standard / Enhanced LRC bracket tags: [mm:ss.xx] or [key:value]
         match parse_lrc_line(line, &mut meta) {
             LrcLineResult::Metadata => continue,
-            LrcLineResult::Timed {
-                lines,
-                breaks,
-            } => {
+            LrcLineResult::Timed { lines, breaks } => {
                 timed_lines.extend(lines);
                 break_timestamps.extend(breaks);
             }
@@ -443,10 +451,7 @@ fn infer_end_times(lines: &mut [ParsedLyricLine], break_timestamps: &[i64]) {
     for i in 0..len {
         let start = lines[i].start_ms;
         let next_line_start = lines.get(i + 1).map(|n| n.start_ms);
-        let next_break = break_timestamps
-            .iter()
-            .copied()
-            .find(|&b| b > start);
+        let next_break = break_timestamps.iter().copied().find(|&b| b > start);
 
         let boundary = match (next_line_start, next_break) {
             (Some(a), Some(b)) => Some(a.min(b)),
@@ -456,11 +461,7 @@ fn infer_end_times(lines: &mut [ParsedLyricLine], break_timestamps: &[i64]) {
         };
 
         if lines[i].end_ms <= start {
-            let word_end = lines[i]
-                .words
-                .last()
-                .map(|w| w.end)
-                .filter(|&e| e > start);
+            let word_end = lines[i].words.last().map(|w| w.end).filter(|&e| e > start);
             lines[i].end_ms = word_end
                 .or(boundary)
                 .unwrap_or_else(|| start.saturating_add(5_000));
@@ -1092,9 +1093,30 @@ mod tests {
         assert_eq!(line.start_ms, 12_000);
         assert_eq!(line.end_ms, 14_000);
         assert_eq!(line.words.len(), 3);
-        assert_eq!(line.words[0], LyricWord { start: 12_000, end: 12_500, text: "Night ".into() });
-        assert_eq!(line.words[1], LyricWord { start: 12_500, end: 13_200, text: "falls ".into() });
-        assert_eq!(line.words[2], LyricWord { start: 13_200, end: 14_000, text: "softly".into() });
+        assert_eq!(
+            line.words[0],
+            LyricWord {
+                start: 12_000,
+                end: 12_500,
+                text: "Night ".into()
+            }
+        );
+        assert_eq!(
+            line.words[1],
+            LyricWord {
+                start: 12_500,
+                end: 13_200,
+                text: "falls ".into()
+            }
+        );
+        assert_eq!(
+            line.words[2],
+            LyricWord {
+                start: 13_200,
+                end: 14_000,
+                text: "softly".into()
+            }
+        );
 
         let pos = parsed.active_position(12_850).expect("active position");
         assert_eq!(pos.line_index, 0);

@@ -128,8 +128,14 @@ impl RequestHeadersResolver {
             keys.sort();
             for key in keys {
                 let raw_val = &rule.headers[key];
-                let expanded =
-                    expand_template(raw_val, config, effective_cookie, url, host.unwrap_or(""), &origin);
+                let expanded = expand_template(
+                    raw_val,
+                    config,
+                    effective_cookie,
+                    url,
+                    host.unwrap_or(""),
+                    &origin,
+                );
                 if raw_val.contains("{{") && expanded.trim().is_empty() {
                     continue;
                 }
@@ -270,7 +276,10 @@ mod tests {
                 match_pattern: "*.hdslb.com".to_owned(),
                 hosts: vec![],
                 kinds: vec![HeaderRequestKind::Image],
-                headers: HashMap::from([("Referer".to_owned(), "https://www.bilibili.com/".to_owned())]),
+                headers: HashMap::from([(
+                    "Referer".to_owned(),
+                    "https://www.bilibili.com/".to_owned(),
+                )]),
             },
             HeaderRule {
                 match_pattern: "*.bilivideo.com".to_owned(),
@@ -279,7 +288,10 @@ mod tests {
                 headers: HashMap::from([
                     ("Referer".to_owned(), "https://www.bilibili.com/".to_owned()),
                     ("Cookie".to_owned(), "{{cookie}}".to_owned()),
-                    ("X-Token".to_owned(), "Bearer {{config.apiToken}}".to_owned()),
+                    (
+                        "X-Token".to_owned(),
+                        "Bearer {{config.apiToken}}".to_owned(),
+                    ),
                 ]),
             },
         ]);

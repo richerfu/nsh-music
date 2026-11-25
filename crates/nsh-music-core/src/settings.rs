@@ -64,6 +64,7 @@ pub struct AppSettings {
     pub cache_max_mb: u64,
     pub default_player_style: PlayerStyle,
     pub default_stage_style: StageStyle,
+    pub lyrics_stage: bool,
     pub hot_comments: bool,
     pub stage_sparks: bool,
     pub fog_backdrop: bool,
@@ -89,6 +90,7 @@ impl Default for AppSettings {
             cache_max_mb: 1024,
             default_player_style: PlayerStyle::Cover,
             default_stage_style: StageStyle::Flow,
+            lyrics_stage: false,
             hot_comments: true,
             stage_sparks: true,
             fog_backdrop: true,
@@ -167,11 +169,7 @@ impl AppSettings {
     }
 
     /// Sets the persisted JSON configuration value for `plugin_id`.
-    pub fn set_plugin_config(
-        &mut self,
-        plugin_id: impl Into<String>,
-        config: serde_json::Value,
-    ) {
+    pub fn set_plugin_config(&mut self, plugin_id: impl Into<String>, config: serde_json::Value) {
         self.plugin_configs.insert(plugin_id.into(), config);
     }
 
@@ -257,7 +255,10 @@ mod tests {
     fn temp_file_path(name: &str) -> PathBuf {
         let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir()
-            .join(format!("nsh-music-core-settings-test-{}-{seq}", std::process::id()))
+            .join(format!(
+                "nsh-music-core-settings-test-{}-{seq}",
+                std::process::id()
+            ))
             .join(name)
     }
 
@@ -285,6 +286,7 @@ mod tests {
             cache_max_mb: 2048,
             default_player_style: PlayerStyle::Vinyl,
             default_stage_style: StageStyle::Tilt,
+            lyrics_stage: true,
             ffmpeg_path: Some(PathBuf::from("/opt/homebrew/bin/ffmpeg")),
             ..AppSettings::default()
         };
@@ -303,7 +305,10 @@ mod tests {
         assert!(reloaded.is_plugin_enabled("netease"));
         assert!(!reloaded.is_plugin_enabled("bilibili"));
         assert_eq!(
-            reloaded.plugin_config("netease").and_then(|v| v.get("quality")).and_then(|v| v.as_str()),
+            reloaded
+                .plugin_config("netease")
+                .and_then(|v| v.get("quality"))
+                .and_then(|v| v.as_str()),
             Some("lossless")
         );
 

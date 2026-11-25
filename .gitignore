@@ -1,4 +1,5 @@
 /target
 /.nsh
+/.hvigor
 *.part
 .DS_Store

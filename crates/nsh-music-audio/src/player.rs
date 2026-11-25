@@ -1,5 +1,4 @@
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -10,11 +9,16 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
 use crate::cache::{AudioCache, StreamCacheConfig};
-use crate::decoder::{AudioDecoder, DecoderPreference, open_decoder};
-use crate::dsp::{DspConfig, DspProcessor, SPECTRUM_BANDS, mix_crossfade};
+use crate::decoder::{
+    AudioDecoder, AudioSpec, DecoderPreference, infer_extension_hint, open_decoder,
+};
+use crate::dsp::{DspConfig, DspProcessor, SPECTRUM_BANDS, mix_crossfade_in_place};
 use crate::output::{AudioOutput, OutputConfig, default_audio_output};
 use crate::remote::{RemoteCommand, RemoteController};
 use crate::{AudioError, AudioResult};
+
+/// Fixed power-of-two capacity for the pre-allocated PCM ring buffer (~1.36s stereo @ 48kHz).
+const PCM_RING_CAPACITY: usize = 131_072;
 
 /// High-level player transport state.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -57,6 +61,8 @@ pub struct PlaybackSnapshot {
     pub shuffle: bool,
     pub repeat: RepeatMode,
     pub quality: Quality,
+    pub is_lossless: bool,
+    pub stream_format: String,
     pub replay_gain_enabled: bool,
     pub crossfade_ms: u32,
     pub decoder_backend: String,
@@ -78,6 +84,8 @@ impl Default for PlaybackSnapshot {
             shuffle: false,
             repeat: RepeatMode::Off,
             quality: Quality::High,
+            is_lossless: false,
+            stream_format: String::new(),
             replay_gain_enabled: true,
             crossfade_ms: 0,
             decoder_backend: String::new(),
@@ -162,50 +170,207 @@ enum EngineCommand {
     Shutdown,
 }
 
-struct AudioRenderShared {
-    ring: VecDeque<f32>,
-    dsp: DspProcessor,
-    output_config: OutputConfig,
-    playing: bool,
-    decoder_eof: bool,
-    played_frames_since_seek: u64,
-    base_position_ms: u64,
-    latest_spectrum: [f32; SPECTRUM_BANDS],
-    track_ended_flag: bool,
+/// Pre-allocated fixed-capacity circular buffer supporting bulk `copy_from_slice`
+/// transfer with zero heap reallocations during playback.
+pub(crate) struct FixedPcmRing {
+    buf: Box<[f32]>,
+    mask: usize,
+    read_idx: usize,
+    write_idx: usize,
+    len: usize,
 }
 
-impl AudioRenderShared {
-    fn new(config: &AudioEngineConfig) -> Self {
-        let dsp_cfg = DspConfig {
-            volume: config.initial_volume.clamp(0.0, 1.0),
-            replay_gain_enabled: config.replay_gain_enabled,
-            ..DspConfig::default()
-        };
+impl FixedPcmRing {
+    pub(crate) fn new(capacity: usize) -> Self {
+        let cap = capacity.next_power_of_two().max(1024);
         Self {
-            ring: VecDeque::with_capacity(44_100 * 2),
-            dsp: DspProcessor::new(dsp_cfg),
-            output_config: OutputConfig::default(),
-            playing: false,
-            decoder_eof: false,
-            played_frames_since_seek: 0,
-            base_position_ms: 0,
-            latest_spectrum: [0.0; SPECTRUM_BANDS],
-            track_ended_flag: false,
+            buf: vec![0.0f32; cap].into_boxed_slice(),
+            mask: cap - 1,
+            read_idx: 0,
+            write_idx: 0,
+            len: 0,
         }
     }
 
-    fn current_position_ms(&self) -> u64 {
-        let rate = self.output_config.sample_rate.max(1) as u64;
-        self.base_position_ms
-            .saturating_add(self.played_frames_since_seek.saturating_mul(1000) / rate)
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.len
     }
 
-    fn clear_ring(&mut self, base_position_ms: u64) {
-        self.ring.clear();
-        self.base_position_ms = base_position_ms;
-        self.played_frames_since_seek = 0;
-        self.decoder_eof = false;
-        self.track_ended_flag = false;
+    #[inline]
+    pub(crate) fn free_space(&self) -> usize {
+        self.buf.len() - self.len
+    }
+
+    #[inline]
+    pub(crate) fn clear(&mut self) {
+        self.read_idx = 0;
+        self.write_idx = 0;
+        self.len = 0;
+    }
+
+    pub(crate) fn push_slice(&mut self, data: &[f32]) -> usize {
+        let to_copy = data.len().min(self.free_space());
+        if to_copy == 0 {
+            return 0;
+        }
+        let cap = self.buf.len();
+        let first = to_copy.min(cap - self.write_idx);
+        self.buf[self.write_idx..self.write_idx + first].copy_from_slice(&data[..first]);
+        let second = to_copy - first;
+        if second > 0 {
+            self.buf[..second].copy_from_slice(&data[first..to_copy]);
+        }
+        self.write_idx = (self.write_idx + to_copy) & self.mask;
+        self.len += to_copy;
+        to_copy
+    }
+
+    pub(crate) fn pop_slice(&mut self, out: &mut [f32]) -> usize {
+        let to_copy = out.len().min(self.len);
+        if to_copy == 0 {
+            return 0;
+        }
+        let cap = self.buf.len();
+        let first = to_copy.min(cap - self.read_idx);
+        out[..first].copy_from_slice(&self.buf[self.read_idx..self.read_idx + first]);
+        let second = to_copy - first;
+        if second > 0 {
+            out[first..to_copy].copy_from_slice(&self.buf[..second]);
+        }
+        self.read_idx = (self.read_idx + to_copy) & self.mask;
+        self.len -= to_copy;
+        to_copy
+    }
+
+    pub(crate) fn drain_into(&mut self, dst: &mut Vec<f32>, max_samples: usize) {
+        let to_copy = max_samples.min(self.len);
+        if to_copy == 0 {
+            return;
+        }
+        let start = dst.len();
+        dst.resize(start + to_copy, 0.0);
+        let popped = self.pop_slice(&mut dst[start..]);
+        dst.truncate(start + popped);
+    }
+}
+
+/// Lock-free atomic bridge shared between the real-time audio render callback,
+/// the background `EngineActor`, and UI callers (`spectrum()`, `position_ms()`).
+///
+/// Keeping all DSP controls, transport flags, playback position, and 16-band
+/// spectrum levels in atomics avoids holding mutexes during DSP/FFT or UI polling.
+struct AudioAtomics {
+    playing: AtomicBool,
+    decoder_eof: AtomicBool,
+    track_ended: AtomicBool,
+    sample_rate: AtomicU32,
+    channels: AtomicU32,
+    base_position_ms: AtomicU64,
+    played_frames_since_seek: AtomicU64,
+    ring_len: AtomicUsize,
+
+    dsp_gen: AtomicU64,
+    volume_bits: AtomicU32,
+    muted: AtomicBool,
+    rg_gain_bits: AtomicU32,
+    rg_peak_bits: AtomicU32,
+    rg_enabled: AtomicBool,
+    pending_fade_in_ms: AtomicU32,
+    pending_dsp_reset: AtomicBool,
+
+    spectrum_bits: [AtomicU32; SPECTRUM_BANDS],
+    spectrum_dirty: AtomicBool,
+    snapshot_version: AtomicU64,
+}
+
+impl AudioAtomics {
+    fn new(config: &AudioEngineConfig) -> Self {
+        Self {
+            playing: AtomicBool::new(false),
+            decoder_eof: AtomicBool::new(false),
+            track_ended: AtomicBool::new(false),
+            sample_rate: AtomicU32::new(44_100),
+            channels: AtomicU32::new(2),
+            base_position_ms: AtomicU64::new(0),
+            played_frames_since_seek: AtomicU64::new(0),
+            ring_len: AtomicUsize::new(0),
+
+            dsp_gen: AtomicU64::new(1),
+            volume_bits: AtomicU32::new(config.initial_volume.clamp(0.0, 1.0).to_bits()),
+            muted: AtomicBool::new(false),
+            rg_gain_bits: AtomicU32::new(0.0f32.to_bits()),
+            rg_peak_bits: AtomicU32::new(1.0f32.to_bits()),
+            rg_enabled: AtomicBool::new(config.replay_gain_enabled),
+            pending_fade_in_ms: AtomicU32::new(0),
+            pending_dsp_reset: AtomicBool::new(false),
+
+            spectrum_bits: std::array::from_fn(|_| AtomicU32::new(0.0f32.to_bits())),
+            spectrum_dirty: AtomicBool::new(false),
+            snapshot_version: AtomicU64::new(1),
+        }
+    }
+
+    #[inline]
+    fn current_position_ms(&self) -> u64 {
+        let rate = self.sample_rate.load(Ordering::Relaxed).max(1) as u64;
+        let base = self.base_position_ms.load(Ordering::Acquire);
+        let frames = self.played_frames_since_seek.load(Ordering::Relaxed);
+        base.saturating_add(frames.saturating_mul(1000) / rate)
+    }
+
+    #[inline]
+    fn read_spectrum(&self) -> [f32; SPECTRUM_BANDS] {
+        std::array::from_fn(|i| f32::from_bits(self.spectrum_bits[i].load(Ordering::Relaxed)))
+    }
+
+    #[inline]
+    fn write_spectrum(&self, bands: &[f32; SPECTRUM_BANDS]) {
+        for (slot, &val) in self.spectrum_bits.iter().zip(bands.iter()) {
+            slot.store(val.to_bits(), Ordering::Relaxed);
+        }
+        self.spectrum_dirty.store(true, Ordering::Release);
+    }
+
+    fn clear_spectrum(&self) {
+        let zeros = [0.0f32; SPECTRUM_BANDS];
+        self.write_spectrum(&zeros);
+    }
+
+    fn set_volume(&self, volume: f32) {
+        self.volume_bits
+            .store(volume.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+        self.dsp_gen.fetch_add(1, Ordering::Release);
+    }
+
+    fn set_muted(&self, muted: bool) {
+        self.muted.store(muted, Ordering::Relaxed);
+        self.dsp_gen.fetch_add(1, Ordering::Release);
+    }
+
+    fn set_replay_gain(&self, gain_db: f32, peak: f32, enabled: bool) {
+        self.rg_gain_bits
+            .store(gain_db.to_bits(), Ordering::Relaxed);
+        self.rg_peak_bits.store(peak.to_bits(), Ordering::Relaxed);
+        self.rg_enabled.store(enabled, Ordering::Relaxed);
+        self.dsp_gen.fetch_add(1, Ordering::Release);
+    }
+
+    fn trigger_fade_in(&self, duration_ms: u32) {
+        self.pending_fade_in_ms
+            .store(duration_ms, Ordering::Release);
+    }
+
+    fn request_dsp_reset(&self) {
+        self.pending_dsp_reset.store(true, Ordering::Release);
+    }
+
+    fn reset_timeline(&self, base_position_ms: u64) {
+        self.base_position_ms
+            .store(base_position_ms, Ordering::Release);
+        self.played_frames_since_seek.store(0, Ordering::Release);
+        self.decoder_eof.store(false, Ordering::Release);
+        self.track_ended.store(false, Ordering::Release);
     }
 }
 
@@ -213,6 +378,7 @@ struct EngineSignals {
     state_tx: watch::Sender<PlaybackSnapshot>,
     spectrum_tx: watch::Sender<[f32; SPECTRUM_BANDS]>,
     state_callbacks: Mutex<Vec<StateChangeCallback>>,
+    atomics: Arc<AudioAtomics>,
 }
 
 struct AudioEngineInner {
@@ -288,10 +454,12 @@ impl AudioEngine {
         let (cmd_tx, cmd_rx) = mpsc::channel::<EngineCommand>();
         let (state_tx, _) = watch::channel(initial_snapshot.clone());
         let (spectrum_tx, _) = watch::channel([0.0f32; SPECTRUM_BANDS]);
+        let atomics = Arc::new(AudioAtomics::new(&config));
         let signals = Arc::new(EngineSignals {
             state_tx,
             spectrum_tx,
             state_callbacks: Mutex::new(Vec::new()),
+            atomics: Arc::clone(&atomics),
         });
 
         let inner = Arc::new(AudioEngineInner {
@@ -339,7 +507,7 @@ impl AudioEngine {
                 RemoteCommand::Prev => engine.prev_track(),
                 RemoteCommand::Seek(ms) => engine.seek(ms),
                 RemoteCommand::SeekRelative(delta_ms) => {
-                    let cur = engine.snapshot().position_ms as i64;
+                    let cur = engine.position_ms() as i64;
                     engine.seek(cur.saturating_add(delta_ms).max(0) as u64);
                 }
                 RemoteCommand::SetVolume(pct) => {
@@ -381,9 +549,24 @@ impl AudioEngine {
         self.inner.signals.state_tx.borrow().clone()
     }
 
-    /// Returns the latest 16-band spectrum levels (`0.0..=1.0`).
+    /// Lock-free monotonic counter incremented whenever [`snapshot`](Self::snapshot) changes.
+    /// UI pollers can compare this before cloning `PlaybackSnapshot`.
+    pub fn snapshot_version(&self) -> u64 {
+        self.inner
+            .signals
+            .atomics
+            .snapshot_version
+            .load(Ordering::Acquire)
+    }
+
+    /// Lock-free live playback position in milliseconds directly from audio frame counters.
+    pub fn position_ms(&self) -> u64 {
+        self.inner.signals.atomics.current_position_ms()
+    }
+
+    /// Lock-free read of the latest 16-band spectrum levels (`0.0..=1.0`).
     pub fn spectrum(&self) -> [f32; SPECTRUM_BANDS] {
-        *self.inner.signals.spectrum_tx.borrow()
+        self.inner.signals.atomics.read_spectrum()
     }
 
     /// Subscribes to playback state snapshots via `tokio::sync::watch`.
@@ -564,7 +747,8 @@ struct EngineActor {
     remote: RemoteController,
     snapshot: PlaybackSnapshot,
     signals: Arc<EngineSignals>,
-    shared: Arc<Mutex<AudioRenderShared>>,
+    ring: Arc<Mutex<FixedPcmRing>>,
+    atomics: Arc<AudioAtomics>,
     decoder: Option<Box<dyn AudioDecoder>>,
     stream_resolver: Option<StreamResolver>,
     radio_refill: Option<RadioRefillCallback>,
@@ -572,10 +756,14 @@ struct EngineActor {
     shuffle_cursor: usize,
     shuffle_seed: u64,
     pcm_scratch: Vec<f32>,
+    channel_scratch: Vec<f32>,
     resampled_scratch: Vec<f32>,
+    overflow_pcm: Vec<f32>,
+    overflow_offset: usize,
     crossfade_tail: Vec<f32>,
     crossfade_pos: usize,
     last_position_publish: Instant,
+    last_published_spectrum: [f32; SPECTRUM_BANDS],
     last_prefetched_id: Option<String>,
 }
 
@@ -588,7 +776,8 @@ impl EngineActor {
         snapshot: PlaybackSnapshot,
         signals: Arc<EngineSignals>,
     ) -> Self {
-        let shared = Arc::new(Mutex::new(AudioRenderShared::new(&config)));
+        let atomics = Arc::clone(&signals.atomics);
+        let ring = Arc::new(Mutex::new(FixedPcmRing::new(PCM_RING_CAPACITY)));
         Self {
             config,
             output,
@@ -598,7 +787,8 @@ impl EngineActor {
             remote,
             snapshot,
             signals,
-            shared,
+            ring,
+            atomics,
             decoder: None,
             stream_resolver: None,
             radio_refill: None,
@@ -606,40 +796,87 @@ impl EngineActor {
             shuffle_cursor: 0,
             shuffle_seed: 0x9e37_79b9_7f4a_7c15,
             pcm_scratch: Vec::with_capacity(8192),
+            channel_scratch: Vec::with_capacity(8192),
             resampled_scratch: Vec::with_capacity(8192),
+            overflow_pcm: Vec::with_capacity(4096),
+            overflow_offset: 0,
             crossfade_tail: Vec::new(),
             crossfade_pos: 0,
             last_position_publish: Instant::now(),
+            last_published_spectrum: [0.0; SPECTRUM_BANDS],
             last_prefetched_id: None,
         }
     }
 
     fn run(&mut self, rx: Receiver<EngineCommand>) {
         loop {
-            let timeout = if self.snapshot.status.is_playing() {
-                Duration::from_millis(12)
-            } else {
-                Duration::from_millis(40)
-            };
-
-            match rx.recv_timeout(timeout) {
-                Ok(cmd) => {
-                    if self.handle_command(cmd) {
-                        break;
-                    }
-                    // Drain any queued commands before pumping PCM for snappy UI controls.
-                    while let Ok(next_cmd) = rx.try_recv() {
-                        if self.handle_command(next_cmd) {
-                            let _ = self.output.stop();
-                            return;
+            if self.snapshot.status.is_playing() {
+                match rx.recv_timeout(Duration::from_millis(16)) {
+                    Ok(cmd) => {
+                        if self.handle_command(cmd) {
+                            break;
+                        }
+                        while let Ok(next_cmd) = rx.try_recv() {
+                            if self.handle_command(next_cmd) {
+                                let _ = self.output.stop();
+                                return;
+                            }
                         }
                     }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => break,
                 }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => break,
+                self.tick_audio();
+            } else if self.last_published_spectrum.iter().any(|&v| v > 0.001) {
+                // Smoothly decay spectrum bars to zero after pausing, then park completely.
+                match rx.recv_timeout(Duration::from_millis(33)) {
+                    Ok(cmd) => {
+                        if self.handle_command(cmd) {
+                            break;
+                        }
+                        while let Ok(next_cmd) = rx.try_recv() {
+                            if self.handle_command(next_cmd) {
+                                let _ = self.output.stop();
+                                return;
+                            }
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => {
+                        for b in &mut self.last_published_spectrum {
+                            *b *= 0.72;
+                            if *b < 0.002 {
+                                *b = 0.0;
+                            }
+                        }
+                        self.atomics.write_spectrum(&self.last_published_spectrum);
+                        self.atomics.spectrum_dirty.store(false, Ordering::Relaxed);
+                        let _ = self
+                            .signals
+                            .spectrum_tx
+                            .send_replace(self.last_published_spectrum);
+                    }
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            } else {
+                // Idle/paused with zeroed spectrum: block with 0 wakeups and ~0% CPU.
+                match rx.recv() {
+                    Ok(cmd) => {
+                        if self.handle_command(cmd) {
+                            break;
+                        }
+                        while let Ok(next_cmd) = rx.try_recv() {
+                            if self.handle_command(next_cmd) {
+                                let _ = self.output.stop();
+                                return;
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+                if self.snapshot.status.is_playing() {
+                    self.tick_audio();
+                }
             }
-
-            self.tick_audio();
         }
         let _ = self.output.stop();
     }
@@ -720,24 +957,18 @@ impl EngineActor {
             }
             EngineCommand::SetVolume(vol) => {
                 self.snapshot.volume = vol.clamp(0.0, 1.0);
-                if let Ok(mut shared) = self.shared.lock() {
-                    shared.dsp.set_volume(self.snapshot.volume);
-                }
+                self.atomics.set_volume(self.snapshot.volume);
                 self.publish_snapshot();
             }
             EngineCommand::SetMuted(muted) => {
                 self.snapshot.muted = muted;
-                if let Ok(mut shared) = self.shared.lock() {
-                    shared.dsp.set_muted(muted);
-                }
+                self.atomics.set_muted(muted);
                 self.publish_snapshot();
             }
             EngineCommand::ToggleMute => {
                 let next = !self.snapshot.muted;
                 self.snapshot.muted = next;
-                if let Ok(mut shared) = self.shared.lock() {
-                    shared.dsp.set_muted(next);
-                }
+                self.atomics.set_muted(next);
                 self.publish_snapshot();
             }
             EngineCommand::SetShuffle(enabled) => {
@@ -770,9 +1001,7 @@ impl EngineActor {
             }
             EngineCommand::SetReplayGainEnabled(enabled) => {
                 self.snapshot.replay_gain_enabled = enabled;
-                if let Ok(mut shared) = self.shared.lock() {
-                    shared.dsp.set_replay_gain(0.0, 1.0, enabled);
-                }
+                self.atomics.set_replay_gain(0.0, 1.0, enabled);
                 self.publish_snapshot();
             }
             EngineCommand::SetCrossfadeMs(ms) => {
@@ -863,48 +1092,109 @@ impl EngineActor {
         false
     }
 
+    fn clear_ring_and_timeline(&mut self, base_position_ms: u64) {
+        self.overflow_pcm.clear();
+        self.overflow_offset = 0;
+        if let Ok(mut ring) = self.ring.lock() {
+            ring.clear();
+        }
+        self.atomics.ring_len.store(0, Ordering::Release);
+        self.atomics.reset_timeline(base_position_ms);
+    }
+
     fn ensure_output_started(&mut self, desired: OutputConfig) -> AudioResult<()> {
         if self.output_started {
             let _ = self.output.resume();
             return Ok(());
         }
 
-        let shared = Arc::clone(&self.shared);
+        let ring = Arc::clone(&self.ring);
+        let atomics = Arc::clone(&self.atomics);
+        let initial_dsp_cfg = DspConfig {
+            sample_rate: desired.sample_rate,
+            channels: desired.channels,
+            volume: self.snapshot.volume,
+            muted: self.snapshot.muted,
+            replay_gain_enabled: self.snapshot.replay_gain_enabled,
+            ..DspConfig::default()
+        };
+
+        // The audio render callback owns `DspProcessor` exclusively (zero mutex around DSP/FFT),
+        // uses non-blocking `try_lock` solely for a sub-microsecond bulk ring memcpy, and
+        // communicates all telemetry & controls via lock-free atomics.
+        let mut dsp = DspProcessor::new(initial_dsp_cfg);
+        let mut seen_dsp_gen = 0u64;
+        let mut seen_rate = desired.sample_rate;
+        let mut seen_channels = desired.channels;
+
         let negotiated = self.output.start(
             desired,
             Box::new(move |out: &mut [f32]| {
                 out.fill(0.0);
-                let Ok(mut guard) = shared.lock() else {
-                    return;
-                };
-                if !guard.playing {
-                    guard.dsp.decay_spectrum(0.84);
-                    guard.latest_spectrum = guard.dsp.spectrum();
+
+                if atomics.pending_dsp_reset.swap(false, Ordering::AcqRel) {
+                    dsp.reset();
+                }
+
+                let sr = atomics.sample_rate.load(Ordering::Relaxed).max(8_000);
+                let ch_u16 = atomics.channels.load(Ordering::Relaxed).max(1) as u16;
+                if sr != seen_rate || ch_u16 != seen_channels {
+                    dsp.configure_stream(sr, ch_u16);
+                    seen_rate = sr;
+                    seen_channels = ch_u16;
+                }
+
+                let cur_gen = atomics.dsp_gen.load(Ordering::Acquire);
+                if cur_gen != seen_dsp_gen {
+                    dsp.set_volume(f32::from_bits(atomics.volume_bits.load(Ordering::Relaxed)));
+                    dsp.set_muted(atomics.muted.load(Ordering::Relaxed));
+                    dsp.set_replay_gain(
+                        f32::from_bits(atomics.rg_gain_bits.load(Ordering::Relaxed)),
+                        f32::from_bits(atomics.rg_peak_bits.load(Ordering::Relaxed)),
+                        atomics.rg_enabled.load(Ordering::Relaxed),
+                    );
+                    seen_dsp_gen = cur_gen;
+                }
+
+                let fade_ms = atomics.pending_fade_in_ms.swap(0, Ordering::AcqRel);
+                if fade_ms > 0 {
+                    dsp.trigger_fade_in(fade_ms);
+                }
+
+                if !atomics.playing.load(Ordering::Acquire) {
                     return;
                 }
 
-                let mut written = 0usize;
-                while written < out.len() {
-                    if let Some(sample) = guard.ring.pop_front() {
-                        out[written] = sample;
-                        written += 1;
-                    } else {
-                        break;
+                let written = match ring.try_lock() {
+                    Ok(mut guard) => {
+                        let n = guard.pop_slice(out);
+                        atomics.ring_len.store(guard.len(), Ordering::Release);
+                        n
                     }
-                }
+                    Err(_) => {
+                        // Producer is copying a chunk (<1us); output silence rather than
+                        // blocking CoreAudio/WASAPI/AAudio/OHAudio real-time I/O thread.
+                        return;
+                    }
+                };
 
-                let ch = (guard.output_config.channels as usize).max(1);
+                let ch = (ch_u16 as usize).max(1);
                 if written > 0 {
-                    guard.played_frames_since_seek += (written / ch) as u64;
-                    guard.dsp.process_interleaved(out);
-                    guard.latest_spectrum = guard.dsp.spectrum();
-                } else if guard.decoder_eof {
-                    guard.track_ended_flag = true;
-                    guard.dsp.decay_spectrum(0.8);
-                    guard.latest_spectrum = guard.dsp.spectrum();
+                    atomics
+                        .played_frames_since_seek
+                        .fetch_add((written / ch) as u64, Ordering::Relaxed);
+                    dsp.process_interleaved(out);
+                    let spec = dsp.spectrum();
+                    atomics.write_spectrum(&spec);
+                } else if atomics.decoder_eof.load(Ordering::Acquire) {
+                    atomics.track_ended.store(true, Ordering::Release);
+                    dsp.decay_spectrum(0.8);
+                    let spec = dsp.spectrum();
+                    atomics.write_spectrum(&spec);
                 } else {
-                    guard.dsp.decay_spectrum(0.9);
-                    guard.latest_spectrum = guard.dsp.spectrum();
+                    dsp.decay_spectrum(0.9);
+                    let spec = dsp.spectrum();
+                    atomics.write_spectrum(&spec);
                 }
             }),
         )?;
@@ -912,12 +1202,12 @@ impl EngineActor {
         self.output_started = true;
         self.output_config = negotiated;
         self.snapshot.output_backend = self.output.backend_name().to_owned();
-        if let Ok(mut guard) = self.shared.lock() {
-            guard.output_config = negotiated;
-            guard
-                .dsp
-                .configure_stream(negotiated.sample_rate, negotiated.channels);
-        }
+        self.atomics
+            .sample_rate
+            .store(negotiated.sample_rate, Ordering::Release);
+        self.atomics
+            .channels
+            .store(negotiated.channels as u32, Ordering::Release);
         Ok(())
     }
 
@@ -938,14 +1228,14 @@ impl EngineActor {
         self.crossfade_pos = 0;
         if self.snapshot.crossfade_ms > 0
             && self.snapshot.status.is_playing()
-            && let Ok(mut guard) = self.shared.lock()
+            && let Ok(mut ring) = self.ring.lock()
         {
             let max_xfade_samples = ((self.snapshot.crossfade_ms as usize)
-                * (guard.output_config.sample_rate as usize)
+                * (self.output_config.sample_rate as usize)
                 / 1000)
-                * (guard.output_config.channels as usize).max(1);
-            let take_len = guard.ring.len().min(max_xfade_samples);
-            self.crossfade_tail.extend(guard.ring.drain(..take_len));
+                * (self.output_config.channels as usize).max(1);
+            ring.drain_into(&mut self.crossfade_tail, max_xfade_samples);
+            self.atomics.ring_len.store(ring.len(), Ordering::Release);
         }
 
         self.snapshot.current_track = Some(track.clone());
@@ -953,6 +1243,8 @@ impl EngineActor {
         self.snapshot.position_ms = 0;
         self.snapshot.duration_ms = track.duration.max(0) as u64;
         self.snapshot.buffered_ms = 0;
+        self.snapshot.is_lossless = false;
+        self.snapshot.stream_format.clear();
         self.publish_snapshot();
 
         let resolved = match explicit_stream {
@@ -961,14 +1253,26 @@ impl EngineActor {
         };
 
         let stream_info = match resolved {
-            Ok(info) => info,
+            Ok(info) => {
+                log::info!(
+                    "resolved stream for '{}' ({}): target={} media_type={:?}",
+                    track.name,
+                    track.id,
+                    sanitize_url_for_log(&info.url),
+                    info.media_type
+                );
+                info
+            }
             Err(err) => {
+                log::warn!(
+                    "failed to resolve stream for '{}' ({}): {err}",
+                    track.name,
+                    track.id
+                );
                 self.decoder = None;
                 self.snapshot.status = PlaybackStatus::Error(err);
-                if let Ok(mut guard) = self.shared.lock() {
-                    guard.playing = false;
-                    guard.clear_ring(0);
-                }
+                self.atomics.playing.store(false, Ordering::Release);
+                self.clear_ring_and_timeline(0);
                 self.publish_snapshot();
                 return;
             }
@@ -1000,12 +1304,16 @@ impl EngineActor {
         ) {
             Ok(dec) => dec,
             Err(err) => {
+                log::warn!(
+                    "failed to open decoder for '{}' ({}) target={}: {err}",
+                    track.name,
+                    track.id,
+                    sanitize_url_for_log(&stream_info.url)
+                );
                 self.decoder = None;
                 self.snapshot.status = PlaybackStatus::Error(err.to_string());
-                if let Ok(mut guard) = self.shared.lock() {
-                    guard.playing = false;
-                    guard.clear_ring(0);
-                }
+                self.atomics.playing.store(false, Ordering::Release);
+                self.clear_ring_and_timeline(0);
                 self.publish_snapshot();
                 return;
             }
@@ -1022,6 +1330,9 @@ impl EngineActor {
             return;
         }
 
+        let (is_lossless, stream_format) =
+            classify_stream_format(&stream_info, &spec, self.snapshot.quality);
+
         let duration_ms = spec
             .duration_ms
             .filter(|&d| d > 0)
@@ -1030,27 +1341,28 @@ impl EngineActor {
         self.snapshot.duration_ms = duration_ms;
         self.snapshot.position_ms = 0;
         self.snapshot.buffered_ms = duration_ms;
+        self.snapshot.is_lossless = is_lossless;
+        self.snapshot.stream_format = stream_format;
         self.snapshot.decoder_backend = decoder.backend_name().to_owned();
         self.snapshot.status = PlaybackStatus::Playing;
         self.decoder = Some(decoder);
 
-        if let Ok(mut guard) = self.shared.lock() {
-            guard.clear_ring(0);
-            guard.dsp.set_replay_gain(
-                stream_info.gain as f32,
-                if stream_info.peak > 0.0 {
-                    stream_info.peak as f32
-                } else {
-                    1.0
-                },
-                self.snapshot.replay_gain_enabled,
-            );
-            guard.dsp.trigger_fade_in(12);
-            guard.playing = true;
-        }
+        self.atomics.playing.store(false, Ordering::Release);
+        self.clear_ring_and_timeline(0);
+        self.atomics.set_replay_gain(
+            stream_info.gain as f32,
+            if stream_info.peak > 0.0 {
+                stream_info.peak as f32
+            } else {
+                1.0
+            },
+            self.snapshot.replay_gain_enabled,
+        );
+        self.atomics.trigger_fade_in(12);
 
-        // Prime ring buffer immediately before publishing Playing state.
+        // Prime ring buffer immediately before enabling playback so first callback never underruns.
         self.fill_decoder_buffer();
+        self.atomics.playing.store(true, Ordering::Release);
         self.publish_snapshot();
         self.sync_remote_metadata();
         self.maybe_prefetch_next();
@@ -1058,41 +1370,15 @@ impl EngineActor {
     }
 
     fn resolve_track_stream(&self, track: &Track) -> Result<StreamInfo, String> {
-        if let Some(ref resolver) = self.stream_resolver {
-            match resolver(track, self.snapshot.quality) {
-                Ok(info) if !info.url.is_empty() => return Ok(info),
-                Ok(_) => {}
-                Err(err) => {
-                    // Fall back to direct URL / local_path if present, else return error.
-                    if track.url.is_empty() && track.local_path.is_empty() {
-                        return Err(err.to_string());
-                    }
-                }
-            }
-        }
-
-        if !track.local_path.is_empty() {
-            return Ok(StreamInfo {
-                url: track.local_path.clone(),
-                ..StreamInfo::default()
-            });
-        }
-        if !track.url.is_empty() {
-            return Ok(StreamInfo {
-                url: track.url.clone(),
-                ..StreamInfo::default()
-            });
-        }
-        Err(format!(
-            "track '{}' has no playable URL and no stream resolver returned a stream",
-            track.name
-        ))
+        resolve_track_stream_with_resolver(
+            self.stream_resolver.as_ref(),
+            track,
+            self.snapshot.quality,
+        )
     }
 
     fn pause_internal(&mut self) {
-        if let Ok(mut guard) = self.shared.lock() {
-            guard.playing = false;
-        }
+        self.atomics.playing.store(false, Ordering::Release);
         let _ = self.output.pause();
         self.snapshot.status = PlaybackStatus::Paused;
         self.publish_snapshot();
@@ -1104,10 +1390,8 @@ impl EngineActor {
     }
 
     fn resume_internal(&mut self) {
-        if let Ok(mut guard) = self.shared.lock() {
-            guard.dsp.trigger_fade_in(10);
-            guard.playing = true;
-        }
+        self.atomics.trigger_fade_in(10);
+        self.atomics.playing.store(true, Ordering::Release);
         let _ = self.output.resume();
         self.snapshot.status = PlaybackStatus::Playing;
         self.publish_snapshot();
@@ -1122,17 +1406,19 @@ impl EngineActor {
         self.decoder = None;
         self.crossfade_tail.clear();
         self.crossfade_pos = 0;
-        if let Ok(mut guard) = self.shared.lock() {
-            guard.playing = false;
-            guard.clear_ring(0);
-            guard.dsp.reset();
-            guard.latest_spectrum = [0.0; SPECTRUM_BANDS];
-        }
+        self.atomics.playing.store(false, Ordering::Release);
+        self.clear_ring_and_timeline(0);
+        self.atomics.request_dsp_reset();
+        self.atomics.clear_spectrum();
+        self.atomics.spectrum_dirty.store(false, Ordering::Relaxed);
         if self.output_started {
             let _ = self.output.pause();
         }
         self.snapshot.status = PlaybackStatus::Stopped;
         self.snapshot.position_ms = 0;
+        self.snapshot.is_lossless = false;
+        self.snapshot.stream_format.clear();
+        self.last_published_spectrum = [0.0; SPECTRUM_BANDS];
         let _ = self.signals.spectrum_tx.send_replace([0.0; SPECTRUM_BANDS]);
         self.remote.clear();
     }
@@ -1146,6 +1432,7 @@ impl EngineActor {
 
         let Some(ref mut decoder) = self.decoder else {
             self.snapshot.position_ms = clamped;
+            self.atomics.reset_timeline(clamped);
             self.publish_snapshot();
             return;
         };
@@ -1154,10 +1441,8 @@ impl EngineActor {
             Ok(landed_ms) => {
                 self.crossfade_tail.clear();
                 self.crossfade_pos = 0;
-                if let Ok(mut guard) = self.shared.lock() {
-                    guard.clear_ring(landed_ms);
-                    guard.dsp.trigger_fade_in(8);
-                }
+                self.clear_ring_and_timeline(landed_ms);
+                self.atomics.trigger_fade_in(8);
                 self.snapshot.position_ms = landed_ms;
                 self.fill_decoder_buffer();
                 self.publish_snapshot();
@@ -1178,20 +1463,17 @@ impl EngineActor {
             self.fill_decoder_buffer();
         }
 
-        let (pos_ms, spectrum, ended) = match self.shared.lock() {
-            Ok(mut guard) => {
-                let ended = guard.track_ended_flag;
-                if ended {
-                    guard.track_ended_flag = false;
-                }
-                (guard.current_position_ms(), guard.latest_spectrum, ended)
+        if self.atomics.spectrum_dirty.swap(false, Ordering::AcqRel) {
+            let spectrum = self.atomics.read_spectrum();
+            if spectrum != self.last_published_spectrum {
+                self.last_published_spectrum = spectrum;
+                let _ = self.signals.spectrum_tx.send_replace(spectrum);
             }
-            Err(_) => return,
-        };
+        }
 
-        let _ = self.signals.spectrum_tx.send_replace(spectrum);
-
-        if ended && self.snapshot.status.is_playing() {
+        if self.atomics.track_ended.swap(false, Ordering::AcqRel)
+            && self.snapshot.status.is_playing()
+        {
             self.on_track_finished();
             return;
         }
@@ -1200,6 +1482,7 @@ impl EngineActor {
             && self.last_position_publish.elapsed() >= Duration::from_millis(50)
         {
             self.last_position_publish = Instant::now();
+            let pos_ms = self.atomics.current_position_ms();
             let clamped = if self.snapshot.duration_ms > 0 {
                 pos_ms.min(self.snapshot.duration_ms)
             } else {
@@ -1212,30 +1495,57 @@ impl EngineActor {
         }
     }
 
-    fn fill_decoder_buffer(&mut self) {
-        let Some(ref mut decoder) = self.decoder else {
-            return;
+    fn flush_overflow_to_ring(&mut self) -> bool {
+        if self.overflow_offset >= self.overflow_pcm.len() {
+            self.overflow_pcm.clear();
+            self.overflow_offset = 0;
+            return true;
+        }
+        let Ok(mut ring) = self.ring.lock() else {
+            return false;
         };
-        let target_samples =
-            (self.output_config.sample_rate as usize / 2) * (self.output_config.channels as usize).max(1);
+        let pushed = ring.push_slice(&self.overflow_pcm[self.overflow_offset..]);
+        self.atomics.ring_len.store(ring.len(), Ordering::Release);
+        self.overflow_offset += pushed;
+        if self.overflow_offset >= self.overflow_pcm.len() {
+            self.overflow_pcm.clear();
+            self.overflow_offset = 0;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn fill_decoder_buffer(&mut self) {
+        if self.decoder.is_none() {
+            return;
+        }
+        let target_samples = ((self.output_config.sample_rate as usize / 2)
+            * (self.output_config.channels as usize).max(1))
+        .min(PCM_RING_CAPACITY.saturating_sub(8192));
+
+        // Lock-free fast check: skip decoding if ring is already well-buffered.
+        if self.atomics.ring_len.load(Ordering::Acquire) >= target_samples {
+            return;
+        }
+
+        if !self.flush_overflow_to_ring() {
+            return;
+        }
 
         loop {
-            let current_len = self
-                .shared
-                .lock()
-                .map(|g| g.ring.len())
-                .unwrap_or(target_samples);
-            if current_len >= target_samples {
+            if self.atomics.ring_len.load(Ordering::Acquire) >= target_samples {
                 break;
             }
 
+            let Some(ref mut decoder) = self.decoder else {
+                break;
+            };
             self.pcm_scratch.clear();
             let spec = decoder.spec();
             match decoder.read_pcm(&mut self.pcm_scratch) {
                 Ok(0) => {
-                    if let Ok(mut guard) = self.shared.lock() {
-                        guard.decoder_eof = true;
-                    }
+                    self.atomics.decoder_eof.store(true, Ordering::Release);
                     break;
                 }
                 Ok(_) => {
@@ -1246,24 +1556,22 @@ impl EngineActor {
                         spec.channels,
                         self.output_config.sample_rate,
                         self.output_config.channels,
+                        &mut self.channel_scratch,
                         &mut self.resampled_scratch,
                     );
 
-                    // Apply equal-power crossfade against outgoing tail if active.
+                    // Apply zero-allocation in-place equal-power crossfade against outgoing tail.
                     if self.crossfade_pos < self.crossfade_tail.len() {
                         let tail_rem = self.crossfade_tail.len() - self.crossfade_pos;
                         let overlap = tail_rem.min(self.resampled_scratch.len());
                         let total_xfade = self.crossfade_tail.len().max(1) as f32;
-                        let progress = (self.crossfade_pos as f32 + overlap as f32 * 0.5)
-                            / total_xfade;
-                        let mut blended = vec![0.0f32; overlap];
-                        mix_crossfade(
+                        let progress =
+                            (self.crossfade_pos as f32 + overlap as f32 * 0.5) / total_xfade;
+                        mix_crossfade_in_place(
                             &self.crossfade_tail[self.crossfade_pos..self.crossfade_pos + overlap],
-                            &self.resampled_scratch[..overlap],
-                            &mut blended,
+                            &mut self.resampled_scratch[..overlap],
                             progress,
                         );
-                        self.resampled_scratch[..overlap].copy_from_slice(&blended);
                         self.crossfade_pos += overlap;
                         if self.crossfade_pos >= self.crossfade_tail.len() {
                             self.crossfade_tail.clear();
@@ -1271,15 +1579,25 @@ impl EngineActor {
                         }
                     }
 
-                    if let Ok(mut guard) = self.shared.lock() {
-                        guard.ring.extend(self.resampled_scratch.iter().copied());
+                    let pushed = if let Ok(mut ring) = self.ring.lock() {
+                        let n = ring.push_slice(&self.resampled_scratch);
+                        self.atomics.ring_len.store(ring.len(), Ordering::Release);
+                        n
+                    } else {
+                        break;
+                    };
+
+                    if pushed < self.resampled_scratch.len() {
+                        self.overflow_pcm.clear();
+                        self.overflow_pcm
+                            .extend_from_slice(&self.resampled_scratch[pushed..]);
+                        self.overflow_offset = 0;
+                        break;
                     }
                 }
                 Err(err) => {
                     log::warn!("audio decode error: {err}");
-                    if let Ok(mut guard) = self.shared.lock() {
-                        guard.decoder_eof = true;
-                    }
+                    self.atomics.decoder_eof.store(true, Ordering::Release);
                     break;
                 }
             }
@@ -1289,11 +1607,9 @@ impl EngineActor {
     fn on_track_finished(&mut self) {
         if self.snapshot.repeat == RepeatMode::One {
             self.seek_internal(0);
-            if let Ok(mut guard) = self.shared.lock() {
-                guard.decoder_eof = false;
-                guard.track_ended_flag = false;
-                guard.playing = true;
-            }
+            self.atomics.decoder_eof.store(false, Ordering::Release);
+            self.atomics.track_ended.store(false, Ordering::Release);
+            self.atomics.playing.store(true, Ordering::Release);
             return;
         }
         self.advance_next(false);
@@ -1308,7 +1624,9 @@ impl EngineActor {
             if self.shuffle_cursor + 1 < self.shuffle_order.len() {
                 return Some(self.shuffle_order[self.shuffle_cursor + 1]);
             }
-            if self.snapshot.repeat == RepeatMode::All || (manual_skip && self.snapshot.repeat == RepeatMode::One) {
+            if self.snapshot.repeat == RepeatMode::All
+                || (manual_skip && self.snapshot.repeat == RepeatMode::One)
+            {
                 return self.shuffle_order.first().copied();
             }
             return None;
@@ -1433,7 +1751,7 @@ impl EngineActor {
     }
 
     fn maybe_prefetch_next(&mut self) {
-        if !self.config.prefetch_next {
+        if !self.config.prefetch_next || self.cache.max_bytes() == 0 {
             return;
         }
         let Some(next_idx) = self.next_queue_index(false) else {
@@ -1447,23 +1765,22 @@ impl EngineActor {
         }
         self.last_prefetched_id = Some(next_track.id.clone());
 
-        let url_and_headers = if next_track.url.starts_with("http://")
-            || next_track.url.starts_with("https://")
-        {
-            Some((next_track.url.clone(), Vec::new()))
-        } else if let Some(ref resolver) = self.stream_resolver {
-            resolver(&next_track, self.snapshot.quality)
-                .ok()
-                .filter(|s| s.url.starts_with("http://") || s.url.starts_with("https://"))
-                .map(|s| {
-                    (
-                        s.url,
-                        s.headers.into_iter().collect::<Vec<(String, String)>>(),
-                    )
-                })
-        } else {
-            None
-        };
+        let url_and_headers =
+            if next_track.url.starts_with("http://") || next_track.url.starts_with("https://") {
+                Some((next_track.url.clone(), Vec::new()))
+            } else if let Some(ref resolver) = self.stream_resolver {
+                resolver(&next_track, self.snapshot.quality)
+                    .ok()
+                    .filter(|s| s.url.starts_with("http://") || s.url.starts_with("https://"))
+                    .map(|s| {
+                        (
+                            s.url,
+                            s.headers.into_iter().collect::<Vec<(String, String)>>(),
+                        )
+                    })
+            } else {
+                None
+            };
 
         if let Some((url, headers)) = url_and_headers {
             drop(self.cache.prefetch(url, headers, Some(512 * 1024)));
@@ -1516,6 +1833,9 @@ impl EngineActor {
 
     fn publish_snapshot(&self) {
         let snap = self.snapshot.clone();
+        self.atomics
+            .snapshot_version
+            .fetch_add(1, Ordering::Release);
         let _ = self.signals.state_tx.send_replace(snap.clone());
         let callbacks = self
             .signals
@@ -1529,14 +1849,156 @@ impl EngineActor {
     }
 }
 
+/// Normalizes a format/MIME/codec label into a concise lowercase format identifier
+/// (e.g. `"flac"`, `"wav"`, `"alac"`, `"mp3"`, `"aac"`, `"opus"`, `"vorbis"`).
+pub(crate) fn normalize_stream_format(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_start_matches('.');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let full_lower = trimmed.to_ascii_lowercase();
+    if full_lower.contains("opus") {
+        return Some("opus".to_owned());
+    }
+    let lower = trimmed
+        .split(';')
+        .next()
+        .unwrap_or(trimmed)
+        .trim()
+        .to_ascii_lowercase();
+    if lower.is_empty() {
+        return None;
+    }
+
+    if lower.contains("flac") {
+        return Some("flac".to_owned());
+    }
+    if lower.contains("alac") {
+        return Some("alac".to_owned());
+    }
+    if lower.contains("wav") || lower.starts_with("pcm") {
+        return Some("wav".to_owned());
+    }
+    if lower.contains("aiff") || lower == "aif" {
+        return Some("aiff".to_owned());
+    }
+    if lower.contains("ape") || lower.contains("monkey") {
+        return Some("ape".to_owned());
+    }
+    if lower.contains("wavpack") || lower == "wv" {
+        return Some("wavpack".to_owned());
+    }
+    if lower.contains("dsf") || lower.contains("dff") || lower.contains("dsd") {
+        return Some("dsd".to_owned());
+    }
+    if lower.contains("mp3") || lower.contains("mpeg") {
+        return Some("mp3".to_owned());
+    }
+    if lower.contains("aac") {
+        return Some("aac".to_owned());
+    }
+    if lower.contains("m4a") || lower.contains("mp4") {
+        return Some("m4a".to_owned());
+    }
+    if lower.contains("opus") {
+        return Some("opus".to_owned());
+    }
+    if lower.contains("vorbis") {
+        return Some("vorbis".to_owned());
+    }
+    if lower.contains("ogg") {
+        return Some("ogg".to_owned());
+    }
+    if lower.contains("webm") || lower.contains("matroska") || lower == "mka" {
+        return Some("webm".to_owned());
+    }
+    if lower.contains("wma") {
+        return Some("wma".to_owned());
+    }
+    if lower.contains("eac3") || lower.contains("ac3") {
+        return Some("ac3".to_owned());
+    }
+    if lower == "demo-synth" {
+        return Some("demo-synth".to_owned());
+    }
+
+    // Drop opaque numeric/debug strings like "0x..." or "CodecType(...)"
+    if lower.starts_with("0x") || lower.starts_with("codectype") {
+        return None;
+    }
+
+    let token = lower.rsplit('/').next().unwrap_or(&lower);
+    if !token.is_empty() && token.len() <= 16 {
+        Some(token.to_owned())
+    } else {
+        None
+    }
+}
+
+fn is_lossless_format(fmt: &str) -> bool {
+    matches!(
+        fmt,
+        "flac" | "wav" | "alac" | "aiff" | "pcm" | "ape" | "wavpack" | "tta" | "dsd"
+    )
+}
+
+fn is_known_lossy_format(fmt: &str) -> bool {
+    matches!(
+        fmt,
+        "mp3" | "aac" | "m4a" | "opus" | "vorbis" | "ogg" | "webm" | "wma" | "ac3"
+    )
+}
+
+/// Classifies `(is_lossless, stream_format)` from the resolved [`StreamInfo`],
+/// decoded [`AudioSpec`], and active [`Quality`] setting.
+pub(crate) fn classify_stream_format(
+    stream_info: &StreamInfo,
+    spec: &AudioSpec,
+    requested_quality: Quality,
+) -> (bool, String) {
+    let media_fmt = normalize_stream_format(&stream_info.media_type);
+    let codec_fmt = normalize_stream_format(&spec.codec_name);
+    let url_ext =
+        infer_extension_hint(&stream_info.url, None).and_then(|ext| normalize_stream_format(&ext));
+
+    // Prefer codec over generic container (e.g. ALAC inside `.m4a` -> `"alac"`,
+    // AAC inside `.m4a` -> `"aac"`), falling back to MIME/media_type and URL extension.
+    let stream_format = match (&codec_fmt, &media_fmt, &url_ext) {
+        (Some(c), _, _) if is_lossless_format(c) => c.clone(),
+        (_, Some(m), _) if is_lossless_format(m) => m.clone(),
+        (_, _, Some(u)) if is_lossless_format(u) => u.clone(),
+        (Some(c), _, _) if c != "demo-synth" => c.clone(),
+        (_, Some(m), _) => m.clone(),
+        (_, _, Some(u)) => u.clone(),
+        (Some(c), _, _) => c.clone(),
+        _ => String::new(),
+    };
+
+    let quality_str = stream_info.quality.trim().to_ascii_lowercase();
+    let stream_quality_lossless = matches!(
+        quality_str.as_str(),
+        "lossless" | "flac" | "alac" | "wav" | "hires" | "hi-res" | "sq" | "hr"
+    ) || quality_str.contains("lossless");
+
+    let is_lossless = is_lossless_format(&stream_format)
+        || stream_quality_lossless
+        || (quality_str.is_empty()
+            && requested_quality == Quality::Lossless
+            && !is_known_lossy_format(&stream_format));
+
+    (is_lossless, stream_format)
+}
+
 /// Converts interleaved PCM from `(src_rate, src_ch)` to `(dst_rate, dst_ch)` using
-/// channel mapping and linear interpolation resampling when rates differ.
+/// channel mapping and linear interpolation resampling when rates differ, reusing
+/// `channel_scratch` to avoid per-packet heap allocations.
 pub(crate) fn convert_pcm(
     input: &[f32],
     src_rate: u32,
     src_ch: u16,
     dst_rate: u32,
     dst_ch: u16,
+    channel_scratch: &mut Vec<f32>,
     out: &mut Vec<f32>,
 ) {
     let sc = (src_ch as usize).max(1);
@@ -1548,41 +2010,42 @@ pub(crate) fn convert_pcm(
 
     // Fast path: identical sample rate & channel count.
     if src_rate == dst_rate && sc == dc {
-        out.extend_from_slice(input);
+        out.extend_from_slice(&input[..src_frames * sc]);
         return;
     }
 
-    // Channel conversion first into temporary frame slice if needed.
-    let channel_mapped: Vec<f32> = if sc == dc {
-        input[..src_frames * sc].to_vec()
+    // Zero-copy slice when channel counts match (common 44.1kHz <-> 48kHz stereo on macOS).
+    let src_slice: &[f32] = if sc == dc {
+        &input[..src_frames * sc]
     } else {
-        let mut mapped = Vec::with_capacity(src_frames * dc);
+        channel_scratch.clear();
+        channel_scratch.reserve(src_frames * dc);
         for frame in input[..src_frames * sc].chunks_exact(sc) {
             match (sc, dc) {
                 (1, 2) => {
-                    mapped.push(frame[0]);
-                    mapped.push(frame[0]);
+                    channel_scratch.push(frame[0]);
+                    channel_scratch.push(frame[0]);
                 }
                 (_, 1) => {
                     let avg = frame.iter().copied().sum::<f32>() / sc as f32;
-                    mapped.push(avg);
+                    channel_scratch.push(avg);
                 }
                 (_, 2) => {
-                    mapped.push(frame[0]);
-                    mapped.push(frame[1]);
+                    channel_scratch.push(frame[0]);
+                    channel_scratch.push(frame[1]);
                 }
                 _ => {
                     for c in 0..dc {
-                        mapped.push(frame[c % sc]);
+                        channel_scratch.push(frame[c % sc]);
                     }
                 }
             }
         }
-        mapped
+        channel_scratch.as_slice()
     };
 
     if src_rate == dst_rate || src_rate == 0 || dst_rate == 0 {
-        out.extend_from_slice(&channel_mapped);
+        out.extend_from_slice(src_slice);
         return;
     }
 
@@ -1590,15 +2053,179 @@ pub(crate) fn convert_pcm(
     let dst_frames = ((src_frames as f64) / ratio).round().max(1.0) as usize;
     out.reserve(dst_frames * dc);
 
-    for out_f in 0..dst_frames {
-        let src_pos = (out_f as f64) * ratio;
-        let idx0 = (src_pos.floor() as usize).min(src_frames - 1);
-        let idx1 = (idx0 + 1).min(src_frames - 1);
-        let frac = (src_pos - idx0 as f64) as f32;
-        for c in 0..dc {
-            let s0 = channel_mapped[idx0 * dc + c];
-            let s1 = channel_mapped[idx1 * dc + c];
-            out.push(s0 + (s1 - s0) * frac);
+    let last_frame = src_frames - 1;
+    if dc == 2 {
+        for out_f in 0..dst_frames {
+            let src_pos = (out_f as f64) * ratio;
+            let idx0 = (src_pos as usize).min(last_frame);
+            let idx1 = (idx0 + 1).min(last_frame);
+            let frac = (src_pos - idx0 as f64) as f32;
+            let base0 = idx0 * 2;
+            let base1 = idx1 * 2;
+            let l0 = src_slice[base0];
+            let r0 = src_slice[base0 + 1];
+            out.push(l0 + (src_slice[base1] - l0) * frac);
+            out.push(r0 + (src_slice[base1 + 1] - r0) * frac);
         }
+    } else {
+        for out_f in 0..dst_frames {
+            let src_pos = (out_f as f64) * ratio;
+            let idx0 = (src_pos as usize).min(last_frame);
+            let idx1 = (idx0 + 1).min(last_frame);
+            let frac = (src_pos - idx0 as f64) as f32;
+            for c in 0..dc {
+                let s0 = src_slice[idx0 * dc + c];
+                let s1 = src_slice[idx1 * dc + c];
+                out.push(s0 + (s1 - s0) * frac);
+            }
+        }
+    }
+}
+
+/// Formats a URL for info/warn logs using only scheme + host (+ port), stripping paths,
+/// query strings, and credentials so tokens/cookies never leak into logs.
+fn sanitize_url_for_log(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "<empty>".to_owned();
+    }
+    if let Ok(parsed) = url::Url::parse(trimmed) {
+        let scheme = parsed.scheme();
+        if scheme == "http" || scheme == "https" {
+            let host = parsed.host_str().unwrap_or("<unknown>");
+            return match parsed.port() {
+                Some(port) => format!("{scheme}://{host}:{port}"),
+                None => format!("{scheme}://{host}"),
+            };
+        }
+        return format!("{scheme}://<local>");
+    }
+    "<local-path>".to_owned()
+}
+
+fn resolve_track_stream_with_resolver(
+    stream_resolver: Option<&StreamResolver>,
+    track: &Track,
+    quality: Quality,
+) -> Result<StreamInfo, String> {
+    if let Some(resolver) = stream_resolver {
+        match resolver(track, quality) {
+            Ok(info) if !info.url.is_empty() => return Ok(info),
+            Ok(_) => {}
+            Err(SourceError::Unsupported) => {
+                // `Unsupported` explicitly allows fallback to `track.local_path` / `track.url`.
+            }
+            Err(err) => {
+                log::warn!(
+                    "stream_resolver failed for '{}' ({}): {err}",
+                    track.name,
+                    track.id
+                );
+                // Only fall back to a local file path on real resolver errors; NEVER fall back
+                // to `track.url` (which for plugins like YouTube Music is an HTML watch page).
+                if !track.local_path.is_empty() {
+                    return Ok(StreamInfo {
+                        url: track.local_path.clone(),
+                        ..StreamInfo::default()
+                    });
+                }
+                return Err(err.to_string());
+            }
+        }
+    }
+
+    if !track.local_path.is_empty() {
+        return Ok(StreamInfo {
+            url: track.local_path.clone(),
+            ..StreamInfo::default()
+        });
+    }
+    if !track.url.is_empty() {
+        return Ok(StreamInfo {
+            url: track.url.clone(),
+            ..StreamInfo::default()
+        });
+    }
+    Err(format!(
+        "track '{}' has no playable URL and no stream resolver returned a stream",
+        track.name
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use nsh_music_core::model::{Quality, SourceError, Track};
+
+    use super::{StreamResolver, resolve_track_stream_with_resolver, sanitize_url_for_log};
+
+    #[test]
+    fn test_resolve_track_stream_does_not_fallback_to_webpage_url_on_error() {
+        let resolver: StreamResolver =
+            Arc::new(|_, _| Err(SourceError::Message("upstream failed".into())));
+        let track = Track {
+            id: "0dGXCvLIffY".to_owned(),
+            source: "youtube-music".to_owned(),
+            name: "Test Song".to_owned(),
+            url: "https://music.youtube.com/watch?v=0dGXCvLIffY".to_owned(),
+            local_path: String::new(),
+            ..Track::default()
+        };
+
+        let err = resolve_track_stream_with_resolver(Some(&resolver), &track, Quality::High)
+            .expect_err("non-Unsupported resolver error must NOT fall back to webpage track.url");
+        assert_eq!(err, "upstream failed");
+    }
+
+    #[test]
+    fn test_resolve_track_stream_allows_unsupported_and_local_path_fallbacks() {
+        // Case 1: `Err(SourceError::Unsupported)` falls back to `track.url`.
+        let unsupported_resolver: StreamResolver = Arc::new(|_, _| Err(SourceError::Unsupported));
+        let remote_track = Track {
+            id: "direct-1".to_owned(),
+            source: "direct".to_owned(),
+            name: "Direct Track".to_owned(),
+            url: "https://cdn.example.test/song.mp3".to_owned(),
+            ..Track::default()
+        };
+        let resolved_remote = resolve_track_stream_with_resolver(
+            Some(&unsupported_resolver),
+            &remote_track,
+            Quality::High,
+        )
+        .expect("Unsupported error should fall back to track.url");
+        assert_eq!(resolved_remote.url, "https://cdn.example.test/song.mp3");
+
+        // Case 2: Any other resolver error still falls back when `track.local_path` is present.
+        let failing_resolver: StreamResolver =
+            Arc::new(|_, _| Err(SourceError::Message("network offline".into())));
+        let cached_local_track = Track {
+            id: "local-1".to_owned(),
+            source: "youtube-music".to_owned(),
+            name: "Downloaded Track".to_owned(),
+            url: "https://music.youtube.com/watch?v=abc".to_owned(),
+            local_path: "/tmp/downloaded.flac".to_owned(),
+            ..Track::default()
+        };
+        let resolved_local = resolve_track_stream_with_resolver(
+            Some(&failing_resolver),
+            &cached_local_track,
+            Quality::High,
+        )
+        .expect("non-empty local_path should still fall back cleanly");
+        assert_eq!(resolved_local.url, "/tmp/downloaded.flac");
+
+        // Verify URL sanitizer strips query/path secrets.
+        assert_eq!(
+            sanitize_url_for_log(
+                "https://rr1---sn.googlevideo.com/videoplayback?sig=SECRET&token=123"
+            ),
+            "https://rr1---sn.googlevideo.com"
+        );
+        assert_eq!(
+            sanitize_url_for_log("http://127.0.0.1:24567/stream?key=abc"),
+            "http://127.0.0.1:24567"
+        );
     }
 }

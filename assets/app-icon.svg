@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" fill="none">
+  <defs>
+    <!-- Full-bleed coral-red gradient aligned with theme.json primary accent (#ff6961 -> #f24741 -> #cf241c) -->
+    <linearGradient id="bg-grad" x1="0" y1="0" x2="1024" y2="1024" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ff6961"/>
+      <stop offset="46%" stop-color="#f24741"/>
+      <stop offset="100%" stop-color="#cf241c"/>
+    </linearGradient>
+
+    <!-- Soft luminous upper highlight for tactile depth across the full canvas -->
+    <radialGradient id="top-glow" cx="512" cy="180" r="680" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ffb1a6" stop-opacity="0.34"/>
+      <stop offset="55%" stop-color="#ff6e66" stop-opacity="0.06"/>
+      <stop offset="100%" stop-color="#8a1110" stop-opacity="0.18"/>
+    </radialGradient>
+
+    <!-- Vinyl disc sheen scaled for full-bleed r=356 disc -->
+    <linearGradient id="disc-sheen" x1="156" y1="156" x2="868" y2="868" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.22"/>
+      <stop offset="48%" stop-color="#ffffff" stop-opacity="0.06"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0.15"/>
+    </linearGradient>
+
+    <!-- Pure white glyph with subtle silk gradient -->
+    <linearGradient id="note-grad" x1="512" y1="286" x2="512" y2="720" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#fff4f3"/>
+    </linearGradient>
+
+    <!-- Generous filter region so the 1.20x scaled emblem & shadow never clip -->
+    <filter id="note-shadow" x="120" y="120" width="784" height="784" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="15" stdDeviation="15" flood-color="#7d0f0b" flood-opacity="0.34"/>
+    </filter>
+  </defs>
+
+  <!-- 100% full-bleed edge-to-edge background -->
+  <rect x="0" y="0" width="1024" height="1024" fill="url(#bg-grad)"/>
+  <rect x="0" y="0" width="1024" height="1024" fill="url(#top-glow)"/>
+
+  <!-- Subtle audiophile vinyl grooves comfortably inside mobile safe circles -->
+  <circle cx="512" cy="512" r="356" fill="url(#disc-sheen)"/>
+  <circle cx="512" cy="512" r="356" stroke="#ffffff" stroke-opacity="0.22" stroke-width="5"/>
+  <circle cx="512" cy="512" r="298" stroke="#ffffff" stroke-opacity="0.14" stroke-width="3.5"/>
+  <circle cx="512" cy="512" r="240" stroke="#ffffff" stroke-opacity="0.12" stroke-width="3.5"/>
+  <circle cx="512" cy="512" r="180" stroke="#ffffff" stroke-opacity="0.10" stroke-width="3"/>
+
+  <!-- Diagonal specular light arcs at r=316 -->
+  <path d="M 288.6 288.6 A 316 316 0 0 1 512 196" stroke="#ffffff" stroke-opacity="0.26" stroke-width="9.5" stroke-linecap="round"/>
+  <path d="M 735.4 735.4 A 316 316 0 0 1 512 828" stroke="#ffffff" stroke-opacity="0.18" stroke-width="8.5" stroke-linecap="round"/>
+
+  <!-- Bold crisp white beamed eighth-note emblem scaled 1.20x around center with +8 optical balance -->
+  <g filter="url(#note-shadow)" transform="translate(512 512) scale(1.2) translate(-512 -512) translate(8, 0)">
+    <path
+      fill="url(#note-grad)"
+      d="M 436 364
+         C 436 346 449 330 467 326
+         L 653 288
+         C 674 284 694 300 694 322
+         L 694 606
+         C 694 618 684 628 672 628
+         L 654 628
+         C 642 628 632 618 632 606
+         L 632 406
+         L 498 434
+         L 498 650
+         C 498 662 488 672 476 672
+         L 458 672
+         C 446 672 436 662 436 650
+         Z"
+    />
+    <ellipse cx="421" cy="656" rx="80" ry="59" transform="rotate(-17 421 656)" fill="url(#note-grad)"/>
+    <ellipse cx="617" cy="614" rx="80" ry="59" transform="rotate(-17 617 614)" fill="url(#note-grad)"/>
+  </g>
+</svg>

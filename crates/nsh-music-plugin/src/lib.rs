@@ -15,7 +15,10 @@ pub mod headers;
 pub mod host;
 pub mod installer;
 pub mod manifest;
+pub mod mobile_compat;
 pub mod runtime;
+pub mod virtual_ytdlp;
+pub(crate) mod yt_ejs;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -27,23 +30,31 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use crate::compat::{
-    analyze_plugin_dir, analyze_source, CompatFinding, CompatReport, CompatTier,
+    CompatFinding, CompatReport, CompatTier, analyze_plugin_dir, analyze_source,
 };
 pub use crate::headers::{HeaderRequestKind, HeaderRule, RequestHeadersResolver};
 pub use crate::host::{
-    HostContext, HostRuntimeOptions, MobileSandboxError, WebSignInHandler, WebSignInRequest,
-    WebSignInResult,
+    HostContext, HostRuntimeOptions, ManagedProcess, MobileSandboxError, OpenUrlHandler,
+    SpawnOptions, VirtualPipeHandle, WebSignInHandler, WebSignInRequest, WebSignInResult,
 };
 pub use crate::installer::{
-    GitHubRepoSpec, InstallSource, InstalledPluginMeta, InstallerError, PendingPluginInstall,
-    PluginInstaller,
+    GitHubRepoSpec, InstallSource, InstalledPluginMeta, InstallerError, ORIGIN_FILE,
+    PendingPluginInstall, PluginInstaller, PluginOrigin, read_plugin_origin,
 };
 pub use crate::manifest::{
-    is_valid_plugin_id, ManifestError, PluginLocales, PluginManifest, PluginPermissions,
+    ManifestError, PluginLocales, PluginManifest, PluginPermissions, effective_host_version,
+    is_valid_plugin_id, set_host_app_version,
+};
+pub use crate::mobile_compat::{
+    FfmpegVirtualShim, MobileProcessVirtualizer, VirtualProcessShim, VirtualSpawnError,
+    VirtualSpawnResult,
 };
 pub use crate::runtime::{
-    transpile_ts_to_js, PluginSource, QrSignInSession, QrSignInStatus, RuntimeError,
-    EXTRA_PLUGIN_EXPORTS, MYGO_PLUGIN_EXPORTS,
+    DEFAULT_CALL_TIMEOUT, EXTRA_PLUGIN_EXPORTS, MYGO_PLUGIN_EXPORTS, PluginSource, QrSignInSession,
+    QrSignInStatus, RuntimeError, SIGN_IN_CALL_TIMEOUT, transpile_ts_to_js,
+};
+pub use crate::virtual_ytdlp::{
+    VIRTUAL_YTDLP_VERSION_BANNER, VirtualYtdlpShim, YtdlpVirtualShim, is_ytdlp_command,
 };
 
 /// Top-level errors returned by [`PluginManager`].
@@ -90,6 +101,7 @@ pub struct PluginManager {
     locale: RwLock<String>,
     sign_in_prompt: RwLock<Option<SignInPromptCallback>>,
     web_sign_in_handler: RwLock<Option<WebSignInHandler>>,
+    open_url_handler: RwLock<Option<OpenUrlHandler>>,
     is_mobile_override: Option<bool>,
 }
 
@@ -110,6 +122,7 @@ impl PluginManager {
             locale: RwLock::new("zh-CN".to_owned()),
             sign_in_prompt: RwLock::new(None),
             web_sign_in_handler: RwLock::new(None),
+            open_url_handler: RwLock::new(None),
             is_mobile_override: None,
         })
     }
@@ -172,9 +185,10 @@ impl PluginManager {
             errors.remove(&id);
         }
         if let Ok(mut loaded) = self.loaded.write()
-            && let Some(prev) = loaded.insert(id, Arc::clone(&source)) {
-                prev.shutdown();
-            }
+            && let Some(prev) = loaded.insert(id, Arc::clone(&source))
+        {
+            prev.shutdown();
+        }
         Ok(source)
     }
 
@@ -226,11 +240,17 @@ impl PluginManager {
         self.installer.cancel_staged(pending);
     }
 
-    /// Updates program execution permission grant state for an installed plugin.
+    /// Updates program execution permission grant state for an installed plugin, persists
+    /// `granted.json`, and restarts any running runtime (killing spawned processes and refreshing
+    /// loopback fetch permissions).
     pub fn set_granted(&self, plugin_id: &str, granted: bool) -> Result<(), PluginError> {
         self.installer.set_granted(plugin_id, granted)?;
+        let granted_path = self.data_dir.join(plugin_id).join("granted.json");
+        let _ =
+            crate::installer::atomic_write(&granted_path, if granted { b"true" } else { b"false" });
         if let Some(loaded) = self.get(plugin_id) {
             loaded.set_granted(granted);
+            loaded.restart()?;
         }
         Ok(())
     }
@@ -299,12 +319,8 @@ impl PluginManager {
 
         for meta in installed {
             seen_ids.insert(meta.id.clone());
-            let loaded_src = loaded_guard
-                .as_ref()
-                .and_then(|m| m.get(&meta.id).cloned());
-            let load_error = errors_guard
-                .as_ref()
-                .and_then(|m| m.get(&meta.id).cloned());
+            let loaded_src = loaded_guard.as_ref().and_then(|m| m.get(&meta.id).cloned());
+            let load_error = errors_guard.as_ref().and_then(|m| m.get(&meta.id).cloned());
 
             if let Some(src) = loaded_src {
                 let manifest = src.manifest();
@@ -328,14 +344,13 @@ impl PluginManager {
                     load_error: None,
                 });
             } else {
-                let manifest = PluginManifest::from_dir(&meta.dir).unwrap_or_else(|_| {
-                    PluginManifest {
+                let manifest =
+                    PluginManifest::from_dir(&meta.dir).unwrap_or_else(|_| PluginManifest {
                         id: meta.id.clone(),
                         name: meta.name.clone(),
                         version: meta.version.clone(),
                         ..PluginManifest::default()
-                    }
-                });
+                    });
                 let locales = PluginLocales::load_from_dir(&meta.dir);
                 let info = manifest.to_source_info(&locales, &locale);
                 let report = analyze_plugin_dir(&meta.dir).unwrap_or_default();
@@ -438,6 +453,18 @@ impl PluginManager {
         }
     }
 
+    /// Installs or clears the URL opener handler for `host.openURL` on the manager and all loaded plugins.
+    pub fn set_open_url_handler(&self, handler: Option<OpenUrlHandler>) {
+        if let Ok(mut g) = self.open_url_handler.write() {
+            *g = handler.clone();
+        }
+        if let Ok(guard) = self.loaded.read() {
+            for src in guard.values() {
+                src.set_open_url_handler(handler.clone());
+            }
+        }
+    }
+
     /// Runs static compatibility analysis on a plugin directory without booting its JS runtime.
     pub fn analyze_dir(dir: &Path) -> Result<CompatReport, PluginError> {
         Ok(analyze_plugin_dir(dir)?)
@@ -454,9 +481,10 @@ impl PluginManager {
 
     fn unload(&self, plugin_id: &str) {
         if let Ok(mut loaded) = self.loaded.write()
-            && let Some(src) = loaded.remove(plugin_id) {
-                src.shutdown();
-            }
+            && let Some(src) = loaded.remove(plugin_id)
+        {
+            src.shutdown();
+        }
         if let Ok(mut errors) = self.load_errors.write() {
             errors.remove(plugin_id);
         }
@@ -471,9 +499,10 @@ impl PluginManager {
                     errors.remove(&meta.id);
                 }
                 if let Ok(mut loaded) = self.loaded.write()
-                    && let Some(prev) = loaded.insert(meta.id.clone(), Arc::clone(&arc)) {
-                        prev.shutdown();
-                    }
+                    && let Some(prev) = loaded.insert(meta.id.clone(), Arc::clone(&arc))
+                {
+                    prev.shutdown();
+                }
                 Ok(arc)
             }
             Err(err) => {
@@ -491,11 +520,8 @@ impl PluginManager {
             is_mobile_override: self.is_mobile_override,
             platform_override: None,
             sign_in_prompt: self.sign_in_prompt.read().ok().and_then(|g| g.clone()),
-            web_sign_in_handler: self
-                .web_sign_in_handler
-                .read()
-                .ok()
-                .and_then(|g| g.clone()),
+            web_sign_in_handler: self.web_sign_in_handler.read().ok().and_then(|g| g.clone()),
+            open_url_handler: self.open_url_handler.read().ok().and_then(|g| g.clone()),
         }
     }
 }
@@ -516,8 +542,8 @@ mod tests {
 
     use nsh_music_core::model::{Quality, SearchKind};
     use nsh_music_core::source::{PluginCompatLevel, RequestKind};
-    use zip::write::SimpleFileOptions;
     use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
 
     fn temp_workspace(tag: &str) -> PathBuf {
         let nonce = SystemTime::now()
@@ -632,7 +658,9 @@ mod tests {
         assert_eq!(home.title, "Hello NSH");
         assert_eq!(home.sections[0].tracks[0].source, "demo-js");
 
-        let sr = src.search("city pop", SearchKind::Tracks, 10).expect("search");
+        let sr = src
+            .search("city pop", SearchKind::Tracks, 10)
+            .expect("search");
         assert_eq!(sr.tracks[0].name, "Result:city pop:tracks:10");
 
         src.set_setting("token", "xyz-999").expect("set setting");
@@ -799,9 +827,14 @@ mod tests {
 
         // Static compat analyzer must recognize virtualized ffmpeg as Full / VirtualFfmpeg.
         assert_eq!(src.compat_report().tier, CompatTier::Full);
-        assert_eq!(src.compatibility_info().level, PluginCompatLevel::VirtualFfmpeg);
+        assert_eq!(
+            src.compatibility_info().level,
+            PluginCompatLevel::VirtualFfmpeg
+        );
 
-        let track = src.get_track("tr-1").expect("getTrack runs TS + crypto + storage + ffmpeg -version");
+        let track = src
+            .get_track("tr-1")
+            .expect("getTrack runs TS + crypto + storage + ffmpeg -version");
         assert!(
             track
                 .name
@@ -810,7 +843,9 @@ mod tests {
             track.name
         );
 
-        let stream = src.stream("tr-1", Quality::High).expect("virtual ffmpeg loopback relay");
+        let stream = src
+            .stream("tr-1", Quality::High)
+            .expect("virtual ffmpeg loopback relay");
         assert_eq!(stream.url, format!("http://127.0.0.1:{relay_port}/"));
 
         // Fetch audio directly from the virtual ffmpeg loopback server!
@@ -820,7 +855,11 @@ mod tests {
             .unwrap();
         let relayed = rt.block_on(async {
             let client = reqwest::Client::new();
-            let resp = client.get(&stream.url).send().await.expect("GET loopback relay");
+            let resp = client
+                .get(&stream.url)
+                .send()
+                .await
+                .expect("GET loopback relay");
             assert!(resp.status().is_success(), "status={}", resp.status());
             resp.bytes().await.expect("relay bytes").to_vec()
         });
@@ -848,15 +887,18 @@ mod tests {
             r#"
             export async function getTrack(_id: string) {
                 const ff = host.spawn("ffmpeg", ["-version"]);
-                const code = await ff.wait();
+                const ffCode = await ff.wait();
+                const yt = host.spawn("yt-dlp", ["--version"]);
+                const ytLine = await yt.readLine();
+                const ytCode = await yt.wait();
                 return {
                     id: "ok",
-                    name: `mobile=${host.capabilities.isMobile}|canSpawn=${host.capabilities.canSpawnExternal}|ff=${code === 0 && ff.stdout().includes("ffmpeg")}`,
+                    name: `mobile=${host.capabilities.isMobile}|canSpawn=${host.capabilities.canSpawnExternal}|ff=${ffCode === 0 && ff.stdout().includes("ffmpeg")}|yt=${ytCode === 0 && Boolean(ytLine && ytLine.includes("nsh-virtual-ytdlp"))}|ey=${host.capabilities.embeddedYtdlp}|vp=${host.capabilities.virtualProcesses.join(",")}|open=${host.capabilities.openUrl}`,
                     duration: 1000
                 };
             }
             export async function search(_opts: any) {
-                host.spawn("yt-dlp", ["--version"]);
+                host.spawn("python3", ["--version"]);
                 return { tracks: [] };
             }
             "#,
@@ -866,7 +908,9 @@ mod tests {
         let mgr = PluginManager::new(root.join("plugins"), root.join("data"))
             .unwrap()
             .with_mobile_override(true);
-        let src = mgr.install_from_dir(&fixture).expect("load plugin in mobile mode");
+        let src = mgr
+            .install_from_dir(&fixture)
+            .expect("load plugin in mobile mode");
 
         assert_eq!(src.compat_report().tier, CompatTier::MigrationRequired);
         assert_eq!(
@@ -874,16 +918,25 @@ mod tests {
             PluginCompatLevel::DesktopProcessLimited
         );
 
-        let track = src.get_track("1").expect("ffmpeg works even on mobile");
-        assert_eq!(track.name, "mobile=true|canSpawn=false|ff=true");
+        let track = src
+            .get_track("1")
+            .expect("ffmpeg and yt-dlp work even on mobile");
+        assert_eq!(
+            track.name,
+            "mobile=true|canSpawn=false|ff=true|yt=true|ey=true|vp=ffmpeg,yt-dlp|open=true"
+        );
 
         let err = src
             .search("test", SearchKind::Tracks, 0)
-            .expect_err("non-ffmpeg binary must fail on mobile");
+            .expect_err("unvirtualized binary must fail on mobile");
         let msg = err.to_string();
         assert!(
-            msg.contains("MobileSandboxError") && msg.contains("yt-dlp"),
+            msg.contains("MobileSandboxError") && msg.contains("python3"),
             "unexpected error: {msg}"
+        );
+        assert!(
+            !msg.to_ascii_lowercase().contains("allowed"),
+            "MobileSandboxError must never contain 'allowed': {msg}"
         );
 
         mgr.shutdown_all();
@@ -899,8 +952,10 @@ mod tests {
             let mut zw = ZipWriter::new(file);
             let opts = SimpleFileOptions::default();
             zw.start_file("sample/plugin.json", opts).unwrap();
-            zw.write_all(br#"{"id":"sample-zip","name":"Sample Zip","version":"0.2.0","main":"index.js"}"#)
-                .unwrap();
+            zw.write_all(
+                br#"{"id":"sample-zip","name":"Sample Zip","version":"0.2.0","main":"index.js"}"#,
+            )
+            .unwrap();
             zw.start_file("sample/index.js", opts).unwrap();
             zw.write_all(b"export async function suggest({ query }) { return [query + '!']; }")
                 .unwrap();
@@ -977,7 +1032,11 @@ mod tests {
         let pending = mgr.stage_from_dir(&fixture).expect("stage plugin dir");
         assert_eq!(pending.id, "proc-staged");
         assert_eq!(pending.version, "1.2.3");
-        assert!(pending.network_hosts.contains(&"api.example.test".to_owned()));
+        assert!(
+            pending
+                .network_hosts
+                .contains(&"api.example.test".to_owned())
+        );
         assert!(pending.process_commands.contains(&"echo".to_owned()));
 
         // Install without granting external program execution -> search fails cleanly.
@@ -990,7 +1049,9 @@ mod tests {
         // Grant permission via manager -> succeeds on desktop.
         mgr.set_granted("proc-staged", true).expect("set granted");
         assert!(src.compatibility_info().granted);
-        let res = src.search("hi", SearchKind::Tracks, 0).expect("search after grant");
+        let res = src
+            .search("hi", SearchKind::Tracks, 0)
+            .expect("search after grant");
         assert_eq!(res.tracks[0].name, "hi");
 
         mgr.shutdown_all();
@@ -1011,7 +1072,9 @@ mod tests {
                 let mut buf = [0u8; 4096];
                 let n = stream.read(&mut buf).unwrap_or(0);
                 let req = String::from_utf8_lossy(&buf[..n]);
-                let has_referer = req.to_ascii_lowercase().contains("referer: https://auth.example.com/");
+                let has_referer = req
+                    .to_ascii_lowercase()
+                    .contains("referer: https://auth.example.com/");
                 let body = format!(r#"{{"ok":true,"hasReferer":{has_referer}}}"#);
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -1028,6 +1091,9 @@ mod tests {
                 "id": "auth-demo",
                 "name": "Auth Demo",
                 "main": "index.ts",
+                "permissions": {
+                    "network": ["127.0.0.1", "auth.example.com"]
+                },
                 "requestHeaders": [
                     {
                         "match": "127.0.0.1",
@@ -1221,7 +1287,9 @@ mod tests {
         .unwrap();
 
         let mgr = PluginManager::new(root.join("plugins"), root.join("data")).unwrap();
-        let src = mgr.install_from_dir(&fixture).expect("install canonical plugin");
+        let src = mgr
+            .install_from_dir(&fixture)
+            .expect("install canonical plugin");
         src.set_setting("savedOrder", "fav1, fav2").unwrap();
 
         assert_eq!(src.compat_report().tier, CompatTier::Full);
@@ -1265,12 +1333,20 @@ mod tests {
             .stage_from_github("https://github.com/GentleM4dman/mygo-music-bilibili")
             .expect("stage bilibili from GitHub");
         assert_eq!(pending.id, "bilibili");
-        assert!(!pending.process_commands.iter().any(|c| c.contains("dynamic")));
+        assert!(
+            !pending
+                .process_commands
+                .iter()
+                .any(|c| c.contains("dynamic"))
+        );
 
         let src = mgr
             .confirm_staged(&pending, true)
             .expect("confirm and load bilibili");
-        assert_eq!(src.compatibility_info().level, PluginCompatLevel::VirtualFfmpeg);
+        assert_eq!(
+            src.compatibility_info().level,
+            PluginCompatLevel::VirtualFfmpeg
+        );
         assert!(src.can("home"));
         assert!(src.can("browse"));
         assert!(src.can("search"));
@@ -1281,10 +1357,16 @@ mod tests {
         assert!(src.info().navigation.iter().any(|n| n.page == "charts"));
 
         let home = src.home().expect("bilibili home()");
-        assert!(!home.sections.is_empty(), "expected non-empty home sections");
+        assert!(
+            !home.sections.is_empty(),
+            "expected non-empty home sections"
+        );
 
         let charts = src.browse("charts").expect("bilibili browse(charts)");
-        assert!(!charts.sections.is_empty(), "expected non-empty charts sections");
+        assert!(
+            !charts.sections.is_empty(),
+            "expected non-empty charts sections"
+        );
 
         let suggestions = src.suggest("周杰伦").expect("bilibili suggest");
         assert!(!suggestions.is_empty(), "expected non-empty suggestions");
@@ -1302,6 +1384,862 @@ mod tests {
         assert!(!stream.url.is_empty(), "expected non-empty stream url");
 
         mgr.shutdown_all();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn web_sign_in_parses_youtube_music_fields_and_supports_late_handler() {
+        let root = temp_workspace("web-signin-ytm");
+        let fixture = root.join("fixture-ytm-auth");
+        fs::create_dir_all(&fixture).unwrap();
+
+        fs::write(
+            fixture.join("plugin.json"),
+            r#"{
+                "id": "ytm-auth-test",
+                "name": "YTM Auth Test",
+                "main": "index.js",
+                "permissions": { "network": ["music.youtube.com"] }
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            fixture.join("index.js"),
+            r#"
+            export async function suggest() {
+                return [typeof host.webSignIn];
+            }
+            export async function signIn() {
+                const res = await host.webSignIn({
+                    url: "https://accounts.google.com/ServiceLogin?service=youtube",
+                    cookiesOf: "https://music.youtube.com",
+                    until: ["SAPISID", "__Secure-3PSID"],
+                    userAgent: "Mozilla/5.0 TestSafari",
+                    title: "YouTube Music",
+                });
+                return {
+                    id: res.cookies.SAPISID || "missing",
+                    name: `${res.ok}|${res.cancelled}|${res.manualFallback}|${res.cookie}`,
+                };
+            }
+            "#,
+        )
+        .unwrap();
+
+        let mgr = PluginManager::new(root.join("plugins"), root.join("data")).unwrap();
+        // Install BEFORE setting WebSignInHandler -> `host.webSignIn` must initially be `undefined`.
+        let src = mgr.install_from_dir(&fixture).expect("install plugin");
+        assert_eq!(src.suggest("").unwrap(), vec!["undefined"]);
+
+        // Now register the WebSignInHandler dynamically -> `host.webSignIn` becomes callable immediately.
+        let captured = Arc::new(std::sync::Mutex::new(None::<WebSignInRequest>));
+        let captured_clone = Arc::clone(&captured);
+        mgr.set_web_sign_in_handler(Some(Arc::new(move |req| {
+            *captured_clone.lock().unwrap() = Some(req.clone());
+            Ok(WebSignInResult {
+                ok: true,
+                url: "https://music.youtube.com/".to_owned(),
+                cookies: HashMap::from([
+                    ("SAPISID".to_owned(), "sap-123".to_owned()),
+                    ("__Secure-3PSID".to_owned(), "sid-456".to_owned()),
+                ]),
+                cookie: String::new(), // verify auto-synthesis from `cookies` map
+                eval_result: None,
+                cancelled: false,
+                manual_fallback: false,
+            })
+        })));
+
+        assert_eq!(src.suggest("").unwrap(), vec!["function"]);
+        let acc = src.sign_in().expect("signIn via late-registered handler");
+        assert_eq!(acc.id, "sap-123");
+        assert_eq!(
+            acc.name,
+            "true|false|false|SAPISID=sap-123; __Secure-3PSID=sid-456"
+        );
+
+        let req = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("captured WebSignInRequest");
+        assert_eq!(req.plugin_id, "ytm-auth-test");
+        assert_eq!(
+            req.url,
+            "https://accounts.google.com/ServiceLogin?service=youtube"
+        );
+        assert_eq!(req.cookies_of.as_deref(), Some("https://music.youtube.com"));
+        assert_eq!(
+            req.until,
+            vec!["SAPISID".to_owned(), "__Secure-3PSID".to_owned()]
+        );
+        assert_eq!(
+            req.cookie_names,
+            vec!["SAPISID".to_owned(), "__Secure-3PSID".to_owned()]
+        );
+        assert_eq!(req.user_agent.as_deref(), Some("Mozilla/5.0 TestSafari"));
+        assert_eq!(req.title, "YouTube Music");
+
+        // Clearing handler hides `host.webSignIn` again.
+        mgr.set_web_sign_in_handler(None);
+        assert_eq!(src.suggest("").unwrap(), vec!["undefined"]);
+
+        mgr.shutdown_all();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn spawn_ungranted_matches_allowed_and_missing_binary_is_enoent() {
+        let root = temp_workspace("spawn-perm-ytm");
+        let fixture = root.join("fixture-perm");
+        fs::create_dir_all(&fixture).unwrap();
+
+        fs::write(
+            fixture.join("plugin.json"),
+            r#"{
+                "id": "ytm-perm-test",
+                "name": "YTM Perm Test",
+                "main": "index.js",
+                "permissions": { "process": ["ffmpeg", "yt-dlp", "python3", "__nsh_missing_js_runtime_xyz__"] }
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            fixture.join("index.js"),
+            r#"
+            function fail(code, message) {
+                const e = new Error(message);
+                e.code = code;
+                return e;
+            }
+            async function probe(cmd) {
+                try {
+                    const p = host.spawn(cmd, ["--version"]);
+                    p.closeStdin();
+                    while ((await p.readLine()) !== null) {}
+                    return (await p.wait()) === 0 ? "ok" : "nonzero";
+                } catch (e) {
+                    if (/allowed/.test(e.message)) {
+                        throw fail("setup", "Allow programs in plugin settings");
+                    }
+                    return "missing:" + e.message;
+                }
+            }
+            export async function suggest({ query }) {
+                return [await probe(query)];
+            }
+            "#,
+        )
+        .unwrap();
+
+        let mgr = PluginManager::new(root.join("plugins"), root.join("data")).unwrap();
+        let pending = mgr.stage_from_dir(&fixture).expect("stage");
+        let src = mgr
+            .confirm_staged(&pending, false)
+            .expect("confirm ungranted");
+
+        // Unvirtualized external binary when `!granted` MUST fail with `/allowed/` -> structured `SourceError::Setup`.
+        let err = src
+            .suggest("python3")
+            .expect_err("ungranted unvirtualized spawn must fail");
+        assert!(
+            matches!(err, nsh_music_core::model::SourceError::Setup(_)),
+            "expected SourceError::Setup, got {err:?}"
+        );
+
+        // Virtualized `ffmpeg` and `yt-dlp` still work in-process even when `!granted`.
+        let ff_res = src
+            .suggest("ffmpeg")
+            .expect("ffmpeg falls back to VirtualFfmpegShim when ungranted");
+        assert_eq!(ff_res, vec!["ok"]);
+        let ytdlp_res = src
+            .suggest("yt-dlp")
+            .expect("yt-dlp falls back to VirtualYtdlpShim when ungranted");
+        assert_eq!(ytdlp_res, vec!["ok"]);
+
+        // Once granted, missing binaries (like uninstalled `deno`/`node`/`bun`) return ENOENT without `allowed`.
+        mgr.set_granted("ytm-perm-test", true).expect("grant");
+        let missing = src
+            .suggest("__nsh_missing_js_runtime_xyz__")
+            .expect("missing binary should not trigger setup/allowed error");
+        assert!(
+            missing[0].starts_with("missing:") && !missing[0].contains("allowed"),
+            "unexpected probe output: {:?}",
+            missing
+        );
+
+        mgr.shutdown_all();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn desktop_ffmpeg_transcoding_heuristic_and_non_deadlocking_kill() {
+        use crate::mobile_compat::ffmpeg_requests_transcoding;
+
+        // Audio transcoding flags (`-c:a libmp3lame -b:a 192k`) -> real ffmpeg preferred on desktop.
+        let ytm_args: Vec<String> = [
+            "-nostdin",
+            "-hide_banner",
+            "-nostats",
+            "-i",
+            "https://media.example.com/audio/stream?id=1",
+            "-vn",
+            "-c:a",
+            "libmp3lame",
+            "-b:a",
+            "192k",
+            "-id3v2_version",
+            "0",
+            "-write_xing",
+            "0",
+            "-f",
+            "mp3",
+            "-listen",
+            "1",
+            "http://127.0.0.1:25000/",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        assert!(ffmpeg_requests_transcoding(&ytm_args));
+
+        // Stream copy / remux (`-c:a copy`) -> VirtualFfmpegShim.
+        let copy_args: Vec<String> = [
+            "-i",
+            "https://cdn.example.com/audio.m4s",
+            "-vn",
+            "-c:a",
+            "copy",
+            "-f",
+            "mp4",
+            "-listen",
+            "1",
+            "http://127.0.0.1:25001/",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        assert!(!ffmpeg_requests_transcoding(&copy_args));
+
+        // Direct MP3 relay with `.mp3` input and no codec/bitrate flag -> VirtualFfmpegShim.
+        let mp3_relay_args: Vec<String> = [
+            "-i",
+            "http://127.0.0.1:9999/audio.mp3",
+            "-vn",
+            "-f",
+            "mp3",
+            "-listen",
+            "1",
+            "http://127.0.0.1:25002/",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        assert!(!ffmpeg_requests_transcoding(&mp3_relay_args));
+
+        // Verify `ExternalProcessHandle::kill()` never deadlocks while `proc.wait()` is pending.
+        #[cfg(unix)]
+        {
+            let root = temp_workspace("kill-while-wait");
+            let fixture = root.join("fixture-kill");
+            fs::create_dir_all(&fixture).unwrap();
+            fs::write(
+                fixture.join("plugin.json"),
+                r#"{"id":"kill-test","name":"Kill Test","main":"index.js","permissions":{"process":["sleep"]}}"#,
+            )
+            .unwrap();
+            fs::write(
+                fixture.join("index.js"),
+                r#"
+                export async function suggest() {
+                    const p = host.spawn("sleep", ["30"]);
+                    const waitPromise = p.wait();
+                    setTimeout(() => p.kill(), 40);
+                    const code = await waitPromise;
+                    return [String(code), String(p.isRunning())];
+                }
+                "#,
+            )
+            .unwrap();
+
+            let mgr = PluginManager::new(root.join("plugins"), root.join("data")).unwrap();
+            let src = mgr.install_from_dir(&fixture).expect("install kill-test");
+            let start = std::time::Instant::now();
+            let res = src.suggest("").expect("kill while wait must resolve");
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(3),
+                "kill deadlocked while wait() was pending"
+            );
+            assert_eq!(res[1], "false");
+            mgr.shutdown_all();
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    #[ignore = "live network check against github.com and music.youtube.com"]
+    fn live_install_and_query_youtube_music_plugin() {
+        let root = temp_workspace("live-youtube-music");
+        let mgr = PluginManager::new(root.join("plugins"), root.join("data")).unwrap();
+
+        let pending = mgr
+            .stage_from_github("egoist/mygo-music-youtube-music")
+            .expect("stage youtube-music from GitHub");
+        assert_eq!(pending.id, "youtube-music");
+        assert!(
+            pending
+                .network_hosts
+                .iter()
+                .any(|h| h == "music.youtube.com"),
+            "expected music.youtube.com in network_hosts: {:?}",
+            pending.network_hosts
+        );
+        assert!(
+            !pending
+                .process_commands
+                .iter()
+                .any(|c| c.contains("dynamic")),
+            "unexpected dynamic placeholder in process_commands: {:?}",
+            pending.process_commands
+        );
+
+        let src = mgr
+            .confirm_staged(&pending, true)
+            .expect("confirm and load youtube-music");
+
+        // Verify localized navigation in zh-CN and English phrase preservation in en.
+        let zh_info = src.info();
+        assert!(
+            zh_info
+                .navigation
+                .iter()
+                .any(|n| n.page == "charts" && n.title == "排行榜"),
+            "expected zh-CN Charts nav item, got {:?}",
+            zh_info.navigation
+        );
+        assert!(
+            zh_info
+                .navigation
+                .iter()
+                .any(|n| n.page == "new" && n.title == "新发行"),
+            "expected zh-CN New Releases nav item, got {:?}",
+            zh_info.navigation
+        );
+
+        mgr.set_locale("en");
+        let en_info = src.info();
+        assert!(
+            en_info
+                .navigation
+                .iter()
+                .any(|n| n.page == "charts" && n.title == "Charts"),
+            "expected en Charts nav item, got {:?}",
+            en_info.navigation
+        );
+        assert!(
+            en_info
+                .navigation
+                .iter()
+                .any(|n| n.page == "new" && n.title == "New Releases"),
+            "expected en New Releases nav item, got {:?}",
+            en_info.navigation
+        );
+        mgr.set_locale("zh-CN");
+
+        // Verify capabilities.
+        for cap in [
+            "home",
+            "browse",
+            "search",
+            "suggest",
+            "album",
+            "artist",
+            "playlist",
+            "stations",
+            "stationNext",
+            "lyrics",
+            "stream",
+            "account",
+            "signIn",
+            "signOut",
+        ] {
+            assert!(src.can(cap), "expected youtube-music capability `{cap}`");
+        }
+
+        let home = src.home().expect("youtube-music home()");
+        assert!(
+            !home.sections.is_empty(),
+            "expected non-empty home sections"
+        );
+
+        let charts = src.browse("charts").expect("youtube-music browse(charts)");
+        assert!(
+            !charts.sections.is_empty(),
+            "expected non-empty charts sections"
+        );
+
+        let new_rel = src.browse("new").expect("youtube-music browse(new)");
+        assert!(
+            !new_rel.sections.is_empty(),
+            "expected non-empty new releases sections"
+        );
+
+        let search_res = src
+            .search("周杰伦", SearchKind::Tracks, 0)
+            .expect("youtube-music search");
+        assert!(!search_res.tracks.is_empty(), "expected search tracks");
+        let first = &search_res.tracks[0];
+        assert_eq!(first.source, "youtube-music");
+        assert!(!first.id.is_empty());
+
+        let suggestions = src.suggest("周杰伦").expect("youtube-music suggest");
+        assert!(!suggestions.is_empty(), "expected non-empty suggestions");
+
+        let stations = src.stations().expect("youtube-music stations");
+        assert!(!stations.is_empty(), "expected non-empty stations");
+
+        // Exercise album, artist, playlist, and stationNext deserialization against live YouTube Music data.
+        if let Some(alb_id) = home
+            .sections
+            .iter()
+            .flat_map(|s| s.albums.iter())
+            .map(|a| a.id.as_str())
+            .find(|id| !id.is_empty())
+        {
+            let alb_page = src.album(alb_id).expect("youtube-music album()");
+            assert!(!alb_page.album.name.is_empty());
+        }
+        if let Some(art_id) = first
+            .artists
+            .iter()
+            .map(|a| a.id.as_str())
+            .find(|id| !id.is_empty())
+        {
+            let art_page = src.artist(art_id).expect("youtube-music artist()");
+            assert!(!art_page.artist.name.is_empty());
+        }
+        if let Some(pl_id) = home
+            .sections
+            .iter()
+            .flat_map(|s| s.playlists.iter())
+            .map(|p| p.id.as_str())
+            .find(|id| !id.is_empty() && !id.starts_with("RD"))
+        {
+            let pl_page = src.playlist(pl_id).expect("youtube-music playlist()");
+            assert!(!pl_page.name.is_empty());
+        }
+        src.played(first);
+        let radio_tracks = src
+            .station_next("radio")
+            .expect("youtube-music station_next()");
+        assert!(
+            !radio_tracks.is_empty(),
+            "expected radio tracks from station_next"
+        );
+
+        let _lyrics = src.lyrics(&first.id).expect("youtube-music lyrics");
+
+        let stream = src
+            .stream(&first.id, Quality::High)
+            .expect("youtube-music stream");
+        assert!(
+            stream.url.starts_with("http://127.0.0.1:"),
+            "expected loopback relay URL, got {}",
+            stream.url
+        );
+        assert_eq!(stream.media_type, "mp3");
+        assert_eq!(stream.bit_rate, 192_000);
+
+        // Verify actual MP3 audio bytes stream from the loopback ffmpeg relay.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let first_chunk = rt.block_on(async {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+                .unwrap();
+            let mut resp = client
+                .get(&stream.url)
+                .send()
+                .await
+                .expect("GET youtube-music loopback stream");
+            assert!(
+                resp.status().is_success(),
+                "stream status={}",
+                resp.status()
+            );
+            resp.chunk()
+                .await
+                .expect("read first stream chunk")
+                .expect("non-empty chunk")
+                .to_vec()
+        });
+        assert!(
+            first_chunk.len() >= 4,
+            "expected audio bytes from stream, got {} bytes",
+            first_chunk.len()
+        );
+        // When real ffmpeg transcodes with `-id3v2_version 0 -write_xing 0 -f mp3`,
+        // frames begin with an MPEG frame sync (0xFF 0xE0..0xFF) or ID3 tag.
+        let looks_mp3 = first_chunk.starts_with(b"ID3")
+            || (first_chunk[0] == 0xFF && (first_chunk[1] & 0xE0) == 0xE0);
+        assert!(
+            looks_mp3,
+            "expected MP3 audio header from desktop ffmpeg transcode, got {:02x?}",
+            &first_chunk[..first_chunk.len().min(16)]
+        );
+
+        // Verify shutdown kills active ffmpeg relay without deadlocking or stalling.
+        let shut_start = std::time::Instant::now();
+        mgr.shutdown_all();
+        assert!(
+            shut_start.elapsed() < std::time::Duration::from_secs(3),
+            "shutdown_all stalled on active ffmpeg relay"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn enforces_network_and_process_permissions_and_settings_persistence() {
+        let root = temp_workspace("net-proc-perms");
+        let fixture = root.join("fixture-sec");
+        fs::create_dir_all(&fixture).unwrap();
+
+        let srv = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = srv.local_addr().unwrap().port();
+        let srv_thread = std::thread::spawn(move || {
+            for _ in 0..2 {
+                if let Ok((mut s, _)) = srv.accept() {
+                    let mut buf = [0u8; 1024];
+                    let _ = s.read(&mut buf);
+                    let resp =
+                        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+                    let _ = s.write_all(resp.as_bytes());
+                }
+            }
+        });
+
+        fs::write(
+            fixture.join("plugin.json"),
+            r#"{
+                "id": "sec-demo",
+                "name": "Sec Demo",
+                "main": "index.js",
+                "permissions": {
+                    "network": ["*.allowed.example"],
+                    "process": ["echo"]
+                }
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            fixture.join("index.js"),
+            format!(
+                r#"
+                export async function suggest({{ query }}) {{
+                    if (query === "blocked-host") {{
+                        await fetch("https://evil.other.test/");
+                        return ["unexpected"];
+                    }}
+                    if (query === "loopback") {{
+                        const r = await fetch("http://127.0.0.1:{port}/ping");
+                        return [await r.text()];
+                    }}
+                    if (query === "bad-signin-url") {{
+                        await host.webSignIn({{ url: "http://insecure.example/login", cookiesOf: "https://api.allowed.example", until: ["SID"] }});
+                        return ["unexpected"];
+                    }}
+                    if (query === "bad-cookies-of") {{
+                        await host.webSignIn({{ url: "https://accounts.example/login", cookiesOf: "https://evil.other.test", until: ["SID"] }});
+                        return ["unexpected"];
+                    }}
+                    if (query === "undeclared-proc") {{
+                        host.spawn("uname", ["-a"]);
+                        return ["unexpected"];
+                    }}
+                    return ["ok"];
+                }}
+                "#
+            ),
+        )
+        .unwrap();
+
+        let mgr = PluginManager::new(root.join("plugins"), root.join("data")).unwrap();
+        mgr.set_web_sign_in_handler(Some(Arc::new(|req| {
+            Ok(WebSignInResult {
+                ok: true,
+                url: req.url,
+                cookie: "SID=1".to_owned(),
+                ..WebSignInResult::default()
+            })
+        })));
+        let pending = mgr.stage_from_dir(&fixture).expect("stage");
+        let src = mgr
+            .confirm_staged(&pending, false)
+            .expect("confirm ungranted");
+
+        // Disallowed host rejected.
+        let err = src.suggest("blocked-host").expect_err("disallowed host");
+        assert!(err.to_string().contains("network permission"), "got {err}");
+
+        // Loopback fetch denied while `!granted` (not explicitly in `permissions.network`).
+        assert!(src.suggest("loopback").is_err());
+
+        // `webSignIn` rejects non-https URL and `cookiesOf` outside `permissions.network`.
+        let err_http = src.suggest("bad-signin-url").expect_err("http webSignIn");
+        assert!(
+            err_http.to_string().contains("not a secure web address"),
+            "got {err_http}"
+        );
+        let err_co = src
+            .suggest("bad-cookies-of")
+            .expect_err("disallowed cookiesOf");
+        assert!(
+            err_co.to_string().contains("can't reach evil.other.test"),
+            "got {err_co}"
+        );
+
+        // Granting Allow Programs writes `granted.json`, restarts runtime, and unlocks loopback fetch.
+        mgr.set_granted("sec-demo", true).expect("grant");
+        assert!(root.join("data/sec-demo/granted.json").is_file());
+        assert_eq!(
+            src.suggest("loopback").expect("loopback after grant"),
+            vec!["ok"]
+        );
+
+        // Undeclared desktop binary rejected by `allows_process`.
+        let err_proc = src.suggest("undeclared-proc").expect_err("undeclared proc");
+        assert!(
+            err_proc.to_string().contains("isn't one of the programs"),
+            "got {err_proc}"
+        );
+
+        // Settings persist in `settings.json`.
+        src.set_setting("k1", "v1").expect("set_setting");
+        assert!(root.join("data/sec-demo/settings.json").is_file());
+        let reloaded = mgr.reload("sec-demo").expect("reload");
+        assert_eq!(reloaded.setting("k1"), "v1");
+        assert!(reloaded.compatibility_info().granted);
+
+        mgr.shutdown_all();
+        // Wake loopback listener if second accept is still pending.
+        let _ = std::net::TcpStream::connect(("127.0.0.1", port));
+        let _ = srv_thread.join();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn aes_ecb_two_arg_mygo_order_and_open_url_handler_and_timeout_recovery() {
+        let root = temp_workspace("crypto-openurl-timeout");
+        let fixture = root.join("fixture-misc");
+        fs::create_dir_all(&fixture).unwrap();
+
+        fs::write(
+            fixture.join("plugin.json"),
+            r#"{"id":"misc-demo","name":"Misc Demo","main":"index.js"}"#,
+        )
+        .unwrap();
+        fs::write(
+            fixture.join("index.js"),
+            r#"
+            export async function suggest({ query }) {
+                if (query === "aes") {
+                    // mygo-music 2-arg convention: aesEcbEncrypt(key, text) -> lowercase hex
+                    const hexOut = host.crypto.aesEcbEncrypt("e82ckenh8dichen8", "hello mygo-music");
+                    // legacy 3-arg convention: aesEcbEncrypt(plaintext, key, "base64")
+                    const b64Out = host.crypto.aesEcbEncrypt("hello mygo-music", "e82ckenh8dichen8", "base64");
+                    const dec = host.crypto.aesEcbDecrypt(hexOut, "e82ckenh8dichen8", "hex");
+                    return [hexOut, b64Out, dec];
+                }
+                if (query === "open-ok") {
+                    host.openURL("https://music.example.com/auth");
+                    return ["opened"];
+                }
+                if (query === "open-bad") {
+                    host.openURL("file:///etc/passwd");
+                    return ["bad"];
+                }
+                if (query === "hang") {
+                    while (true) {}
+                }
+                return ["alive:" + query];
+            }
+            "#,
+        )
+        .unwrap();
+
+        let opened_urls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let opened_clone = Arc::clone(&opened_urls);
+
+        // Run in mobile mode to prove OpenUrlHandler works on mobile too.
+        let mgr = PluginManager::new(root.join("plugins"), root.join("data"))
+            .unwrap()
+            .with_mobile_override(true);
+        mgr.set_open_url_handler(Some(Arc::new(move |url| {
+            opened_clone.lock().unwrap().push(url.to_owned());
+            Ok(())
+        })));
+
+        let src = mgr.install_from_dir(&fixture).expect("install misc-demo");
+
+        // 1. AES-ECB both 2-arg (mygo-music) and 3-arg (legacy) signatures match exact Rust crypto.
+        let aes = src.suggest("aes").expect("aes");
+        let expected_ct =
+            crate::crypto::aes_ecb_encrypt(b"hello mygo-music", b"e82ckenh8dichen8").unwrap();
+        assert_eq!(aes[0], crate::crypto::hex_encode(&expected_ct));
+        assert_eq!(aes[1], crate::crypto::base64_encode(&expected_ct));
+        assert_eq!(aes[2], "hello mygo-music");
+
+        // 2. OpenUrlHandler works on mobile and rejects non-http(s) schemes.
+        assert_eq!(src.suggest("open-ok").expect("openURL"), vec!["opened"]);
+        assert_eq!(
+            *opened_urls.lock().unwrap(),
+            vec!["https://music.example.com/auth".to_owned()]
+        );
+        assert!(src.suggest("open-bad").is_err());
+
+        // 3. Per-call timeout interrupts infinite loop & transparently restarts QuickJS worker.
+        src.set_call_timeout_override(Some(std::time::Duration::from_millis(120)));
+        let timeout_err = src
+            .suggest("hang")
+            .expect_err("infinite loop must time out");
+        assert!(
+            timeout_err.to_string().contains("in time"),
+            "unexpected timeout err: {timeout_err}"
+        );
+        src.set_call_timeout_override(None);
+        assert_eq!(
+            src.suggest("recovered")
+                .expect("worker must recover after timeout"),
+            vec!["alive:recovered"]
+        );
+
+        mgr.shutdown_all();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mobile_virtual_ffmpeg_relays_audio_without_desktop_grant_and_probes_degrade_cleanly() {
+        let root = temp_workspace("mobile-virtual-ffmpeg");
+        let fixture = root.join("fixture-mobile-relay");
+        fs::create_dir_all(&fixture).unwrap();
+
+        let upstream = TcpListener::bind("127.0.0.1:0").expect("bind upstream");
+        let upstream_port = upstream.local_addr().unwrap().port();
+        let audio_payload =
+            b"\x00\x00\x00\x18ftypM4A \x00\x00\x00\x00M4A mp42isomGENERIC_RELAY_OK".to_vec();
+        let payload_for_srv = audio_payload.clone();
+        let upstream_thread = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = upstream.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: audio/mp4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    payload_for_srv.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.write_all(&payload_for_srv);
+            }
+        });
+
+        let relay_port = {
+            let p = TcpListener::bind("127.0.0.1:0").unwrap();
+            p.local_addr().unwrap().port()
+        };
+
+        fs::write(
+            fixture.join("plugin.json"),
+            r#"{
+                "id": "mobile-relay-sim",
+                "name": "Mobile Relay Sim",
+                "main": "index.js",
+                "permissions": {
+                    "network": ["127.0.0.1"],
+                    "process": ["ffmpeg"]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        fs::write(
+            fixture.join("index.js"),
+            format!(
+                r#"
+                export async function suggest() {{
+                    // Probing an optional desktop binary on mobile must NOT contain "allowed" in error text.
+                    try {{
+                        host.spawn("deno", ["--version"]);
+                        return ["unexpected"];
+                    }} catch (e) {{
+                        return [String(/allowed/i.test(e.message)), e.name || ""];
+                    }}
+                }}
+
+                export async function stream({{ id, quality }}) {{
+                    const listenUrl = "http://127.0.0.1:{relay_port}/";
+                    const proc = host.spawn("ffmpeg", [
+                        "-nostdin", "-hide_banner", "-nostats",
+                        "-user_agent", "nsh-mobile-test/1.0",
+                        "-i", "http://127.0.0.1:{upstream_port}/track.m4a",
+                        "-vn", "-c:a", "libmp3lame", "-b:a", "192k", "-id3v2_version", "0", "-write_xing", "0",
+                        "-f", "mp3", "-listen", "1", listenUrl,
+                    ]);
+                    proc.closeStdin();
+                    for (let i = 0; i < 60; i++) {{
+                        if (proc.errorOutput().includes("Input #0")) break;
+                        await host.sleep(15);
+                    }}
+                    if (!proc.errorOutput().includes("Input #0")) {{
+                        throw new Error("no Input #0: " + proc.errorOutput());
+                    }}
+                    return {{ url: listenUrl, type: "mp3", quality, bitRate: 192000 }};
+                }}
+                "#
+            ),
+        )
+        .unwrap();
+
+        // Mobile mode without desktop Allow Programs (`granted = false`):
+        // - `ffmpeg` still runs in-process via `VirtualFfmpegShim` (pure passthrough)
+        // - optional non-virtualized CLI probes reject without `"allowed"` in error text.
+        let mgr = PluginManager::new(root.join("plugins"), root.join("data"))
+            .unwrap()
+            .with_mobile_override(true);
+        let pending = mgr.stage_from_dir(&fixture).expect("stage");
+        let src = mgr
+            .confirm_staged(&pending, false)
+            .expect("confirm mobile ungranted");
+
+        let probe = src.suggest("").expect("mobile probe catches sandbox error");
+        assert_eq!(probe, vec!["false", "MobileSandboxError"]);
+
+        let st = src
+            .stream("t1", Quality::High)
+            .expect("mobile ffmpeg relay");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (ct, bytes) = rt.block_on(async {
+            let client = reqwest::Client::new();
+            let resp = client.get(&st.url).send().await.expect("GET mobile relay");
+            assert!(resp.status().is_success());
+            let ct = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_owned();
+            let b = resp.bytes().await.expect("relay body").to_vec();
+            (ct, b)
+        });
+        assert_eq!(ct, "audio/mp4");
+        assert_eq!(bytes, audio_payload);
+
+        mgr.shutdown_all();
+        let _ = upstream_thread.join();
         let _ = fs::remove_dir_all(&root);
     }
 }

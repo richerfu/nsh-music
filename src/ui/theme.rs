@@ -140,14 +140,14 @@ pub const fn adaptive(light: Rgba, dark: Rgba) -> AdaptiveColor {
 pub mod colors {
     use super::{AdaptiveColor, adaptive, rgb, rgb_a};
 
-    pub const BACKGROUND: AdaptiveColor = adaptive(rgb(0xfdfcfb), rgb(0x141416));
+    pub const BACKGROUND: AdaptiveColor = adaptive(rgb(0xffffff), rgb(0x141416));
     pub const FOREGROUND: AdaptiveColor = adaptive(rgb(0x1d1d1f), rgb(0xf5f5f7));
-    pub const SIDEBAR: AdaptiveColor = adaptive(rgb(0xf4f3f1), rgb(0x1c1c1f));
+    pub const SIDEBAR: AdaptiveColor = adaptive(rgb(0xf4f4f6), rgb(0x1c1c1f));
     pub const SIDEBAR_FOREGROUND: AdaptiveColor = adaptive(rgb(0x1d1d1f), rgb(0xf5f5f7));
-    pub const SIDEBAR_ACCENT: AdaptiveColor = adaptive(rgb(0xeae8e5), rgb(0x2a2a2f));
-    pub const SIDEBAR_BORDER: AdaptiveColor = adaptive(rgb(0xe5e3df), rgb(0x26262a));
+    pub const SIDEBAR_ACCENT: AdaptiveColor = adaptive(rgb(0xe9e9ee), rgb(0x2a2a2f));
+    pub const SIDEBAR_BORDER: AdaptiveColor = adaptive(rgb(0xe5e5ea), rgb(0x26262a));
 
-    pub const CARD: AdaptiveColor = adaptive(rgb(0xf8f7f5), rgb(0x222226));
+    pub const CARD: AdaptiveColor = adaptive(rgb(0xf8f8fa), rgb(0x222226));
     pub const CARD_ELEVATED: AdaptiveColor = adaptive(rgb(0xffffff), rgb(0x28282d));
     pub const CARD_FOREGROUND: AdaptiveColor = adaptive(rgb(0x1d1d1f), rgb(0xf5f5f7));
 
@@ -155,40 +155,44 @@ pub mod colors {
     pub const POPOVER_FOREGROUND: AdaptiveColor = adaptive(rgb(0x1d1d1f), rgb(0xf5f5f7));
 
     /// Coral Rose brand accent (light & dark tuned for crisp contrast).
-    pub const PRIMARY: AdaptiveColor = adaptive(rgb(0xe53e38), rgb(0xf45d6c));
+    pub const PRIMARY: AdaptiveColor = adaptive(rgb(0xe53e38), rgb(0xfa586a));
     pub const PRIMARY_HOVER: AdaptiveColor = adaptive(rgb(0xcc332e), rgb(0xff7280));
     pub const PRIMARY_FOREGROUND: AdaptiveColor = adaptive(rgb(0xffffff), rgb(0xffffff));
-    pub const PRIMARY_SOFT: AdaptiveColor = adaptive(rgb_a(0xe53e38, 0.12), rgb_a(0xf45d6c, 0.18));
+    pub const PRIMARY_SOFT: AdaptiveColor = adaptive(rgb_a(0xe53e38, 0.12), rgb_a(0xfa586a, 0.18));
 
     /// Secondary Amber Gold accent (lossless badges, vinyl highlights, warm glows).
     pub const AMBER: AdaptiveColor = adaptive(rgb(0xd98a16), rgb(0xf5a623));
     pub const AMBER_FOREGROUND: AdaptiveColor = adaptive(rgb(0x1d1508), rgb(0x1d1508));
     pub const AMBER_SOFT: AdaptiveColor = adaptive(rgb_a(0xd98a16, 0.13), rgb_a(0xf5a623, 0.18));
+    /// Warm champagne gold used for the Lossless badge on the dark Now Playing stage.
+    pub const LOSSLESS_GOLD: AdaptiveColor = adaptive(rgb(0xf5d58a), rgb(0xf5d58a));
 
-    pub const SECONDARY: AdaptiveColor = adaptive(rgb(0xefeee9), rgb(0x26262b));
+    pub const SECONDARY: AdaptiveColor = adaptive(rgb(0xefeff4), rgb(0x26262b));
     pub const SECONDARY_FOREGROUND: AdaptiveColor = adaptive(rgb(0x1d1d1f), rgb(0xf5f5f7));
 
-    pub const MUTED: AdaptiveColor = adaptive(rgb(0xf0efeb), rgb(0x232328));
-    pub const MUTED_FOREGROUND: AdaptiveColor = adaptive(rgb(0x6c6c73), rgb(0x9898a3));
-    pub const FAINT_FOREGROUND: AdaptiveColor = adaptive(rgb(0x9c9ca4), rgb(0x63636e));
+    pub const MUTED: AdaptiveColor = adaptive(rgb(0xf0f0f5), rgb(0x232328));
+    pub const MUTED_FOREGROUND: AdaptiveColor =
+        adaptive(rgb_a(0x3c3c43, 0.62), rgb_a(0xebebf5, 0.56));
+    pub const FAINT_FOREGROUND: AdaptiveColor =
+        adaptive(rgb_a(0x3c3c43, 0.32), rgb_a(0xebebf5, 0.30));
 
-    pub const ACCENT: AdaptiveColor = adaptive(rgb(0xe9e7e3), rgb(0x2c2c32));
+    pub const ACCENT: AdaptiveColor = adaptive(rgb(0xe8e8ee), rgb(0x2c2c32));
     pub const ACCENT_FOREGROUND: AdaptiveColor = adaptive(rgb(0x1d1d1f), rgb(0xf5f5f7));
 
-    pub const BORDER: AdaptiveColor = adaptive(rgb_a(0x1d1d1f, 0.09), rgb_a(0xffffff, 0.09));
-    pub const BORDER_STRONG: AdaptiveColor = adaptive(rgb_a(0x1d1d1f, 0.16), rgb_a(0xffffff, 0.16));
-    pub const INPUT: AdaptiveColor = adaptive(rgb(0xdcdad4), rgb(0x323238));
-    pub const RING: AdaptiveColor = adaptive(rgb(0xe53e38), rgb(0xf45d6c));
+    pub const BORDER: AdaptiveColor = adaptive(rgb_a(0x000000, 0.07), rgb_a(0xffffff, 0.07));
+    pub const BORDER_STRONG: AdaptiveColor = adaptive(rgb_a(0x000000, 0.14), rgb_a(0xffffff, 0.15));
+    pub const INPUT: AdaptiveColor = adaptive(rgb(0xdcdce3), rgb(0x323238));
+    pub const RING: AdaptiveColor = adaptive(rgb(0xe53e38), rgb(0xfa586a));
 
-    /// Subtle interactive washes.
-    pub const HOVER: AdaptiveColor = adaptive(rgb_a(0x1d1d1f, 0.05), rgb_a(0xffffff, 0.06));
-    pub const PRESS: AdaptiveColor = adaptive(rgb_a(0x1d1d1f, 0.10), rgb_a(0xffffff, 0.12));
-    pub const SELECTED: AdaptiveColor = adaptive(rgb_a(0xe53e38, 0.10), rgb_a(0xf45d6c, 0.16));
+    /// Subtle interactive washes matching macOS / `mygo-music` chrome.
+    pub const HOVER: AdaptiveColor = adaptive(rgb_a(0x000000, 0.04), rgb_a(0xffffff, 0.06));
+    pub const PRESS: AdaptiveColor = adaptive(rgb_a(0x000000, 0.08), rgb_a(0xffffff, 0.10));
+    pub const SELECTED: AdaptiveColor = adaptive(rgb_a(0xe53e38, 0.10), rgb_a(0xfa586a, 0.16));
 
     /// Translucent glass surfaces.
-    pub const GLASS: AdaptiveColor = adaptive(rgb_a(0xfdfcfb, 0.84), rgb_a(0x18181c, 0.82));
-    pub const GLASS_BAR: AdaptiveColor = adaptive(rgb_a(0xf8f7f5, 0.88), rgb_a(0x1c1c1f, 0.88));
-    pub const GLASS_RIM: AdaptiveColor = adaptive(rgb_a(0x1d1d1f, 0.08), rgb_a(0xffffff, 0.10));
+    pub const GLASS: AdaptiveColor = adaptive(rgb_a(0xffffff, 0.86), rgb_a(0x18181c, 0.84));
+    pub const GLASS_BAR: AdaptiveColor = adaptive(rgb_a(0xf8f8fa, 0.90), rgb_a(0x1c1c1f, 0.88));
+    pub const GLASS_RIM: AdaptiveColor = adaptive(rgb_a(0x000000, 0.07), rgb_a(0xffffff, 0.09));
 
     /// Semantic status tokens.
     pub const OK: AdaptiveColor = adaptive(rgb(0x16a34a), rgb(0x4ade80));
@@ -215,6 +219,12 @@ pub mod colors {
         adaptive(rgb_a(0x0b0b0d, 0.62), rgb_a(0x0b0b0d, 0.68));
     pub const MEDIA_BADGE_FG: AdaptiveColor = adaptive(rgb(0xffffff), rgb(0xffffff));
     pub const SKELETON: AdaptiveColor = adaptive(rgb(0xe8e7e3), rgb(0x2b2b31));
+    pub const SKELETON_SHEEN: AdaptiveColor =
+        adaptive(rgb_a(0xffffff, 0.56), rgb_a(0xffffff, 0.09));
+    pub const NP_SKELETON_BASE: AdaptiveColor =
+        adaptive(rgb_a(0xffffff, 0.10), rgb_a(0xffffff, 0.10));
+    pub const NP_SKELETON_SHEEN: AdaptiveColor =
+        adaptive(rgb_a(0xffffff, 0.18), rgb_a(0xffffff, 0.18));
     pub const TRACK_RAIL: AdaptiveColor = adaptive(rgb_a(0x1d1d1f, 0.12), rgb_a(0xffffff, 0.14));
     pub const TRACK_BUFFERED: AdaptiveColor =
         adaptive(rgb_a(0x1d1d1f, 0.24), rgb_a(0xffffff, 0.26));
@@ -290,6 +300,11 @@ pub fn amber() -> AdaptiveColor {
 
 pub fn amber_soft() -> AdaptiveColor {
     colors::AMBER_SOFT
+}
+
+/// Warm champagne gold (`#f5d58a`) for the Lossless badge on the Now Playing stage.
+pub fn lossless_gold() -> AdaptiveColor {
+    colors::LOSSLESS_GOLD
 }
 
 pub fn secondary() -> AdaptiveColor {
@@ -432,6 +447,73 @@ pub fn track_buffered() -> AdaptiveColor {
     colors::TRACK_BUFFERED
 }
 
+/// Converts `r, g, b` (`0.0..=1.0`) into `(hue_deg in 0..360, sat in 0..1, val in 0..1)`.
+fn rgb_to_hsv(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let d = max - min;
+    let h = if d <= 1e-6 {
+        0.0
+    } else if (max - r).abs() <= 1e-6 {
+        60.0 * (((g - b) / d).rem_euclid(6.0))
+    } else if (max - g).abs() <= 1e-6 {
+        60.0 * (((b - r) / d) + 2.0)
+    } else {
+        60.0 * (((r - g) / d) + 4.0)
+    };
+    let s = if max <= 1e-6 { 0.0 } else { d / max };
+    (h.rem_euclid(360.0), s.clamp(0.0, 1.0), max.clamp(0.0, 1.0))
+}
+
+/// Exact port of `egoist/mygo-music` `hsvColor(h, s, v)` (`backdrop.go:262-282`).
+fn hsv_to_hsla(h_deg: f32, s: f32, v: f32) -> Hsla {
+    let h = h_deg.rem_euclid(360.0);
+    let s = s.clamp(0.0, 1.0);
+    let v = v.clamp(0.0, 1.0);
+    let c = v * s;
+    let x = c * (1.0 - (((h / 60.0) % 2.0) - 1.0).abs());
+    let (r, g, b) = if h < 60.0 {
+        (c, x, 0.0)
+    } else if h < 120.0 {
+        (x, c, 0.0)
+    } else if h < 180.0 {
+        (0.0, c, x)
+    } else if h < 240.0 {
+        (0.0, x, c)
+    } else if h < 300.0 {
+        (x, 0.0, c)
+    } else {
+        (c, 0.0, x)
+    };
+    let m = v - c;
+    let r8 = ((r + m) * 255.0 + 0.5).clamp(0.0, 255.0) as u32;
+    let g8 = ((g + m) * 255.0 + 0.5).clamp(0.0, 255.0) as u32;
+    let b8 = ((b + m) * 255.0 + 0.5).clamp(0.0, 255.0) as u32;
+    rgb((r8 << 16) | (g8 << 8) | b8).to_hsla()
+}
+
+/// Linearly blends two [`Hsla`] colors in sRGB space (`t = 0.0` returns `a`,
+/// `t = 1.0` returns `b`), matching Go `ui.Color.Mix(other, t)` without hue spin.
+pub fn mix_color(a: Hsla, b: Hsla, t: f32) -> Hsla {
+    let t = t.clamp(0.0, 1.0);
+    let ca = a.to_rgb();
+    let cb = b.to_rgb();
+    Rgba {
+        r: ca.r + (cb.r - ca.r) * t,
+        g: ca.g + (cb.g - ca.g) * t,
+        b: ca.b + (cb.b - ca.b) * t,
+        a: ca.a + (cb.a - ca.a) * t,
+    }
+    .to_hsla()
+}
+
+/// Converts raw extracted cover RGB bytes directly into [`Hsla`] without
+/// pre-muting so downstream HSV helpers receive the cover's true hue/saturation.
+pub fn raw_accent_from_rgb(r: u8, g: u8, b: u8) -> Hsla {
+    let hex24 = (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
+    rgb(hex24).to_hsla()
+}
+
 /// Default ambient artwork accent (`Hsla` of Coral Rose muted for backdrops).
 pub fn default_artwork_accent() -> Hsla {
     hsla(0.985, 0.56, 0.42, 1.0)
@@ -454,19 +536,42 @@ pub fn artwork_wash(accent: Hsla, alpha: f32) -> AdaptiveColor {
     AdaptiveColor::new(hsla(h, s, 0.50, a * 0.7), hsla(h, s, 0.46, a))
 }
 
-/// Derives a deep atmospheric backdrop base color for the Now Playing stage.
-pub fn artwork_stage_bg(accent: Hsla) -> Hsla {
-    let h = accent.h.rem_euclid(1.0);
-    let s = accent.s.clamp(0.22, 0.52);
-    hsla(h, s, 0.10, 1.0)
+/// Derives the `(top, foot)` gradient shades for the Now Playing stage backdrop,
+/// ported 1:1 from `egoist/mygo-music` `backdropColors` (`backdrop.go:234-240`).
+/// Neutral gray covers (`s <= 0.12`) remain gray.
+pub fn artwork_backdrop_colors(accent: Hsla) -> (Hsla, Hsla) {
+    let c = accent.to_rgb();
+    let (h, mut s, _) = rgb_to_hsv(c.r, c.g, c.b);
+    if s > 0.12 {
+        s = (s * 1.3).clamp(0.45, 0.66);
+    }
+    (
+        hsv_to_hsla(h, s, 0.35),
+        hsv_to_hsla(h, (s * 1.05).min(0.70), 0.24),
+    )
 }
 
-/// Derives contrasting `(deep, fog)` colors for the WGSL ambient fog shader.
+/// Derives a deep atmospheric backdrop base color for the Now Playing stage.
+pub fn artwork_stage_bg(accent: Hsla) -> Hsla {
+    artwork_backdrop_colors(accent).1
+}
+
+/// Derives contrasting `(deep, fog)` colors for the WGSL ambient fog shader,
+/// ported 1:1 from `egoist/mygo-music` `fogColors` (`backdrop.go:253-259`).
+/// Neutral gray covers (`s <= 0.12`) remain gray.
 pub fn artwork_fog_colors(accent: Hsla) -> (Hsla, Hsla) {
-    let h = accent.h.rem_euclid(1.0);
-    let deep = hsla(h, accent.s.clamp(0.28, 0.54), 0.085, 1.0);
-    let fog = hsla(h, accent.s.clamp(0.36, 0.68), 0.44, 1.0);
-    (deep, fog)
+    let c = accent.to_rgb();
+    let (h, mut s, _) = rgb_to_hsv(c.r, c.g, c.b);
+    if s > 0.12 {
+        s = (s * 1.3).clamp(0.60, 0.85);
+    }
+    (hsv_to_hsla(h, s, 0.30), hsv_to_hsla(h, s * 0.60, 0.72))
+}
+
+/// Derives the luminous Now Playing stage accent (`tint.Mix(white, 0.45)`)
+/// used for active indicators, lyrics highlights, and scrubber smoke on the dark stage.
+pub fn artwork_np_accent(accent: Hsla) -> Hsla {
+    mix_color(accent, colors::NP_FG.dark, 0.45)
 }
 
 /// Curated warm/editorial 2-stop cover palettes for offline or demo artwork.
@@ -701,14 +806,70 @@ pub trait Elevated: Styled + Sized {
         self.bg(colors::GLASS)
             .border_1()
             .border_color(colors::GLASS_RIM)
-            .backdrop_blur(px(22.0))
+            .backdrop_blur(px(16.0))
             .elevation(Elevation::Floating)
     }
 
     /// Translucent bar surface for sticky desktop player bar and top chrome.
     fn glass_bar_surface(self) -> Self {
-        self.bg(colors::GLASS_BAR).backdrop_blur(px(20.0))
+        self.bg(colors::GLASS_BAR).backdrop_blur(px(16.0))
     }
 }
 
 impl<T: Styled + Sized> Elevated for T {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gray_cover_stays_neutral_in_backdrop_and_fog() {
+        let gray = raw_accent_from_rgb(128, 128, 128);
+        let (deep, fog) = artwork_fog_colors(gray);
+        assert!(
+            deep.s < 0.02,
+            "expected neutral gray deep, got s={}",
+            deep.s
+        );
+        assert!(fog.s < 0.02, "expected neutral gray fog, got s={}", fog.s);
+
+        let (top, foot) = artwork_backdrop_colors(gray);
+        assert!(top.s < 0.02, "expected neutral gray top, got s={}", top.s);
+        assert!(
+            foot.s < 0.02,
+            "expected neutral gray foot, got s={}",
+            foot.s
+        );
+    }
+
+    #[test]
+    fn saturated_cover_matches_mygo_hsv_targets() {
+        let coral = raw_accent_from_rgb(240, 80, 96);
+        let (deep, fog) = artwork_fog_colors(coral);
+        let deep_rgb = deep.to_rgb();
+        let fog_rgb = fog.to_rgb();
+        let (_, deep_s, deep_v) = rgb_to_hsv(deep_rgb.r, deep_rgb.g, deep_rgb.b);
+        let (_, fog_s, fog_v) = rgb_to_hsv(fog_rgb.r, fog_rgb.g, fog_rgb.b);
+        assert!((0.58..=0.88).contains(&deep_s), "deep_s={deep_s}");
+        assert!((0.27..=0.33).contains(&deep_v), "deep_v={deep_v}");
+        assert!((fog_s - deep_s * 0.60).abs() < 0.04, "fog_s={fog_s}");
+        assert!((0.69..=0.75).contains(&fog_v), "fog_v={fog_v}");
+
+        let (top, foot) = artwork_backdrop_colors(coral);
+        let top_rgb = top.to_rgb();
+        let foot_rgb = foot.to_rgb();
+        let (_, top_s, top_v) = rgb_to_hsv(top_rgb.r, top_rgb.g, top_rgb.b);
+        let (_, _, foot_v) = rgb_to_hsv(foot_rgb.r, foot_rgb.g, foot_rgb.b);
+        assert!((0.43..=0.68).contains(&top_s), "top_s={top_s}");
+        assert!((0.32..=0.38).contains(&top_v), "top_v={top_v}");
+        assert!((0.21..=0.27).contains(&foot_v), "foot_v={foot_v}");
+    }
+
+    #[test]
+    fn np_accent_mixes_toward_white_in_srgb() {
+        let blue = raw_accent_from_rgb(0, 100, 200);
+        let mixed = artwork_np_accent(blue).to_rgb();
+        assert!((mixed.r - 0.45).abs() < 0.02, "r={}", mixed.r);
+        assert!(mixed.b > 0.85, "b={}", mixed.b);
+    }
+}

@@ -394,10 +394,7 @@ fn b64_val(byte: u8) -> Option<u8> {
 
 /// Decodes standard or URL-safe Base64 (ignoring ASCII whitespace, tolerant of omitted padding).
 pub fn base64_decode(input: &str) -> Result<Vec<u8>, CryptoError> {
-    let cleaned: Vec<u8> = input
-        .bytes()
-        .filter(|b| !b.is_ascii_whitespace())
-        .collect();
+    let cleaned: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
     if cleaned.is_empty() {
         return Ok(Vec::new());
     }
@@ -424,8 +421,9 @@ pub fn base64_decode(input: &str) -> Result<Vec<u8>, CryptoError> {
         let rem = unpadded.len() - i;
         let v0 = b64_val(unpadded[i])
             .ok_or_else(|| CryptoError::InvalidBase64(format!("invalid byte at index {i}")))?;
-        let v1 = b64_val(unpadded[i + 1])
-            .ok_or_else(|| CryptoError::InvalidBase64(format!("invalid byte at index {}", i + 1)))?;
+        let v1 = b64_val(unpadded[i + 1]).ok_or_else(|| {
+            CryptoError::InvalidBase64(format!("invalid byte at index {}", i + 1))
+        })?;
         out.push((v0 << 2) | (v1 >> 4));
 
         if rem >= 3 {

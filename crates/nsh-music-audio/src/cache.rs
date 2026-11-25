@@ -6,9 +6,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, HOST, LOCATION, RANGE};
+use reqwest::header::{
+    ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, HOST, HeaderMap, HeaderName,
+    HeaderValue, LOCATION, RANGE,
+};
 use reqwest::{Client, Method, Response};
 use sha2::{Digest, Sha256};
+use tokio::sync::Notify;
 use url::Url;
 
 use crate::{AudioError, AudioResult};
@@ -88,6 +92,19 @@ pub fn build_no_redirect_client(connect_timeout: Duration) -> AudioResult<Client
         .map_err(|e| AudioError::Http(format!("failed to build HTTP client: {e}")))
 }
 
+/// Builds a `reqwest::Client` for local loopback streams (`127.0.0.1`, `localhost`, `::1`)
+/// with `Policy::none()` and `.no_proxy()` so local relays are never intercepted by OS
+/// system proxy settings.
+pub fn build_loopback_no_redirect_client(connect_timeout: Duration) -> AudioResult<Client> {
+    Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .connect_timeout(connect_timeout)
+        .tcp_nodelay(true)
+        .build()
+        .map_err(|e| AudioError::Http(format!("failed to build loopback HTTP client: {e}")))
+}
+
 /// Sends an HTTP request and manually follows HTTP 3xx redirects up to `max_redirects`
 /// while preserving all custom `headers` (e.g. `Referer`, `Cookie`, `User-Agent`, `Origin`,
 /// `Authorization`) across cross-host CDN redirects.
@@ -102,8 +119,8 @@ pub async fn send_with_preserved_headers(
     range: Option<&str>,
     max_redirects: usize,
 ) -> AudioResult<RedirectedResponse> {
-    let mut current_url =
-        Url::parse(url).map_err(|e| AudioError::InvalidInput(format!("invalid URL '{url}': {e}")))?;
+    let mut current_url = Url::parse(url)
+        .map_err(|e| AudioError::InvalidInput(format!("invalid URL '{url}': {e}")))?;
     let mut current_method = method;
     let mut redirect_count = 0usize;
 
@@ -178,11 +195,12 @@ pub async fn send_with_preserved_headers(
             .get(CONTENT_RANGE)
             .and_then(|v| v.to_str().ok())
             .and_then(parse_content_range_total);
-        let total_size = content_range_total.or(if status == reqwest::StatusCode::PARTIAL_CONTENT {
-            None
-        } else {
-            content_length
-        });
+        let total_size =
+            content_range_total.or(if status == reqwest::StatusCode::PARTIAL_CONTENT {
+                None
+            } else {
+                content_length
+            });
         let accepts_ranges = status == reqwest::StatusCode::PARTIAL_CONTENT
             || resp_headers
                 .get(ACCEPT_RANGES)
@@ -213,6 +231,19 @@ pub fn parse_content_range_total(header_value: &str) -> Option<u64> {
     trimmed.parse::<u64>().ok()
 }
 
+/// Returns `true` when `url` points to a local loopback host (`127.0.0.1`, `localhost`,
+/// `::1`, etc.) such as an ephemeral [`VirtualFfmpegShim`](crate::VirtualFfmpegShim) relay.
+/// Ephemeral loopback URLs reuse ports across tracks and must never read from or persist
+/// into the disk LRU cache.
+pub(crate) fn is_loopback_url(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
 /// Computes a deterministic hex SHA-256 cache key for a URL or identifier.
 pub fn cache_key_for_url(url: &str) -> String {
     let mut hasher = Sha256::new();
@@ -233,6 +264,7 @@ struct AudioCacheInner {
     max_bytes: AtomicU64,
     chunk_size: usize,
     client: Client,
+    loopback_client: Client,
     access_seq: AtomicU64,
     entries: Mutex<HashMap<String, CacheEntry>>,
 }
@@ -260,12 +292,14 @@ impl AudioCache {
     pub fn new(config: StreamCacheConfig) -> AudioResult<Self> {
         fs::create_dir_all(&config.cache_dir)?;
         let client = build_no_redirect_client(config.connect_timeout)?;
+        let loopback_client = build_loopback_no_redirect_client(config.connect_timeout)?;
         let cache = Self {
             inner: Arc::new(AudioCacheInner {
                 cache_dir: config.cache_dir,
                 max_bytes: AtomicU64::new(config.max_bytes),
                 chunk_size: config.chunk_size.max(4096),
                 client,
+                loopback_client,
                 access_seq: AtomicU64::new(1),
                 entries: Mutex::new(HashMap::new()),
             }),
@@ -273,6 +307,14 @@ impl AudioCache {
         cache.scan_existing()?;
         cache.evict_if_needed()?;
         Ok(cache)
+    }
+
+    fn client_for_url(&self, url: &Url) -> &Client {
+        if is_loopback_url(url) {
+            &self.inner.loopback_client
+        } else {
+            &self.inner.client
+        }
     }
 
     /// Convenience constructor with an explicit cache directory and byte cap.
@@ -303,11 +345,7 @@ impl AudioCache {
     }
 
     pub fn entry_count(&self) -> usize {
-        self.inner
-            .entries
-            .lock()
-            .map(|e| e.len())
-            .unwrap_or(0)
+        self.inner.entries.lock().map(|e| e.len()).unwrap_or(0)
     }
 
     pub fn total_bytes(&self) -> u64 {
@@ -323,7 +361,11 @@ impl AudioCache {
         self.inner
             .entries
             .lock()
-            .map(|e| e.get(&key).map(|entry| entry.path.exists()).unwrap_or(false))
+            .map(|e| {
+                e.get(&key)
+                    .map(|entry| entry.path.exists())
+                    .unwrap_or(false)
+            })
             .unwrap_or(false)
     }
 
@@ -412,8 +454,13 @@ impl AudioCache {
             Some(e) => format!("bytes={start}-{e}"),
             None => format!("bytes={start}-"),
         });
+        let client = Url::parse(url)
+            .ok()
+            .as_ref()
+            .map(|parsed| self.client_for_url(parsed))
+            .unwrap_or(&self.inner.client);
         send_with_preserved_headers(
-            &self.inner.client,
+            client,
             Method::GET,
             url,
             headers,
@@ -436,13 +483,6 @@ impl AudioCache {
             return Ok(ProgressiveStream::from_local_file(file, len, None));
         }
 
-        if let Some(cached_path) = self.get_cached_path(url)
-            && let Ok(file) = File::open(&cached_path)
-        {
-            let len = file.metadata().map(|m| m.len()).unwrap_or(0);
-            return Ok(ProgressiveStream::from_local_file(file, len, None));
-        }
-
         let parsed = Url::parse(url)
             .map_err(|e| AudioError::InvalidInput(format!("unsupported media URI '{url}': {e}")))?;
         if parsed.scheme() != "http" && parsed.scheme() != "https" {
@@ -452,12 +492,21 @@ impl AudioCache {
             )));
         }
 
+        let is_loopback = is_loopback_url(&parsed);
+        if !is_loopback
+            && let Some(cached_path) = self.get_cached_path(url)
+            && let Ok(file) = File::open(&cached_path)
+        {
+            let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+            return Ok(ProgressiveStream::from_local_file(file, len, None));
+        }
+
         let key = cache_key_for_url(url);
         let final_path = self.final_path_for_key(&key);
         let part_path = self.part_path_for_key(&key);
 
         let rt = io_runtime_handle();
-        let client = self.inner.client.clone();
+        let client = self.client_for_url(&parsed).clone();
         let req_url = url.to_owned();
         let req_headers = headers.clone();
 
@@ -502,8 +551,10 @@ impl AudioCache {
                 finished: false,
                 error: None,
             }),
+            downloaded_atomic: AtomicU64::new(0),
             ready: Condvar::new(),
             cancelled: AtomicBool::new(false),
+            cancel_notify: Notify::new(),
         });
 
         let bg_shared = Arc::clone(&shared);
@@ -518,13 +569,26 @@ impl AudioCache {
             let mut total_written = 0u64;
             loop {
                 if bg_shared.cancelled.load(Ordering::Relaxed) {
+                    drop(writer);
                     let _ = fs::remove_file(&bg_part_path);
                     return;
                 }
-                match response.chunk().await {
+                let next_chunk = tokio::select! {
+                    _ = bg_shared.cancel_notify.notified() => {
+                        drop(writer);
+                        let _ = fs::remove_file(&bg_part_path);
+                        return;
+                    }
+                    chunk = response.chunk() => chunk,
+                };
+                match next_chunk {
                     Ok(Some(chunk)) => {
+                        if chunk.is_empty() {
+                            continue;
+                        }
                         if let Err(err) = writer.write_all(&chunk) {
                             bg_shared.set_error(format!("cache write error: {err}"));
+                            drop(writer);
                             let _ = fs::remove_file(&bg_part_path);
                             return;
                         }
@@ -534,18 +598,24 @@ impl AudioCache {
                     Ok(None) => {
                         let _ = writer.flush();
                         drop(writer);
-                        if fs::rename(&bg_part_path, &bg_final_path).is_ok() {
+                        if !is_loopback
+                            && bg_cache.max_bytes() > 0
+                            && fs::rename(&bg_part_path, &bg_final_path).is_ok()
+                        {
                             let _ = bg_cache.register_complete_entry(
                                 bg_key,
                                 bg_final_path,
                                 total_written,
                             );
+                        } else if !is_loopback || bg_shared.cancelled.load(Ordering::Relaxed) {
+                            let _ = fs::remove_file(&bg_part_path);
                         }
                         bg_shared.mark_finished(total_written);
                         return;
                     }
                     Err(err) => {
                         bg_shared.set_error(format!("HTTP stream error: {err}"));
+                        drop(writer);
                         let _ = fs::remove_file(&bg_part_path);
                         return;
                     }
@@ -557,7 +627,8 @@ impl AudioCache {
             cache: self.clone(),
             final_url: redirected.final_url.to_string(),
             headers,
-            read_file,
+            read_file: Some(read_file),
+            cleanup_part_path: if is_loopback { Some(part_path) } else { None },
             pos: 0,
             total_size: redirected.total_size,
             accepts_ranges: redirected.accepts_ranges,
@@ -577,6 +648,14 @@ impl AudioCache {
     ) -> tokio::task::JoinHandle<AudioResult<PathBuf>> {
         let cache = self.clone();
         io_runtime_handle().spawn(async move {
+            if cache.max_bytes() == 0 {
+                return Err(AudioError::Other("audio disk cache is disabled".into()));
+            }
+            if Url::parse(&url).ok().as_ref().is_some_and(is_loopback_url) {
+                return Err(AudioError::Other(
+                    "skipping disk cache prefetch for ephemeral loopback stream".into(),
+                ));
+            }
             if let Some(existing) = cache.get_cached_path(&url) {
                 return Ok(existing);
             }
@@ -604,7 +683,8 @@ impl AudioCache {
             }
             file.flush()?;
             drop(file);
-            // Only promote to complete cache entry if full track was downloaded (not partial range).
+            // Only promote to complete cache entry if full track was downloaded;
+            // remove partial temp files so they never leak in the cache directory.
             let is_complete = max_prefetch_bytes.is_none()
                 || resp
                     .total_size
@@ -615,7 +695,8 @@ impl AudioCache {
                 cache.register_complete_entry(key, final_path.clone(), written)?;
                 Ok(final_path)
             } else {
-                Ok(part_path)
+                let _ = fs::remove_file(&part_path);
+                Ok(final_path)
             }
         })
     }
@@ -734,12 +815,15 @@ struct ProgressiveProgress {
 
 struct ProgressiveShared {
     state: Mutex<ProgressiveProgress>,
+    downloaded_atomic: AtomicU64,
     ready: Condvar,
     cancelled: AtomicBool,
+    cancel_notify: Notify,
 }
 
 impl ProgressiveShared {
     fn advance_downloaded(&self, bytes: u64) {
+        self.downloaded_atomic.store(bytes, Ordering::Release);
         if let Ok(mut guard) = self.state.lock() {
             guard.downloaded = bytes;
             self.ready.notify_all();
@@ -747,6 +831,7 @@ impl ProgressiveShared {
     }
 
     fn mark_finished(&self, final_size: u64) {
+        self.downloaded_atomic.store(final_size, Ordering::Release);
         if let Ok(mut guard) = self.state.lock() {
             guard.downloaded = final_size;
             guard.total_size = Some(final_size);
@@ -773,7 +858,8 @@ struct RemoteStreamInner {
     cache: AudioCache,
     final_url: String,
     headers: Vec<(String, String)>,
-    read_file: File,
+    read_file: Option<File>,
+    cleanup_part_path: Option<PathBuf>,
     pos: u64,
     total_size: Option<u64>,
     accepts_ranges: bool,
@@ -785,6 +871,12 @@ struct RemoteStreamInner {
 impl Drop for RemoteStreamInner {
     fn drop(&mut self) {
         self.shared.cancelled.store(true, Ordering::Relaxed);
+        self.shared.cancel_notify.notify_waiters();
+        // Close read handle before removing ephemeral loopback `.part` files (Windows-safe).
+        let _ = self.read_file.take();
+        if let Some(ref part_path) = self.cleanup_part_path {
+            let _ = fs::remove_file(part_path);
+        }
     }
 }
 
@@ -803,10 +895,16 @@ impl RemoteStreamInner {
             None => offset + window_size - 1,
         };
 
-        let client = self.cache.inner.client.clone();
+        let client = Url::parse(&self.final_url)
+            .ok()
+            .as_ref()
+            .map(|parsed| self.cache.client_for_url(parsed))
+            .unwrap_or(&self.cache.inner.client)
+            .clone();
         let url = self.final_url.clone();
         let headers = self.headers.clone();
         let range_hdr = format!("bytes={offset}-{end}");
+        let max_full_fallback_bytes = offset.saturating_add(window_size) as usize;
         let (tx, rx) = std::sync::mpsc::channel();
 
         io_runtime_handle().spawn(async move {
@@ -820,14 +918,14 @@ impl RemoteStreamInner {
                     MAX_REDIRECTS,
                 )
                 .await?;
-                if resp.status != reqwest::StatusCode::PARTIAL_CONTENT
-                    && !resp.status.is_success()
+                if resp.status != reqwest::StatusCode::PARTIAL_CONTENT && !resp.status.is_success()
                 {
                     return Err(AudioError::Http(format!(
                         "range seek HTTP {} for {}",
                         resp.status, resp.final_url
                     )));
                 }
+                let status = resp.status;
                 let mut data = Vec::new();
                 while let Some(chunk) = resp
                     .response
@@ -836,14 +934,20 @@ impl RemoteStreamInner {
                     .map_err(|e| AudioError::Http(format!("range chunk error: {e}")))?
                 {
                     data.extend_from_slice(&chunk);
+                    // If server ignored Range (200 OK), stop once we cover the requested window.
+                    if status != reqwest::StatusCode::PARTIAL_CONTENT
+                        && data.len() >= max_full_fallback_bytes
+                    {
+                        break;
+                    }
                 }
-                Ok((data, resp.total_size))
+                Ok((status, data, resp.total_size))
             }
             .await;
             let _ = tx.send(res);
         });
 
-        let (data, updated_total) = rx
+        let (status, data, updated_total) = rx
             .recv()
             .map_err(|_| io::Error::other("range fetch task failed"))?
             .map_err(|e| io::Error::other(e.to_string()))?;
@@ -851,8 +955,45 @@ impl RemoteStreamInner {
         if let Some(total) = updated_total {
             self.total_size = Some(total);
         }
-        self.range_cache = Some(RangeWindow { start: offset, data });
-        Ok(())
+
+        if status == reqwest::StatusCode::PARTIAL_CONTENT {
+            self.range_cache = Some(RangeWindow {
+                start: offset,
+                data,
+            });
+            Ok(())
+        } else {
+            // Server ignored the HTTP Range header and sent bytes starting at offset 0.
+            // Never mislabel offset-0 bytes as `start: offset`.
+            self.accepts_ranges = false;
+            if offset < data.len() as u64 {
+                self.range_cache = Some(RangeWindow { start: 0, data });
+                Ok(())
+            } else {
+                self.range_cache = None;
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "upstream ignored HTTP Range request and did not cover requested offset",
+                ))
+            }
+        }
+    }
+
+    fn read_from_file_at(
+        &mut self,
+        offset: u64,
+        buf: &mut [u8],
+        avail: usize,
+    ) -> io::Result<usize> {
+        let file = self
+            .read_file
+            .as_mut()
+            .ok_or_else(|| io::Error::other("progressive read file closed"))?;
+        file.seek(SeekFrom::Start(offset))?;
+        let to_read = buf.len().min(avail);
+        let n = file.read(&mut buf[..to_read])?;
+        self.pos += n as u64;
+        Ok(n)
     }
 
     fn read_bytes(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -865,7 +1006,14 @@ impl RemoteStreamInner {
             return Ok(0);
         }
 
-        // Fast path: check if current position is already downloaded in the progressive file.
+        // Lock-free fast path: read directly from progressive file when already buffered.
+        let fast_downloaded = self.shared.downloaded_atomic.load(Ordering::Acquire);
+        if self.pos < fast_downloaded {
+            let avail = (fast_downloaded - self.pos) as usize;
+            return self.read_from_file_at(self.pos, buf, avail);
+        }
+
+        // Slow path: inspect progress state and range window.
         let (downloaded, finished, error) = {
             let guard = self
                 .shared
@@ -876,12 +1024,8 @@ impl RemoteStreamInner {
         };
 
         if self.pos < downloaded {
-            self.read_file.seek(SeekFrom::Start(self.pos))?;
             let avail = (downloaded - self.pos) as usize;
-            let to_read = buf.len().min(avail);
-            let n = self.read_file.read(&mut buf[..to_read])?;
-            self.pos += n as u64;
-            return Ok(n);
+            return self.read_from_file_at(self.pos, buf, avail);
         }
 
         // Check range window cache when seeking ahead of the progressive writer.
@@ -898,17 +1042,33 @@ impl RemoteStreamInner {
         }
 
         // If position is far ahead of the progressive download and server accepts ranges, fetch via HTTP Range!
-        const RANGE_JUMP_THRESHOLD: u64 = 128 * 1024;
+        // Keep threshold at 512 KiB so DASH fMP4 fragment skips (~160 KiB per `mdat`) reuse the
+        // already-open progressive download instead of firing dozens of serial Range connections.
+        const RANGE_JUMP_THRESHOLD: u64 = 512 * 1024;
         if self.accepts_ranges && self.pos > downloaded.saturating_add(RANGE_JUMP_THRESHOLD) {
-            self.fetch_range_window(self.pos, buf.len())?;
-            if let Some(window) = &self.range_cache {
-                if window.data.is_empty() {
-                    return Ok(0);
+            match self.fetch_range_window(self.pos, buf.len()) {
+                Ok(()) => {
+                    if let Some(window) = &self.range_cache {
+                        if window.data.is_empty() {
+                            return Ok(0);
+                        }
+                        if self.pos >= window.start
+                            && self.pos < window.start + window.data.len() as u64
+                        {
+                            let rel = (self.pos - window.start) as usize;
+                            let avail = window.data.len() - rel;
+                            let n = buf.len().min(avail);
+                            buf[..n].copy_from_slice(&window.data[rel..rel + n]);
+                            self.pos += n as u64;
+                            return Ok(n);
+                        }
+                    }
                 }
-                let n = buf.len().min(window.data.len());
-                buf[..n].copy_from_slice(&window.data[..n]);
-                self.pos += n as u64;
-                return Ok(n);
+                Err(err) if err.kind() == io::ErrorKind::Unsupported => {
+                    // Server ignored Range (`accepts_ranges` is now false); fall through
+                    // to the sequential progressive stream rather than returning bad bytes.
+                }
+                Err(err) => return Err(err),
             }
         }
 
@@ -947,11 +1107,7 @@ impl RemoteStreamInner {
         if self.pos < guard.downloaded {
             let avail = (guard.downloaded - self.pos) as usize;
             drop(guard);
-            self.read_file.seek(SeekFrom::Start(self.pos))?;
-            let to_read = buf.len().min(avail);
-            let n = self.read_file.read(&mut buf[..to_read])?;
-            self.pos += n as u64;
-            return Ok(n);
+            return self.read_from_file_at(self.pos, buf, avail);
         }
 
         if let Some(err) = guard.error.clone() {
@@ -993,10 +1149,7 @@ impl RemoteStreamInner {
 }
 
 enum StreamBackend {
-    Local {
-        file: File,
-        len: u64,
-    },
+    Local { file: File, len: u64 },
     Remote(RemoteStreamInner),
 }
 
@@ -1021,7 +1174,9 @@ impl ProgressiveStream {
 
     fn from_remote(inner: RemoteStreamInner) -> Self {
         let byte_len = inner.total_size;
-        let seekable = inner.accepts_ranges || byte_len.is_some();
+        // Symphonia demuxers (e.g. IsoMp4Reader) require `byte_len().is_some()` whenever
+        // `is_seekable() == true`; report seekable ONLY when total byte length is known.
+        let seekable = byte_len.is_some();
         let content_type = inner.content_type.clone();
         Self {
             backend: Mutex::new(StreamBackend::Remote(inner)),
@@ -1065,12 +1220,7 @@ impl ProgressiveStream {
         };
         match &*guard {
             StreamBackend::Local { len, .. } => *len,
-            StreamBackend::Remote(r) => r
-                .shared
-                .state
-                .lock()
-                .map(|s| s.downloaded)
-                .unwrap_or(0),
+            StreamBackend::Remote(r) => r.shared.state.lock().map(|s| s.downloaded).unwrap_or(0),
         }
     }
 }
@@ -1109,5 +1259,308 @@ impl symphonia::core::io::MediaSource for ProgressiveStream {
 
     fn byte_len(&self) -> Option<u64> {
         ProgressiveStream::byte_len(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    fn test_cache_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "nsh-cache-unit-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_unseekable_stream_when_content_length_missing() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let payload: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+        let server_payload = payload.clone();
+
+        let srv = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buf = [0u8; 2048];
+            let _ = socket.read(&mut buf).await;
+            // Advertise Accept-Ranges: bytes WITHOUT Content-Length (the exact trigger
+            // that previously crashed IsoMp4Reader with SeekError(Unseekable)).
+            let hdr = "HTTP/1.1 200 OK\r\nContent-Type: audio/mp4\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n";
+            socket.write_all(hdr.as_bytes()).await.expect("write hdr");
+            socket.write_all(&server_payload).await.expect("write body");
+            let _ = socket.shutdown().await;
+        });
+
+        let dir = test_cache_dir("unseekable");
+        let cache = AudioCache::with_dir(dir.clone(), 1024 * 1024).expect("cache");
+        let url = format!("http://{addr}/live-stream");
+
+        let mut stream = cache.open_progressive(&url, Vec::new()).expect("open");
+        assert_eq!(stream.byte_len(), None);
+        assert!(
+            !stream.is_seekable(),
+            "stream without Content-Length must report is_seekable() == false"
+        );
+
+        let mut received = Vec::new();
+        stream.read_to_end(&mut received).expect("read to end");
+        assert_eq!(received, payload);
+
+        srv.await.expect("srv");
+        drop(stream);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_range_fallback_200_ok_does_not_corrupt_offset() {
+        let pattern: Vec<u8> = (0..700_000usize)
+            .map(|i| ((i / 251) ^ (i % 251)) as u8)
+            .collect();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let srv_pattern = Arc::new(pattern.clone());
+        let req_count = Arc::new(AtomicUsize::new(0));
+        let srv_count = Arc::clone(&req_count);
+
+        let srv = tokio::spawn(async move {
+            for _ in 0..2 {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let pat = Arc::clone(&srv_pattern);
+                let count = Arc::clone(&srv_count);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+                    let seq = count.fetch_add(1, Ordering::SeqCst);
+                    if req.contains("range:") {
+                        // Ignore Range and return 200 OK starting at byte 0!
+                        let hdr = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            pat.len()
+                        );
+                        let _ = socket.write_all(hdr.as_bytes()).await;
+                        let _ = socket.write_all(&pat).await;
+                    } else {
+                        // Initial GET: send headers + only first 4 KiB then pause so seek triggers Range.
+                        let hdr = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                            pat.len()
+                        );
+                        let _ = socket.write_all(hdr.as_bytes()).await;
+                        let _ = socket.write_all(&pat[..4096]).await;
+                        if seq == 0 {
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                        }
+                        let _ = socket.write_all(&pat[4096..]).await;
+                    }
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        let dir = test_cache_dir("range-200");
+        let cache = AudioCache::with_dir(dir.clone(), 1024 * 1024).expect("cache");
+        let url = format!("http://{addr}/track.mp3");
+        let mut stream = cache.open_progressive(&url, Vec::new()).expect("open");
+
+        // Jump past RANGE_JUMP_THRESHOLD (512 KiB) to offset 600_000.
+        stream.seek(SeekFrom::Start(600_000)).expect("seek");
+        let mut slice = [0u8; 64];
+        stream.read_exact(&mut slice).expect("read exact");
+        assert_eq!(
+            &slice[..],
+            &pattern[600_000..600_064],
+            "200 OK Range fallback must return bytes at offset 600_000, NOT corrupted offset 0 bytes"
+        );
+
+        // Also verify short 200 OK body (shorter than offset) returns Unsupported & disables accepts_ranges.
+        let short_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind short");
+        let short_addr = short_listener.local_addr().expect("short addr");
+        let short_srv = tokio::spawn(async move {
+            for _ in 0..2 {
+                let Ok((mut socket, _)) = short_listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+                    if req.contains("range:") {
+                        let body = [0xABu8; 1024];
+                        let hdr = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = socket.write_all(hdr.as_bytes()).await;
+                        let _ = socket.write_all(&body).await;
+                    } else {
+                        let hdr = "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nContent-Length: 300000\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n";
+                        let _ = socket.write_all(hdr.as_bytes()).await;
+                        let _ = socket.write_all(&[0u8; 512]).await;
+                    }
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        let short_stream = cache
+            .open_progressive(&format!("http://{short_addr}/short.mp3"), Vec::new())
+            .expect("open short");
+        {
+            let mut guard = short_stream.backend.lock().expect("lock");
+            if let StreamBackend::Remote(ref mut inner) = *guard {
+                let err = inner
+                    .fetch_range_window(200_000, 64)
+                    .expect_err("short 200 OK must return Unsupported");
+                assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+                assert!(!inner.accepts_ranges);
+            } else {
+                panic!("expected remote stream");
+            }
+        }
+
+        drop(stream);
+        drop(short_stream);
+        let _ = srv.await;
+        let _ = short_srv.await;
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_loopback_url_bypasses_disk_cache() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let url = format!("http://{addr}/");
+
+        let dir = test_cache_dir("loopback-bypass");
+        let cache = AudioCache::with_dir(dir.clone(), 1024 * 1024).expect("cache");
+        // Seed poison bytes under this exact loopback URL.
+        cache
+            .put_bytes(&url, b"STALE-POISON-DATA")
+            .expect("seed poison");
+        assert!(cache.contains(&url));
+
+        let fresh_payload = b"FRESH-RELAY-AUDIO-BYTES".to_vec();
+        let srv_payload = fresh_payload.clone();
+        let srv = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let hdr = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: audio/webm\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                srv_payload.len()
+            );
+            socket.write_all(hdr.as_bytes()).await.expect("hdr");
+            socket.write_all(&srv_payload).await.expect("body");
+            let _ = socket.shutdown().await;
+        });
+
+        let mut stream = cache.open_progressive(&url, Vec::new()).expect("open");
+        let mut received = Vec::new();
+        stream.read_to_end(&mut received).expect("read");
+        assert_eq!(
+            received, fresh_payload,
+            "loopback URL must bypass disk cache and never serve stale poison bytes"
+        );
+        drop(stream);
+        srv.await.expect("srv");
+
+        // Fresh loopback URL must NOT persist into the LRU disk cache upon completion.
+        let listener2 = TcpListener::bind("127.0.0.1:0").await.expect("bind2");
+        let addr2 = listener2.local_addr().expect("addr2");
+        let url2 = format!("http://{addr2}/ephemeral");
+        let srv2 = tokio::spawn(async move {
+            let (mut socket, _) = listener2.accept().await.expect("accept2");
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let body = b"EPHEMERAL-BYTES";
+            let hdr = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: audio/mp4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = socket.write_all(hdr.as_bytes()).await;
+            let _ = socket.write_all(body).await;
+            let _ = socket.shutdown().await;
+        });
+        let mut stream2 = cache.open_progressive(&url2, Vec::new()).expect("open2");
+        let mut got2 = Vec::new();
+        stream2.read_to_end(&mut got2).expect("read2");
+        assert_eq!(got2, b"EPHEMERAL-BYTES");
+        drop(stream2);
+        srv2.await.expect("srv2");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !cache.contains(&url2),
+            "ephemeral loopback URL must never be persisted into the disk cache"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_loopback_client_selected_and_reads_cleanly() {
+        let dir = test_cache_dir("loopback-client");
+        let cache = AudioCache::with_dir(dir.clone(), 1024 * 1024).expect("cache");
+
+        // Verify client_for_url routes loopback hosts to the `.no_proxy()` loopback client
+        // and external hosts to the standard client.
+        for loopback in [
+            "http://127.0.0.1:24567/",
+            "http://localhost:8080/stream",
+            "http://[::1]:9000/",
+        ] {
+            let parsed = Url::parse(loopback).expect("parse loopback");
+            assert!(
+                std::ptr::eq(cache.client_for_url(&parsed), &cache.inner.loopback_client),
+                "expected loopback_client for {loopback}"
+            );
+        }
+        let remote = Url::parse("https://rr1---sn.googlevideo.com/videoplayback").expect("parse");
+        assert!(
+            std::ptr::eq(cache.client_for_url(&remote), &cache.inner.client),
+            "expected standard client for remote URL"
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let payload = b"LOOPBACK-NO-PROXY-AUDIO-STREAM".to_vec();
+        let srv_payload = payload.clone();
+        let srv = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let hdr = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: audio/mp4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                srv_payload.len()
+            );
+            socket.write_all(hdr.as_bytes()).await.expect("hdr");
+            socket.write_all(&srv_payload).await.expect("body");
+            let _ = socket.shutdown().await;
+        });
+
+        let url = format!("http://{addr}/");
+        let mut stream = cache.open_progressive(&url, Vec::new()).expect("open");
+        let mut out = Vec::new();
+        stream.read_to_end(&mut out).expect("read");
+        assert_eq!(out, payload);
+        drop(stream);
+        srv.await.expect("srv");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

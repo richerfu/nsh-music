@@ -7,7 +7,7 @@ license.workspace = true
 
 [features]
 default = ["audio-symphonia"]
-audio-symphonia = ["dep:symphonia"]
+audio-symphonia = ["dep:symphonia", "dep:opus-pure"]
 audio-ffmpeg = ["dep:ffmpeg-sys-next"]
 
 [dependencies]
@@ -25,6 +25,7 @@ hex.workspace = true
 dirs.workspace = true
 
 symphonia = { workspace = true, optional = true }
+opus-pure = { workspace = true, optional = true }
 ffmpeg-sys-next = { workspace = true, optional = true }
 
 [target.'cfg(not(any(target_arch = "wasm32", target_env = "ohos")))'.dependencies]

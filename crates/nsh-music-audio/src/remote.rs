@@ -197,7 +197,10 @@ impl PlatformRemoteDriver for DefaultPlatformRemoteDriver {
     }
 
     fn clear(&self) {
-        log::debug!("[remote:{}] cleared now playing metadata", self.backend.as_str());
+        log::debug!(
+            "[remote:{}] cleared now playing metadata",
+            self.backend.as_str()
+        );
     }
 }
 

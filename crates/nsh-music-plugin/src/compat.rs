@@ -54,6 +54,7 @@ pub struct CompatFinding {
 pub struct CompatReport {
     pub tier: CompatTier,
     pub uses_ffmpeg: bool,
+    pub uses_ytdlp: bool,
     pub uses_web_sign_in: bool,
     pub uses_external_spawn: bool,
     pub external_commands: Vec<String>,
@@ -68,7 +69,7 @@ impl CompatReport {
     pub fn to_source_compat(&self, granted: bool) -> SourceCompat {
         let level = if self.tier == CompatTier::MigrationRequired || self.uses_external_spawn {
             PluginCompatLevel::DesktopProcessLimited
-        } else if self.uses_ffmpeg {
+        } else if self.uses_ffmpeg || self.uses_ytdlp {
             PluginCompatLevel::VirtualFfmpeg
         } else {
             PluginCompatLevel::FullNative
@@ -77,6 +78,9 @@ impl CompatReport {
         let mut process_commands = Vec::new();
         if self.uses_ffmpeg {
             process_commands.push("ffmpeg".to_owned());
+        }
+        if self.uses_ytdlp {
+            process_commands.push("yt-dlp".to_owned());
         }
         for cmd in &self.external_commands {
             if !process_commands.iter().any(|c| c == cmd) {
@@ -105,6 +109,26 @@ pub fn is_ffmpeg_binary_name(cmd: &str) -> bool {
     base == "ffmpeg" || base == "ffmpeg.exe"
 }
 
+/// Returns `true` if `cmd` refers to a `yt-dlp` binary (any path or `.exe` suffix).
+pub fn is_ytdlp_binary_name(cmd: &str) -> bool {
+    let trimmed = cmd.trim().trim_matches('"').trim_matches('\'');
+    let base = trimmed
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(trimmed)
+        .to_ascii_lowercase();
+    base == "yt-dlp" || base == "yt-dlp.exe"
+}
+
+fn canonical_command_name(cmd: &str) -> String {
+    let trimmed = cmd.trim().trim_matches('"').trim_matches('\'');
+    let base = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
+    base.strip_suffix(".exe")
+        .or_else(|| base.strip_suffix(".EXE"))
+        .unwrap_or(base)
+        .to_owned()
+}
+
 /// Analyzes a plugin directory (`plugin.json` + JS/TS source files) for cross-platform compatibility.
 pub fn analyze_plugin_dir(plugin_dir: &Path) -> Result<CompatReport, ManifestError> {
     let manifest = PluginManifest::from_dir(plugin_dir)?;
@@ -123,7 +147,12 @@ pub fn analyze_plugin_dir(plugin_dir: &Path) -> Result<CompatReport, ManifestErr
         .and_then(|n| n.to_str())
         .unwrap_or("index.js");
 
-    Ok(analyze_sources(&manifest, &entry_source, filename, &combined_aux))
+    Ok(analyze_sources(
+        &manifest,
+        &entry_source,
+        filename,
+        &combined_aux,
+    ))
 }
 
 /// Analyzes a manifest and single JS/TS source string.
@@ -141,16 +170,20 @@ fn analyze_sources(
     let mut hosts: BTreeSet<String> = manifest.all_network_hosts().into_iter().collect();
     let mut external_cmds: BTreeSet<String> = BTreeSet::new();
 
-    // 1. Inspect manifest-declared commands.
+    // 1. Inspect manifest-declared commands (recognizing `ffmpeg` and `yt-dlp` as mobile-virtualized).
     let manifest_procs = manifest.all_process_commands();
-    let manifest_only_ffmpeg =
-        !manifest_procs.is_empty() && manifest_procs.iter().all(|c| is_ffmpeg_binary_name(c));
-    for cmd in manifest_procs {
-        if is_ffmpeg_binary_name(&cmd) {
+    let manifest_all_virtualized = !manifest_procs.is_empty()
+        && manifest_procs
+            .iter()
+            .all(|c| is_ffmpeg_binary_name(c) || is_ytdlp_binary_name(c));
+    for cmd in &manifest_procs {
+        if is_ffmpeg_binary_name(cmd) {
             report.uses_ffmpeg = true;
+        } else if is_ytdlp_binary_name(cmd) {
+            report.uses_ytdlp = true;
         } else {
             report.uses_external_spawn = true;
-            external_cmds.insert(cmd);
+            external_cmds.insert(canonical_command_name(cmd));
         }
     }
 
@@ -172,16 +205,26 @@ fn analyze_sources(
             CallArg::Literal(cmd) => {
                 if is_ffmpeg_binary_name(&cmd) {
                     report.uses_ffmpeg = true;
+                } else if is_ytdlp_binary_name(&cmd) {
+                    report.uses_ytdlp = true;
                 } else {
                     report.uses_external_spawn = true;
-                    external_cmds.insert(cmd);
+                    external_cmds.insert(canonical_command_name(&cmd));
                 }
             }
             CallArg::Dynamic(expr) => {
                 let lower = expr.to_ascii_lowercase();
-                if lower.contains("ffmpeg") || manifest_only_ffmpeg {
+                if lower.contains("ffmpeg") {
                     report.uses_ffmpeg = true;
-                } else if !checks_can_spawn {
+                } else if lower.contains("ytdlp")
+                    || lower.contains("yt_dlp")
+                    || lower.contains("yt-dlp")
+                {
+                    report.uses_ytdlp = true;
+                } else if manifest_all_virtualized {
+                    // Manifest declares only mobile-virtualized binaries (`ffmpeg` / `yt-dlp`);
+                    // dynamic binary probe loops resolve through the mobile virtualization layer.
+                } else if !checks_can_spawn && external_cmds.is_empty() {
                     report.uses_external_spawn = true;
                     external_cmds.insert(format!("<dynamic:{}>", truncate_expr(&expr, 24)));
                 }
@@ -199,9 +242,10 @@ fn analyze_sources(
     for arg in find_first_call_args(&all_code, "host.fetch") {
         if let CallArg::Literal(raw_url) = arg
             && let Ok(parsed) = url::Url::parse(&raw_url)
-                && let Some(h) = parsed.host_str() {
-                    hosts.insert(h.to_owned());
-                }
+            && let Some(h) = parsed.host_str()
+        {
+            hosts.insert(h.to_owned());
+        }
     }
 
     // 4. Assemble findings and compute final tier.
@@ -212,6 +256,16 @@ fn analyze_sources(
             title: "Embedded Virtual FFmpeg Active".to_owned(),
             detail: "Calls to `host.spawn(\"ffmpeg\", ...)` are transparently intercepted in-process by `VirtualFfmpegShim` on Desktop, iOS, Android, and HarmonyOS.".to_owned(),
             migration_hint: "No changes required; unmodified ffmpeg probe and loopback relay flows work out of the box.".to_owned(),
+        });
+    }
+
+    if report.uses_ytdlp {
+        report.findings.push(CompatFinding {
+            code: "VIRTUAL_YTDLP_INTERCEPTED".to_owned(),
+            severity: CompatTier::Full,
+            title: "Embedded Virtual yt-dlp Active".to_owned(),
+            detail: "Calls to `host.spawn(\"yt-dlp\", ...)` are transparently intercepted in-process by `VirtualYtdlpShim` on iOS, Android, HarmonyOS, and desktops without external `yt-dlp`.".to_owned(),
+            migration_hint: "No changes required; unmodified `yt-dlp` audio resolution flows run in-process without Python or external binaries.".to_owned(),
         });
     }
 
@@ -270,23 +324,41 @@ fn build_summary(report: &CompatReport) -> String {
             "Desktop only for external binary [{}]; mobile requires migration (see PLUGIN_COMPAT.md).",
             report.external_commands.join(", ")
         ),
-        CompatTier::Partial => {
-            if report.uses_ffmpeg {
+        CompatTier::Partial => match (report.uses_ffmpeg, report.uses_ytdlp) {
+            (true, true) => {
+                "Full audio via Virtual FFmpeg & Virtual yt-dlp; webSignIn may require manual cookie fallback on mobile."
+                    .to_owned()
+            }
+            (true, false) => {
                 "Full audio via Virtual FFmpeg; webSignIn may require manual cookie fallback on mobile."
                     .to_owned()
-            } else {
+            }
+            (false, true) => {
+                "Full audio via Virtual yt-dlp; webSignIn may require manual cookie fallback on mobile."
+                    .to_owned()
+            }
+            (false, false) => {
                 "Works on all platforms; webSignIn may require manual cookie fallback for HttpOnly cookies on mobile."
                     .to_owned()
             }
-        }
-        CompatTier::Full => {
-            if report.uses_ffmpeg {
+        },
+        CompatTier::Full => match (report.uses_ffmpeg, report.uses_ytdlp) {
+            (true, true) => {
+                "Full cross-platform compatibility (ffmpeg & yt-dlp handled in-process by VirtualFfmpegShim and VirtualYtdlpShim)."
+                    .to_owned()
+            }
+            (true, false) => {
                 "Full cross-platform compatibility (ffmpeg handled in-process by VirtualFfmpegShim)."
                     .to_owned()
-            } else {
+            }
+            (false, true) => {
+                "Full cross-platform compatibility (yt-dlp handled in-process by VirtualYtdlpShim)."
+                    .to_owned()
+            }
+            (false, false) => {
                 "Full native compatibility across Desktop, iOS, Android, and HarmonyOS.".to_owned()
             }
-        }
+        },
     }
 }
 
@@ -412,10 +484,11 @@ fn collect_js_sources(dir: &Path, skip: &Path, out: &mut String) {
                 .unwrap_or("")
                 .to_ascii_lowercase();
             if matches!(ext.as_str(), "js" | "mjs" | "cjs" | "ts" | "mts" | "cts")
-                && let Ok(content) = fs::read_to_string(&path) {
-                    out.push('\n');
-                    out.push_str(&content);
-                }
+                && let Ok(content) = fs::read_to_string(&path)
+            {
+                out.push('\n');
+                out.push_str(&content);
+            }
         }
     }
 }
@@ -650,18 +723,44 @@ mod tests {
             // host.spawn("ignored-in-comment")
             export default {
                 async getStreamUrl(id) {
-                    return host.spawn("yt-dlp", ["-g", id]);
+                    return host.spawn("python3", ["fetch.py", id]);
                 }
             };
         "#;
         let report = analyze_source(&manifest, src, "index.js");
         assert_eq!(report.tier, CompatTier::MigrationRequired);
         assert!(report.uses_external_spawn);
-        assert_eq!(report.external_commands, vec!["yt-dlp"]);
+        assert_eq!(report.external_commands, vec!["python3"]);
         assert!(report.detected_exports.contains(&"getStreamUrl".to_owned()));
 
         let sc = report.to_source_compat(true);
         assert_eq!(sc.level, PluginCompatLevel::DesktopProcessLimited);
+    }
+
+    #[test]
+    fn classifies_virtual_ytdlp_as_full() {
+        let manifest = PluginManifest::parse_json(
+            r#"{"id":"yt-only","name":"YT Only","permissions":{"process":["yt-dlp"]}}"#,
+        )
+        .unwrap();
+        let src = r#"
+            export async function getStreamUrl(id) {
+                return host.spawn("yt-dlp", ["-g", id]);
+            }
+        "#;
+        let report = analyze_source(&manifest, src, "index.js");
+        assert_eq!(report.tier, CompatTier::Full);
+        assert!(report.uses_ytdlp);
+        assert!(!report.uses_external_spawn);
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.code == "VIRTUAL_YTDLP_INTERCEPTED")
+        );
+        let sc = report.to_source_compat(true);
+        assert_eq!(sc.level, PluginCompatLevel::VirtualFfmpeg);
+        assert_eq!(sc.process_commands, vec!["yt-dlp"]);
     }
 
     #[test]
@@ -675,10 +774,12 @@ mod tests {
         let report = analyze_source(&manifest, src, "index.ts");
         assert_eq!(report.tier, CompatTier::Partial);
         assert!(report.uses_web_sign_in);
-        assert!(report
-            .findings
-            .iter()
-            .any(|f| f.code == "WEB_SIGN_IN_HTTPONLY" && !f.migration_hint.is_empty()));
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.code == "WEB_SIGN_IN_HTTPONLY" && !f.migration_hint.is_empty())
+        );
     }
 
     #[test]
@@ -715,5 +816,71 @@ mod tests {
         let sc = report.to_source_compat(true);
         assert_eq!(sc.level, PluginCompatLevel::VirtualFfmpeg);
         assert_eq!(sc.process_commands, vec!["ffmpeg"]);
+    }
+
+    #[test]
+    fn classifies_youtube_music_manifest_without_dynamic_placeholders() {
+        let manifest = PluginManifest::parse_json(
+            r#"{
+                "id": "youtube-music",
+                "name": "YouTube Music",
+                "version": "0.1.1",
+                "minAppVersion": "0.1.8",
+                "main": "index.js",
+                "permissions": {
+                    "network": ["music.youtube.com", "s.youtube.com", "api.betterlyrics.org"],
+                    "process": [
+                        "ffmpeg",
+                        "yt-dlp",
+                        "/opt/homebrew/bin/ffmpeg",
+                        "/opt/homebrew/bin/yt-dlp",
+                        "/usr/local/bin/ffmpeg",
+                        "/usr/local/bin/yt-dlp"
+                    ]
+                }
+            }"#,
+        )
+        .unwrap();
+        let src = r#"
+            async function program(name, flag) {
+                for (const path of [name, `/opt/homebrew/bin/${name}`]) {
+                    const proc = host.spawn(path, [flag]);
+                }
+            }
+            export async function signIn() {
+                return await host.webSignIn({
+                    url: "https://accounts.google.com/ServiceLogin",
+                    cookiesOf: "https://music.youtube.com",
+                    until: ["SAPISID", "__Secure-3PSID"],
+                });
+            }
+            export async function stream() {
+                host.spawn(ffmpeg, ["-i", url, "-c:a", "libmp3lame", "-f", "mp3", "-listen", "1", out]);
+                host.spawn(ytdlp, ["--print", "url"]);
+            }
+        "#;
+        let report = analyze_source(&manifest, src, "index.js");
+        assert_eq!(report.tier, CompatTier::Partial);
+        assert!(report.uses_ffmpeg);
+        assert!(report.uses_ytdlp);
+        assert!(report.uses_web_sign_in);
+        assert!(!report.uses_external_spawn);
+        assert!(report.external_commands.is_empty());
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.code == "VIRTUAL_FFMPEG_INTERCEPTED")
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.code == "VIRTUAL_YTDLP_INTERCEPTED")
+        );
+        let sc = report.to_source_compat(true);
+        assert_eq!(sc.level, PluginCompatLevel::VirtualFfmpeg);
+        assert_eq!(sc.process_commands, vec!["ffmpeg", "yt-dlp"]);
+        assert!(!sc.process_commands.iter().any(|c| c.contains("dynamic")));
     }
 }

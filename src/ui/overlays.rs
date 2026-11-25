@@ -13,7 +13,7 @@ use nsh_base::{
 use nsh_core::{prelude::*, time::now};
 
 use super::{
-    controls::icon_button_sized,
+    controls::icon_button_tinted,
     icons::{Icon, icon},
     motion,
     theme::{self, DeviceForm, Elevated, Elevation, colors, font_size, radius},
@@ -68,7 +68,7 @@ where
                     .backdrop_style(|s| s.bg(theme::scrim))
                     .grabber_style(|s| {
                         s.w(px(36.0))
-                            .h(px(5.0))
+                            .h(px(4.0))
                             .mt_2()
                             .mb_1()
                             .self_center()
@@ -82,22 +82,39 @@ where
                             .border_color(theme::border)
                             .elevation(Elevation::Modal)
                     })
-                    .child(
+                    .child({
+                        let sheet_metrics = || {
+                            let win_h = window().height.0;
+                            let insets = safe_area();
+                            let kb_lift = (keyboard_height().0 - insets.bottom.0).max(0.0);
+                            if kb_lift > 0.0 {
+                                let sheet_max_h = (win_h - insets.top.0 - kb_lift - 8.0).max(220.0);
+                                let scroll_max_h = (sheet_max_h - 84.0).max(120.0);
+                                (sheet_max_h, 12.0_f32, scroll_max_h)
+                            } else {
+                                let sheet_max_h = (win_h * 0.88).max(320.0);
+                                let scroll_max_h =
+                                    (sheet_max_h - 110.0 - insets.bottom.0).max(220.0);
+                                (sheet_max_h, insets.bottom.0 + 20.0, scroll_max_h)
+                            }
+                        };
                         view()
                             .w_full()
-                            .max_h(move || px((window().height.0 * 0.86).max(320.0)))
+                            .max_h(move || px(sheet_metrics().0))
                             .px_4()
-                            .pt_2()
-                            .pb(move || px(safe_area().bottom.0 + 16.0))
+                            .pt_1p5()
+                            .pb(move || px(sheet_metrics().1))
                             .gap_3()
                             .child(modal_header(title_rx, close_btn))
                             .child(
                                 scroll()
                                     .w_full()
-                                    .max_h(move || px((window().height.0 * 0.72).max(240.0)))
+                                    .keyboard_taps(KeyboardTaps::Handled)
+                                    .keyboard_dismiss_mode(KeyboardDismissMode::OnDrag)
+                                    .max_h(move || px(sheet_metrics().2))
                                     .child(make_content()),
-                            ),
-                    )
+                            )
+                    })
                     .into_element()
             }
             DeviceForm::Desktop | DeviceForm::Pad { .. } => {
@@ -212,6 +229,10 @@ pub fn confirm_destructive(
 fn modal_header(title: Reactive<SharedString>, on_close: Rc<dyn Fn()>) -> View {
     view()
         .w_full()
+        .flex_shrink_0()
+        .pb_3()
+        .border_b_1()
+        .border_color(move || theme::border().opacity(0.6))
         .flex_row()
         .items_center()
         .justify_between()
@@ -222,14 +243,18 @@ fn modal_header(title: Reactive<SharedString>, on_close: Rc<dyn Fn()>) -> View {
                 .flex_1()
                 .min_w(px(0.0))
                 .number_of_lines(1)
-                .text_size(px(font_size::TITLE))
+                .text_size(move || {
+                    if theme::detect_device_form().is_phone() {
+                        px(17.0)
+                    } else {
+                        px(font_size::TITLE)
+                    }
+                })
                 .font_weight(FontWeight::BOLD)
                 .text_color(theme::fg),
         )
-        .child(icon_button_sized(
+        .child(icon_button_tinted(
             Icon::Close,
-            32.0,
-            16.0,
             theme::muted_fg,
             "Close",
             move || on_close(),
@@ -261,6 +286,8 @@ pub struct ToastController {
     shown: Signal<Vec<(u64, ToastPayload, ToastTransitionStatus)>>,
     state: ToastStackState,
     next_id: Stored<u64>,
+    owner: Owner,
+    ticking: Stored<bool>,
 }
 
 impl Default for ToastController {
@@ -270,19 +297,47 @@ impl Default for ToastController {
 }
 
 impl ToastController {
-    /// Creates a new [`ToastController`] and starts its 50ms lifecycle ticker
-    /// tied to the current NSH owner.
+    /// Creates a new [`ToastController`] with an on-demand 50ms lifecycle loop
+    /// that sleeps completely (zero timers, zero CPU) whenever no toasts are active.
     pub fn new() -> Self {
-        let controller = Self {
+        Self {
             manager: stored(ToastManager::new(ToastMotion::sonner())),
             shown: signal(Vec::new()),
             state: ToastStackState::new(),
             next_id: stored(1),
-        };
-        set_interval(Duration::from_millis(50), move || {
-            controller.tick();
+            owner: Owner::current(),
+            ticking: stored(false),
+        }
+    }
+
+    fn ensure_ticking(&self) {
+        let already = self.ticking.with(|running| {
+            if *running {
+                true
+            } else {
+                *running = true;
+                false
+            }
         });
-        controller
+        if already {
+            return;
+        }
+        let controller = *self;
+        self.owner.run(move || {
+            spawn(async move {
+                loop {
+                    timer(Duration::from_millis(50)).await;
+                    controller.tick();
+                    if controller.manager.with(|m| m.is_empty()) {
+                        controller.ticking.with(|running| *running = false);
+                        if !controller.manager.with(|m| m.is_empty()) {
+                            controller.ensure_ticking();
+                        }
+                        break;
+                    }
+                }
+            });
+        });
     }
 
     /// Pushes a toast with default 3.5-second timeout.
@@ -310,6 +365,7 @@ impl ToastController {
             m.push(id, payload, ToastOptions::timeout(Some(timeout)), now());
         });
         self.sync();
+        self.ensure_ticking();
         id
     }
 
@@ -334,6 +390,9 @@ impl ToastController {
             m.dismiss(&id, now());
         });
         self.sync();
+        if !self.manager.with(|m| m.is_empty()) {
+            self.ensure_ticking();
+        }
     }
 
     pub fn dismiss_newest(&self) {
@@ -582,10 +641,7 @@ pub fn styled_context_menu(
 }
 
 /// Styled trigger-opened dropdown/sheet menu wrapping `nsh_base::menu`.
-pub fn styled_menu(
-    trigger: impl IntoElement,
-    actions: Vec<ContextMenuAction>,
-) -> MenuElement {
+pub fn styled_menu(trigger: impl IntoElement, actions: Vec<ContextMenuAction>) -> MenuElement {
     let items = render_menu_actions(actions);
     menu()
         .offset(px(6.0))

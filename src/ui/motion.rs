@@ -53,8 +53,7 @@ pub const TIMING_FAST: Timing = Timing::new(180.0, Easing::Curve(Curve::Cubic, E
 pub const TIMING_BASE: Timing = Timing::new(240.0, Easing::Curve(Curve::Cubic, EaseMode::InOut));
 
 /// Slow ambient mood crossfade for artwork tint & backdrop transitions (`480ms`).
-pub const TIMING_AMBIENT: Timing =
-    Timing::new(480.0, Easing::Curve(Curve::Cubic, EaseMode::InOut));
+pub const TIMING_AMBIENT: Timing = Timing::new(480.0, Easing::Curve(Curve::Cubic, EaseMode::InOut));
 
 /// Snappy spring preset, returning `None` when the user enabled Reduce Motion.
 pub fn spring_snappy() -> Option<Spring> {

@@ -2,15 +2,18 @@
 //! `nsh-music` semantic tokens, adaptive touch targets (`>= 44pt` on
 //! Pad/Phone), and reduced-motion-safe feedback.
 
-use std::rc::Rc;
-use std::time::Duration;
+use std::{
+    f32::consts::{PI, TAU},
+    rc::Rc,
+};
 
 use nsh_base::{
     ButtonElement, Input, SelectElement, SelectEntry, SelectItem, SelectValue, SliderElement,
     SliderValue, SwitchElement, button, input, select, slider, switch,
 };
 use nsh_core::{
-    canvas::CanvasGradient,
+    animation::{Curve, EaseMode},
+    canvas::{CanvasGradient, LineCap},
     geometry::{percentage, point},
     prelude::*,
 };
@@ -56,10 +59,7 @@ pub fn icon_button_tinted(
         .transition_all()
         .duration(move || motion::transition_ms(140.0))
         .hover(|s| s.bg(theme::hover))
-        .active(|s| {
-            s.bg(theme::press)
-                .scale(motion::press_scale)
-        })
+        .active(|s| s.bg(theme::press).scale(motion::press_scale))
         .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
         .disabled_style(|s| s.opacity(0.42))
         .child(icon_reactive(kind, 18.0, tint))
@@ -94,10 +94,7 @@ pub fn icon_button_sized(
         .transition_all()
         .duration(move || motion::transition_ms(140.0))
         .hover(|s| s.bg(theme::hover))
-        .active(|s| {
-            s.bg(theme::press)
-                .scale(motion::press_scale)
-        })
+        .active(|s| s.bg(theme::press).scale(motion::press_scale))
         .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
         .disabled_style(|s| s.opacity(0.42))
         .child(icon_reactive(kind, glyph_size, tint))
@@ -122,7 +119,11 @@ pub fn play_pause_button(
         effect(move || {
             let now = playing_rx.get();
             if prev.replace(now) != now {
-                motion::animate_spring(&morph, if now { 1.0 } else { 0.0 }, motion::spring_settle());
+                motion::animate_spring(
+                    &morph,
+                    if now { 1.0 } else { 0.0 },
+                    motion::spring_settle(),
+                );
             }
         });
     }
@@ -176,6 +177,94 @@ pub fn play_pause_button(
                         .bind_scale(&morph.interpolate(&[0.0, 1.0], &[0.72, 1.0]))
                         .child(icon(Icon::Pause, glyph, colors::PRIMARY_FOREGROUND)),
                 ),
+        )
+}
+
+/// Play / Pause circular primary button that displays [`loading_spinner`] while
+/// `buffering` is true and smoothly spring-morphs between Play and Pause otherwise.
+pub fn play_pause_button_buffering(
+    playing: impl IntoReactive<bool>,
+    buffering: impl IntoReactive<bool>,
+    diameter: f32,
+    label: impl IntoReactive<SharedString>,
+    on_press: impl Fn() + 'static,
+) -> impl IntoElement {
+    let playing_rx = playing.into_reactive();
+    let buffering_rx = buffering.into_reactive();
+    let label_rx = label.into_reactive();
+    let initial = untracked(|| playing_rx.get());
+    let morph = animated_value(if initial { 1.0 } else { 0.0 });
+    let prev = stored(initial);
+
+    {
+        let playing_rx = playing_rx.clone();
+        effect(move || {
+            let now = playing_rx.get();
+            if prev.replace(now) != now {
+                motion::animate_spring(
+                    &morph,
+                    if now { 1.0 } else { 0.0 },
+                    motion::spring_settle(),
+                );
+            }
+        });
+    }
+
+    let glyph = (diameter * 0.44).clamp(14.0, 28.0);
+    let hit = move || {
+        let min = theme::detect_device_form().min_touch_target();
+        let extra = ((min - diameter) * 0.5).max(0.0);
+        EdgeInsets::all(px(extra))
+    };
+
+    button()
+        .on_press(on_press)
+        .accessibility_label(move || Some(label_rx.get()))
+        .hit_slop(hit)
+        .size(px(diameter))
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .bg(theme::primary)
+        .elevation(Elevation::Subtle)
+        .transition_all()
+        .duration(move || motion::transition_ms(160.0))
+        .hover(|s| s.bg(theme::primary_hover))
+        .active(|s| s.scale(motion::press_scale))
+        .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
+        .child(
+            when(
+                move || buffering_rx.get(),
+                move || loading_spinner(glyph, colors::PRIMARY_FOREGROUND),
+            )
+            .otherwise(move || {
+                view()
+                    .size(px(glyph))
+                    .items_center()
+                    .justify_center()
+                    .pointer_events(PointerEvents::None)
+                    .child(
+                        view()
+                            .absolute()
+                            .inset_0()
+                            .items_center()
+                            .justify_center()
+                            .bind_opacity(&morph.interpolate(&[0.0, 1.0], &[1.0, 0.0]))
+                            .bind_scale(&morph.interpolate(&[0.0, 1.0], &[1.0, 0.72]))
+                            .child(icon(Icon::Play, glyph, colors::PRIMARY_FOREGROUND)),
+                    )
+                    .child(
+                        view()
+                            .absolute()
+                            .inset_0()
+                            .items_center()
+                            .justify_center()
+                            .bind_opacity(&morph.interpolate(&[0.0, 1.0], &[0.0, 1.0]))
+                            .bind_scale(&morph.interpolate(&[0.0, 1.0], &[0.72, 1.0]))
+                            .child(icon(Icon::Pause, glyph, colors::PRIMARY_FOREGROUND)),
+                    )
+            }),
         )
 }
 
@@ -242,6 +331,8 @@ pub fn heart_button(
 }
 
 /// Capsule pill filter / navigation button with active highlight state.
+/// On touch devices, wraps a sleek `32pt` visible capsule inside a `>= 44pt`
+/// transparent touch target.
 pub fn pill_button(
     label: impl IntoReactive<SharedString>,
     active: impl IntoReactive<bool>,
@@ -251,70 +342,85 @@ pub fn pill_button(
     let active_bg = active_rx.clone();
     let active_fg = active_rx.clone();
     let active_border = active_rx.clone();
-    let min_h = move || {
-        if theme::detect_device_form().is_touch() {
-            px(44.0)
-        } else {
-            px(30.0)
-        }
-    };
 
     button()
+        .group()
         .selected(move || active_rx.get())
         .on_press(on_press)
-        .hit_slop(move || {
+        .min_h(move || {
             if theme::detect_device_form().is_touch() {
-                EdgeInsets {
-                    top: px(3.0),
-                    bottom: px(3.0),
-                    left: px(2.0),
-                    right: px(2.0),
-                }
+                px(44.0)
             } else {
-                EdgeInsets::default()
+                px(30.0)
             }
         })
-        .min_h(min_h)
-        .px_3()
-        .py_1()
-        .flex_row()
-        .items_center()
+        .min_w(move || {
+            if theme::detect_device_form().is_touch() {
+                px(44.0)
+            } else {
+                px(0.0)
+            }
+        })
         .justify_center()
-        .gap_1p5()
         .rounded_full()
-        .border_1()
-        .border_color(move || {
-            if active_border.get() {
-                theme::primary()
-            } else {
-                theme::border()
-            }
-        })
-        .bg(move || {
-            if active_bg.get() {
-                theme::primary_soft()
-            } else {
-                theme::secondary()
-            }
-        })
-        .transition_all()
-        .duration(move || motion::transition_ms(150.0))
-        .hover(|s| s.bg(theme::accent))
+        .bg(colors::TRANSPARENT)
+        .transition_transform()
+        .duration(move || motion::transition_ms(140.0))
         .active(|s| s.scale(motion::press_scale))
         .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
         .disabled_style(|s| s.opacity(0.45))
         .child(
-            text(label)
-                .number_of_lines(1)
-                .text_size(px(font_size::SUBTITLE))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(move || {
-                    if active_fg.get() {
-                        theme::primary()
+            view()
+                .h(move || {
+                    if theme::detect_device_form().is_touch() {
+                        px(32.0)
                     } else {
-                        theme::fg()
+                        px(30.0)
                     }
-                }),
+                })
+                .px(move || {
+                    if theme::detect_device_form().is_touch() {
+                        px(13.0)
+                    } else {
+                        px(12.0)
+                    }
+                })
+                .flex_row()
+                .items_center()
+                .justify_center()
+                .gap_1p5()
+                .rounded_full()
+                .border_1()
+                .border_color(move || {
+                    if active_border.get() {
+                        theme::primary().opacity(0.38)
+                    } else {
+                        theme::border()
+                    }
+                })
+                .bg(move || {
+                    if active_bg.get() {
+                        theme::primary_soft()
+                    } else {
+                        theme::secondary()
+                    }
+                })
+                .transition_colors()
+                .duration(move || motion::transition_ms(150.0))
+                .group_hover(|s| s.bg(theme::accent))
+                .child(
+                    text(label)
+                        .number_of_lines(1)
+                        .text_size(px(font_size::SUBTITLE))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(move || {
+                            if active_fg.get() {
+                                theme::primary()
+                            } else {
+                                theme::fg()
+                            }
+                        }),
+                ),
         )
 }
 
@@ -379,10 +485,7 @@ pub fn ghost_button(
         .transition_all()
         .duration(move || motion::transition_ms(140.0))
         .hover(|s| s.bg(theme::hover))
-        .active(|s| {
-            s.bg(theme::press)
-                .scale(motion::press_scale)
-        })
+        .active(|s| s.bg(theme::press).scale(motion::press_scale))
         .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
         .disabled_style(|s| s.opacity(0.45))
         .child(
@@ -396,12 +499,9 @@ pub fn ghost_button(
 
 /// Controlled text input styled with semantic tokens and resolved `Hsla`
 /// placeholder/caret/selection colors.
-pub fn styled_input(
-    value: Signal<String>,
-    placeholder: impl IntoReactive<SharedString>,
-) -> Input {
+pub fn styled_input(value: Signal<String>, placeholder: impl IntoReactive<SharedString>) -> Input {
     let ph_rx = placeholder.into_reactive();
-    let min_h = move || match theme::detect_device_form() {
+    let field_h = move || match theme::detect_device_form() {
         DeviceForm::Desktop => px(36.0),
         DeviceForm::Pad { .. } | DeviceForm::Phone => px(44.0),
     };
@@ -412,7 +512,8 @@ pub fn styled_input(
         .placeholder_color(|| color(theme::muted_fg()))
         .caret_color(|| color(theme::primary()))
         .selection_color(|| color(theme::primary_soft()))
-        .min_h(min_h)
+        .h(field_h)
+        .min_h(field_h)
         .px_3()
         .text_size(px(font_size::BODY))
         .text_color(theme::fg)
@@ -458,10 +559,7 @@ pub fn styled_switch(
                 .border_color(theme::border)
                 .transition_colors()
                 .duration(move || motion::transition_ms(160.0))
-                .checked(|s| {
-                    s.bg(theme::primary)
-                        .border_color(theme::primary)
-                })
+                .checked(|s| s.bg(theme::primary).border_color(theme::primary))
         })
         .thumb_style(|s| {
             s.size(px(18.0))
@@ -509,14 +607,11 @@ pub fn styled_slider(
             .w_full()
             .justify_center()
         })
-        .indicator_style(|s| {
-            s.h(px(4.0))
-                .w_full()
-                .rounded_full()
-                .bg(theme::track_rail)
-        })
+        .indicator_style(|s| s.h(px(4.0)).w_full().rounded_full().bg(theme::track_rail))
         .range_style(|s| s.rounded_full().bg(theme::primary))
-        .thumb_class("hover:scale-115 active:scale-125 focus-visible:outline-2 focus-visible:outline-ring")
+        .thumb_class(
+            "hover:scale-115 active:scale-125 focus-visible:outline-2 focus-visible:outline-ring",
+        )
         .thumb_style(|s| {
             s.size(px(14.0))
                 .rounded_full()
@@ -622,6 +717,8 @@ pub fn styled_select(
 }
 
 /// Source switcher capsule pill used in headers, sidebars, and search bars.
+/// On touch devices, preserves a `>= 44pt` transparent outer hit-box wrapping a
+/// sleek `32pt` visible capsule with status dot, label, and chevron.
 pub fn source_pill(
     name: impl IntoReactive<SharedString>,
     active: impl IntoReactive<bool>,
@@ -632,8 +729,10 @@ pub fn source_pill(
     let active_bg = active_rx.clone();
     let active_border = active_rx.clone();
     let active_fg = active_rx.clone();
+    let active_chev = active_rx.clone();
 
     button()
+        .group()
         .selected(move || active_rx.get())
         .on_press(on_press)
         .min_h(move || {
@@ -643,54 +742,100 @@ pub fn source_pill(
                 px(30.0)
             }
         })
-        .px_3()
-        .py_1()
-        .flex_row()
-        .items_center()
-        .gap_2()
+        .min_w(move || {
+            if theme::detect_device_form().is_touch() {
+                px(44.0)
+            } else {
+                px(0.0)
+            }
+        })
+        .justify_center()
         .rounded_full()
-        .border_1()
-        .border_color(move || {
-            if active_border.get() {
-                theme::primary()
-            } else {
-                theme::border()
-            }
-        })
-        .bg(move || {
-            if active_bg.get() {
-                theme::primary_soft()
-            } else {
-                theme::card()
-            }
-        })
-        .hover(|s| s.bg(theme::accent))
+        .bg(colors::TRANSPARENT)
+        .transition_transform()
+        .duration(move || motion::transition_ms(140.0))
         .active(|s| s.scale(motion::press_scale))
         .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
         .child(
             view()
-                .size(px(7.0))
+                .h(move || {
+                    if theme::detect_device_form().is_touch() {
+                        px(32.0)
+                    } else {
+                        px(30.0)
+                    }
+                })
+                .px_2p5()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap_1p5()
                 .rounded_full()
+                .border_1()
+                .border_color(move || {
+                    if active_border.get() {
+                        theme::primary().opacity(0.32)
+                    } else {
+                        theme::border()
+                    }
+                })
                 .bg(move || {
-                    if active_dot.get() {
-                        theme::primary()
+                    if active_bg.get() {
+                        theme::primary_soft()
                     } else {
-                        theme::ok()
+                        theme::card()
                     }
-                }),
-        )
-        .child(
-            text(name)
-                .number_of_lines(1)
-                .text_size(px(font_size::SUBTITLE))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(move || {
-                    if active_fg.get() {
-                        theme::primary()
+                })
+                .transition_colors()
+                .duration(move || motion::transition_ms(140.0))
+                .group_hover(|s| s.bg(theme::accent))
+                .child(
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .gap_1p5()
+                        .min_w(px(0.0))
+                        .flex_shrink(1.0)
+                        .child(
+                            view()
+                                .size(px(6.0))
+                                .flex_shrink_0()
+                                .rounded_full()
+                                .bg(move || {
+                                    if active_dot.get() {
+                                        theme::primary()
+                                    } else {
+                                        theme::ok()
+                                    }
+                                }),
+                        )
+                        .child(
+                            text(name)
+                                .number_of_lines(1)
+                                .text_size(move || {
+                                    if theme::detect_device_form().is_touch() {
+                                        px(font_size::CAPTION)
+                                    } else {
+                                        px(font_size::SUBTITLE)
+                                    }
+                                })
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(move || {
+                                    if active_fg.get() {
+                                        theme::primary()
+                                    } else {
+                                        theme::fg()
+                                    }
+                                }),
+                        ),
+                )
+                .child(icon_reactive(Icon::ChevronDown, 12.0, move || {
+                    if active_chev.get() {
+                        theme::primary().opacity(0.8)
                     } else {
-                        theme::fg()
+                        theme::muted_fg()
                     }
-                }),
+                })),
         )
 }
 
@@ -699,11 +844,7 @@ pub fn source_pill(
 pub fn compat_badge(level: PluginCompatLevel) -> View {
     let (label, fg_col, bg_col) = match level {
         PluginCompatLevel::FullNative => ("All Platforms", theme::ok(), theme::ok_soft()),
-        PluginCompatLevel::VirtualFfmpeg => (
-            "Embedded FFmpeg",
-            theme::warn(),
-            theme::warn_soft(),
-        ),
+        PluginCompatLevel::VirtualFfmpeg => ("Embedded FFmpeg", theme::warn(), theme::warn_soft()),
         PluginCompatLevel::DesktopProcessLimited => {
             ("Desktop Binary", theme::danger(), theme::danger_soft())
         }
@@ -712,10 +853,7 @@ pub fn compat_badge(level: PluginCompatLevel) -> View {
 }
 
 /// Compatibility badge with custom localized text.
-pub fn compat_badge_text(
-    level: PluginCompatLevel,
-    label: impl IntoReactive<SharedString>,
-) -> View {
+pub fn compat_badge_text(level: PluginCompatLevel, label: impl IntoReactive<SharedString>) -> View {
     let (fg_col, bg_col) = match level {
         PluginCompatLevel::FullNative => (theme::ok(), theme::ok_soft()),
         PluginCompatLevel::VirtualFfmpeg => (theme::warn(), theme::warn_soft()),
@@ -775,31 +913,45 @@ fn empty_state_inner(
 ) -> View {
     view()
         .w_full()
-        .py_12()
-        .px_6()
+        .py(move || {
+            if theme::detect_device_form().is_phone() {
+                px(40.0)
+            } else {
+                px(48.0)
+            }
+        })
+        .px(move || {
+            if theme::detect_device_form().is_phone() {
+                px(20.0)
+            } else {
+                px(24.0)
+            }
+        })
         .items_center()
         .justify_center()
         .gap_3()
         .child(
             view()
-                .size(px(56.0))
+                .size(px(60.0))
                 .rounded_full()
                 .bg(theme::muted)
                 .border_1()
-                .border_color(theme::border)
+                .border_color(move || theme::border().opacity(0.75))
                 .items_center()
                 .justify_center()
-                .child(icon(kind, 24.0, colors::MUTED_FOREGROUND)),
+                .child(icon(kind, 26.0, colors::MUTED_FOREGROUND)),
         )
         .child(
             text(title)
+                .text_center()
                 .text_size(px(font_size::HEADING))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(theme::fg),
         )
         .child(
             text(subtitle)
-                .max_w(px(400.0))
+                .max_w(px(360.0))
+                .text_center()
                 .text_size(px(font_size::SUBTITLE))
                 .text_color(theme::muted_fg),
         )
@@ -817,7 +969,7 @@ pub fn section_header(
     view()
         .w_full()
         .flex_row()
-        .items_end()
+        .items_center()
         .justify_between()
         .gap_3()
         .child(
@@ -829,7 +981,13 @@ pub fn section_header(
                     text(title)
                         .role(AccessibilityRole::Header)
                         .number_of_lines(1)
-                        .text_size(px(font_size::TITLE))
+                        .text_size(move || {
+                            if theme::detect_device_form().is_phone() {
+                                px(font_size::HEADING)
+                            } else {
+                                px(font_size::TITLE)
+                            }
+                        })
                         .font_weight(FontWeight::BOLD)
                         .text_color(theme::fg),
                 )
@@ -851,8 +1009,15 @@ pub fn section_header(
                             px(28.0)
                         }
                     })
-                    .px_2p5()
+                    .px(move || {
+                        if theme::detect_device_form().is_phone() {
+                            px(8.0)
+                        } else {
+                            px(10.0)
+                        }
+                    })
                     .py_1()
+                    .flex_shrink_0()
                     .flex_row()
                     .items_center()
                     .gap_1()
@@ -872,49 +1037,134 @@ pub fn section_header(
         })
 }
 
-/// Loading placeholder block with smooth animated diagonal shimmer sweep (static under `reduce_motion()`).
-pub fn shimmer_block(corner_radius: f32) -> View {
-    let phase = signal(0.0_f32);
-    let box_size = signal((180.0_f32, 180.0_f32));
-    if !reduce_motion() {
-        set_interval(Duration::from_millis(32), move || {
-            phase.update(|p| {
-                *p = (*p + 0.026) % 1.0;
-            });
-        });
-    }
+/// Crisp 270° rounded-cap loading spinner rotated continuously on the native
+/// UI animation thread (`900ms` linear loop; static under `reduce_motion()`,
+/// automatically stopped on unmount with zero Rust polling timers).
+pub fn loading_spinner(size_pt: f32, tint: impl IntoReactive<AdaptiveColor>) -> View {
+    let tint_rx = tint.into_reactive();
+    let angle = animated_value(0.0);
+    let spin = Animation::timing(&angle, 360.0, Timing::new(900.0, Easing::Linear)).looped(None);
+    let running = spin.clone();
+
+    effect(move || {
+        if reduce_motion() {
+            running.stop();
+            angle.set(0.0);
+        } else {
+            angle.set(0.0);
+            let _ = running.start();
+        }
+    });
+    cleanup(move || spin.stop());
+
+    let stroke = (size_pt * 0.12).clamp(1.6, 3.2);
+    let radius = ((size_pt - stroke) * 0.5).max(2.0);
+    let center = size_pt * 0.5;
+
+    view()
+        .size(px(size_pt))
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .pointer_events(PointerEvents::None)
+        .bind_rotate(&angle)
+        .child(
+            canvas(move || {
+                let resolved = color(tint_rx.get());
+                Painter::new()
+                    .line_width(stroke)
+                    .line_cap(LineCap::Round)
+                    .stroke_color(resolved.opacity(0.18))
+                    .begin_path()
+                    .arc(center, center, radius, 0.0, TAU)
+                    .stroke()
+                    .stroke_color(resolved)
+                    .begin_path()
+                    .arc(center, center, radius, -PI * 0.5, PI)
+                    .stroke()
+            })
+            .size_full(),
+        )
+}
+
+fn shimmer_block_styled(corner_radius: f32, base: AdaptiveColor, sheen: AdaptiveColor) -> View {
+    const BAND_W: f32 = 220.0;
+    let sweep = animated_value(0.0);
+    // Match `mygo-music` skeleton cadence: 1100ms sweep + 500ms rest = 1600ms period.
+    let anim = Animation::sequence([
+        Animation::timing(
+            &sweep,
+            1.0,
+            Timing::new(1100.0, Easing::Curve(Curve::Sin, EaseMode::InOut)),
+        ),
+        Animation::delay(500.0),
+    ])
+    .looped(None);
+    let running = anim.clone();
+
+    effect(move || {
+        if reduce_motion() {
+            running.stop();
+            sweep.set(0.0);
+        } else {
+            sweep.set(0.0);
+            let _ = running.start();
+        }
+    });
+    cleanup(move || anim.stop());
+
+    let translate_x = sweep.interpolate(&[0.0, 1.0], &[-BAND_W, 560.0]);
 
     view()
         .size_full()
         .rounded(px(corner_radius))
         .overflow_hidden()
-        .bg(theme::skeleton)
-        .on_layout(move |b: &Bounds<Points>| {
-            box_size.set((b.size.width.0.max(24.0), b.size.height.0.max(12.0)));
-        })
+        .bg(base)
         .child(when(
             move || !reduce_motion(),
             move || {
-                canvas(move || {
-                    let (w, h) = box_size.get();
-                    let p = phase.get();
-                    let span = (w * 0.45).max(48.0);
-                    let start = -span + (w + span * 2.0) * p;
-                    let base = color(theme::skeleton());
-                    let highlight = base.lighten(0.10).alpha(0.65);
-                    let grad = CanvasGradient::linear(
-                        point(px(start), px(0.0)),
-                        point(px(start + span), px(h * 0.25)),
+                view()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left_0()
+                    .w(px(BAND_W))
+                    .pointer_events(PointerEvents::None)
+                    .bind_translate_x(&translate_x)
+                    .child(
+                        canvas(move || {
+                            let tint = color(sheen);
+                            let grad = CanvasGradient::linear(
+                                point(px(0.0), px(0.0)),
+                                point(px(BAND_W), px(18.0)),
+                            )
+                            .add_color_stop(percentage(0.0), tint.alpha(0.0))
+                            .add_color_stop(percentage(0.5), tint)
+                            .add_color_stop(percentage(1.0), tint.alpha(0.0));
+                            Painter::new()
+                                .fill_style(grad)
+                                .fill_rect(0.0, 0.0, BAND_W, 1024.0)
+                        })
+                        .size_full(),
                     )
-                    .add_color_stop(percentage(0.0), base.alpha(0.0))
-                    .add_color_stop(percentage(0.5), highlight)
-                    .add_color_stop(percentage(1.0), base.alpha(0.0));
-                    Painter::new().fill_style(grad).fill_rect(0.0, 0.0, w, h)
-                })
-                .size_full()
-                .pointer_events(PointerEvents::None)
             },
         ))
+}
+
+/// Loading placeholder block with smooth UI-thread animated sheen sweep
+/// (static under `reduce_motion()`, zero Rust interval timers).
+pub fn shimmer_block(corner_radius: f32) -> View {
+    shimmer_block_styled(corner_radius, colors::SKELETON, colors::SKELETON_SHEEN)
+}
+
+/// Translucent white loading placeholder block for dark Now Playing stage
+/// skeletons (lyrics, stage words, comments), matching `mygo-music` `npShimmer`.
+pub fn shimmer_block_on_dark(corner_radius: f32) -> View {
+    shimmer_block_styled(
+        corner_radius,
+        colors::NP_SKELETON_BASE,
+        colors::NP_SKELETON_SHEEN,
+    )
 }
 
 /// Loading placeholder skeleton card matching `MediaCard` proportions with shimmer sweep.

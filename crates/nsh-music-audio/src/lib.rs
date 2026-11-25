@@ -13,6 +13,8 @@ pub mod cache;
 pub mod decoder;
 pub mod dsp;
 pub mod ffmpeg_backend;
+#[cfg(feature = "audio-symphonia")]
+pub(crate) mod opus_codec;
 pub mod output;
 pub mod player;
 pub mod remote;
@@ -52,20 +54,20 @@ pub use cache::{
     AudioCache, ProgressiveStream, RedirectedResponse, StreamCacheConfig,
     send_with_preserved_headers,
 };
-pub use decoder::{AudioDecoder, AudioSpec, DecoderPreference, open_decoder};
 #[cfg(test)]
 pub use decoder::DemoSynthDecoder;
 #[cfg(feature = "audio-symphonia")]
 pub use decoder::SymphoniaDecoder;
+pub use decoder::{AudioDecoder, AudioSpec, DecoderPreference, open_decoder};
 pub use dsp::{
     DspConfig, DspProcessor, FadeEnvelope, SPECTRUM_BANDS, SoftLimiter, SpectrumAnalyzer,
-    compute_replay_gain_linear, db_to_linear, mix_crossfade,
+    compute_replay_gain_linear, db_to_linear, mix_crossfade, mix_crossfade_in_place,
 };
-#[cfg(feature = "audio-ffmpeg")]
-pub use ffmpeg_backend::{FfmpegDecoder, ReadSeek};
 pub use ffmpeg_backend::{
     AudioBackendCapabilities, audio_backend_capabilities, embedded_ffmpeg_version,
 };
+#[cfg(feature = "audio-ffmpeg")]
+pub use ffmpeg_backend::{FfmpegDecoder, ReadSeek};
 #[cfg(not(any(target_arch = "wasm32", target_env = "ohos")))]
 pub use output::CpalOutput;
 #[cfg(target_env = "ohos")]
@@ -196,7 +198,10 @@ mod tests {
                 "HTTP/1.1 200 OK\r\nContent-Type: audio/mp4\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
                 server_payload.len()
             );
-            socket.write_all(header.as_bytes()).await.expect("write header");
+            socket
+                .write_all(header.as_bytes())
+                .await
+                .expect("write header");
             socket.write_all(&server_payload).await.expect("write body");
             let _ = socket.shutdown().await;
         });
@@ -310,7 +315,10 @@ mod tests {
         let dir = unique_temp_dir("cache");
         let cache = AudioCache::with_dir(dir.clone(), 20_000).expect("create cache");
         let headers = vec![
-            ("Referer".to_owned(), "https://music.example.test/".to_owned()),
+            (
+                "Referer".to_owned(),
+                "https://music.example.test/".to_owned(),
+            ),
             ("Cookie".to_owned(), "token=xyz".to_owned()),
             ("User-Agent".to_owned(), "nsh-music-agent".to_owned()),
         ];
@@ -322,7 +330,9 @@ mod tests {
         assert_eq!(stream.byte_len(), Some(cdn_body.len() as u64));
 
         let mut all = Vec::new();
-        stream.read_to_end(&mut all).expect("read progressive stream");
+        stream
+            .read_to_end(&mut all)
+            .expect("read progressive stream");
         assert_eq!(all, cdn_body);
 
         // Seek backwards inside the progressive file.
@@ -335,11 +345,17 @@ mod tests {
         cdn_task.await.expect("cdn task");
 
         // Verify LRU byte eviction: insert entries totaling > 20_000 bytes.
-        cache.put_bytes("https://lru.test/1", &vec![1u8; 9_000]).unwrap();
-        cache.put_bytes("https://lru.test/2", &vec![2u8; 9_000]).unwrap();
+        cache
+            .put_bytes("https://lru.test/1", &vec![1u8; 9_000])
+            .unwrap();
+        cache
+            .put_bytes("https://lru.test/2", &vec![2u8; 9_000])
+            .unwrap();
         // Touch entry 1 so entry 2 becomes least recently used.
         assert!(cache.get_cached_path("https://lru.test/1").is_some());
-        cache.put_bytes("https://lru.test/3", &vec![3u8; 9_000]).unwrap();
+        cache
+            .put_bytes("https://lru.test/3", &vec![3u8; 9_000])
+            .unwrap();
         assert!(cache.total_bytes() <= 20_000);
         assert!(cache.contains("https://lru.test/1"));
         assert!(cache.contains("https://lru.test/3"));
@@ -375,7 +391,10 @@ mod tests {
         dsp.process_interleaved(&mut samples);
 
         let max_abs = samples.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
-        assert!(max_abs <= 0.99, "soft limiter should prevent clipping, peak={max_abs}");
+        assert!(
+            max_abs <= 0.99,
+            "soft limiter should prevent clipping, peak={max_abs}"
+        );
 
         let bands = dsp.spectrum();
         let max_band = bands.iter().copied().fold(0.0f32, f32::max);
@@ -448,11 +467,7 @@ mod tests {
         let radio_calls_cb = Arc::clone(&radio_calls);
         engine.set_radio_refill(Some(Arc::new(move |_| {
             let n = radio_calls_cb.fetch_add(1, Ordering::SeqCst);
-            vec![make_demo_track(
-                &format!("radio-{n}"),
-                "Endless FM",
-                20_000,
-            )]
+            vec![make_demo_track(&format!("radio-{n}"), "Endless FM", 20_000)]
         })));
 
         engine.play_queue(vec![t1.clone(), t2.clone()], 0);
@@ -472,12 +487,18 @@ mod tests {
 
         let snap = engine.snapshot();
         assert_eq!(snap.status, PlaybackStatus::Playing);
-        assert_eq!(snap.current_track.as_ref().map(|t| t.id.as_str()), Some("demo-1"));
+        assert_eq!(
+            snap.current_track.as_ref().map(|t| t.id.as_str()),
+            Some("demo-1")
+        );
         assert_eq!(snap.output_backend, "null");
         assert_eq!(snap.decoder_backend, "demo-synth");
         assert!(frames_counter.load(Ordering::Relaxed) > 0);
         let spec_energy: f32 = engine.spectrum().iter().sum();
-        assert!(spec_energy > 0.0, "spectrum should be active while playing demo track");
+        assert!(
+            spec_energy > 0.0,
+            "spectrum should be active while playing demo track"
+        );
 
         // Test seek.
         engine.seek(12_000);
@@ -613,6 +634,543 @@ mod tests {
 
         let landed = dec.seek(500).expect("seek wav to 500ms");
         assert!((450..=550).contains(&landed), "landed={landed}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_lossless_classification_and_stream_format() {
+        use nsh_music_core::model::{Quality, StreamInfo};
+
+        let wav_spec = AudioSpec {
+            sample_rate: 44_100,
+            channels: 2,
+            duration_ms: Some(10_000),
+            bit_rate: None,
+            codec_name: "wav".to_owned(),
+        };
+        let (is_lossless, fmt) = player::classify_stream_format(
+            &StreamInfo {
+                url: "file:///tmp/song.wav".to_owned(),
+                media_type: "audio/wav".to_owned(),
+                ..StreamInfo::default()
+            },
+            &wav_spec,
+            Quality::Standard,
+        );
+        assert!(is_lossless);
+        assert_eq!(fmt, "wav");
+
+        let flac_spec = AudioSpec {
+            codec_name: "flac".to_owned(),
+            ..wav_spec.clone()
+        };
+        let (is_lossless, fmt) = player::classify_stream_format(
+            &StreamInfo {
+                url: "https://cdn.example/track.flac".to_owned(),
+                media_type: "audio/flac".to_owned(),
+                ..StreamInfo::default()
+            },
+            &flac_spec,
+            Quality::High,
+        );
+        assert!(is_lossless);
+        assert_eq!(fmt, "flac");
+
+        let alac_spec = AudioSpec {
+            codec_name: "alac".to_owned(),
+            ..wav_spec.clone()
+        };
+        let (is_lossless, fmt) = player::classify_stream_format(
+            &StreamInfo {
+                url: "https://cdn.example/track.m4a".to_owned(),
+                media_type: "audio/mp4".to_owned(),
+                ..StreamInfo::default()
+            },
+            &alac_spec,
+            Quality::High,
+        );
+        assert!(is_lossless);
+        assert_eq!(fmt, "alac");
+
+        // Lossy MP3 must stay non-lossless even when user prefers Quality::Lossless.
+        let mp3_spec = AudioSpec {
+            codec_name: "mp3".to_owned(),
+            ..wav_spec.clone()
+        };
+        let (is_lossless, fmt) = player::classify_stream_format(
+            &StreamInfo {
+                url: "file:///tmp/song.mp3".to_owned(),
+                media_type: "audio/mpeg".to_owned(),
+                ..StreamInfo::default()
+            },
+            &mp3_spec,
+            Quality::Lossless,
+        );
+        assert!(!is_lossless);
+        assert_eq!(fmt, "mp3");
+
+        // Lossy Opus (including WebM/Opus MIME strings) must stay non-lossless.
+        let opus_spec = AudioSpec {
+            codec_name: "opus".to_owned(),
+            ..wav_spec.clone()
+        };
+        let (is_lossless, fmt) = player::classify_stream_format(
+            &StreamInfo {
+                url: "http://127.0.0.1:24567/".to_owned(),
+                media_type: "audio/webm; codecs=\"opus\"".to_owned(),
+                ..StreamInfo::default()
+            },
+            &opus_spec,
+            Quality::Lossless,
+        );
+        assert!(!is_lossless);
+        assert_eq!(fmt, "opus");
+        assert_eq!(
+            player::normalize_stream_format("audio/webm; codecs=\"opus\"").as_deref(),
+            Some("opus")
+        );
+
+        // Resolved stream explicitly tagged lossless sets is_lossless = true.
+        let (is_lossless, fmt) = player::classify_stream_format(
+            &StreamInfo {
+                url: "https://cdn.example/stream?id=42".to_owned(),
+                quality: "lossless".to_owned(),
+                media_type: "audio/mp4".to_owned(),
+                ..StreamInfo::default()
+            },
+            &AudioSpec {
+                codec_name: "aac".to_owned(),
+                ..wav_spec
+            },
+            Quality::High,
+        );
+        assert!(is_lossless);
+        assert_eq!(fmt, "aac");
+    }
+
+    #[test]
+    fn test_fixed_pcm_ring_wraparound_and_resampler() {
+        let mut ring = player::FixedPcmRing::new(1024);
+        let chunk_a: Vec<f32> = (0..700).map(|i| i as f32).collect();
+        assert_eq!(ring.push_slice(&chunk_a), 700);
+        assert_eq!(ring.len(), 700);
+
+        let mut out_a = vec![0.0f32; 500];
+        assert_eq!(ring.pop_slice(&mut out_a), 500);
+        assert_eq!(&out_a[..], &chunk_a[..500]);
+        assert_eq!(ring.len(), 200);
+
+        // Push across wraparound boundary.
+        let chunk_b: Vec<f32> = (1000..1600).map(|i| i as f32).collect();
+        assert_eq!(ring.push_slice(&chunk_b), 600);
+        assert_eq!(ring.len(), 800);
+
+        let mut out_all = vec![0.0f32; 800];
+        assert_eq!(ring.pop_slice(&mut out_all), 800);
+        assert_eq!(&out_all[..200], &chunk_a[500..700]);
+        assert_eq!(&out_all[200..800], &chunk_b[..600]);
+        assert_eq!(ring.len(), 0);
+
+        // Resample 44.1kHz stereo -> 48kHz stereo using reusable scratch buffers.
+        let mut ch_scratch = Vec::new();
+        let mut out = Vec::new();
+        let input_44k = vec![0.5f32; 441 * 2];
+        player::convert_pcm(&input_44k, 44_100, 2, 48_000, 2, &mut ch_scratch, &mut out);
+        assert_eq!(out.len(), 480 * 2);
+        assert!(
+            ch_scratch.is_empty(),
+            "same-channel resample should not touch channel_scratch"
+        );
+        assert!((out[0] - 0.5).abs() < 1e-4);
+    }
+
+    #[cfg(feature = "audio-symphonia")]
+    #[test]
+    fn test_audio_engine_reports_wav_lossless_metadata() {
+        let sample_rate: u32 = 44_100;
+        let channels: u16 = 2;
+        let num_frames: u32 = sample_rate / 2;
+        let data_bytes = num_frames * channels as u32 * 2;
+        let mut wav = Vec::with_capacity(44 + data_bytes as usize);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&channels.to_le_bytes());
+        wav.extend_from_slice(&sample_rate.to_le_bytes());
+        wav.extend_from_slice(&(sample_rate * channels as u32 * 2).to_le_bytes());
+        wav.extend_from_slice(&(channels * 2).to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_bytes.to_le_bytes());
+        for i in 0..num_frames {
+            let t = i as f32 / sample_rate as f32;
+            let sample = ((TAU * 440.0 * t).sin() * 12_000.0) as i16;
+            wav.extend_from_slice(&sample.to_le_bytes());
+            wav.extend_from_slice(&sample.to_le_bytes());
+        }
+
+        let dir = unique_temp_dir("engine-lossless-wav");
+        let wav_path = dir.join("master.wav");
+        std::fs::write(&wav_path, &wav).expect("write wav");
+
+        let engine = AudioEngine::with_output(
+            AudioEngineConfig {
+                cache: StreamCacheConfig {
+                    cache_dir: dir.join("cache"),
+                    max_bytes: 1024 * 1024,
+                    ..StreamCacheConfig::default()
+                },
+                prefetch_next: false,
+                ..AudioEngineConfig::default()
+            },
+            Box::new(NullOutput::with_tick_interval(Duration::from_millis(2))),
+        )
+        .expect("create engine");
+
+        let track = Track {
+            id: "wav-1".to_owned(),
+            source: "local".to_owned(),
+            name: "Master WAV".to_owned(),
+            duration: 500,
+            local_path: wav_path.display().to_string(),
+            ..Track::default()
+        };
+        let initial_ver = engine.snapshot_version();
+        engine.play_track(track);
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            let snap = engine.snapshot();
+            if snap.status == PlaybackStatus::Playing && snap.is_lossless {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let snap = engine.snapshot();
+        assert_eq!(snap.status, PlaybackStatus::Playing);
+        assert!(snap.is_lossless, "WAV track must report is_lossless=true");
+        assert_eq!(snap.stream_format, "wav");
+        assert!(engine.snapshot_version() > initial_ver);
+
+        engine.stop();
+        let stop_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < stop_deadline {
+            if engine.snapshot().status == PlaybackStatus::Stopped {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let stopped = engine.snapshot();
+        assert!(!stopped.is_lossless);
+        assert!(stopped.stream_format.is_empty());
+
+        engine.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Live end-to-end YouTube Music (`0dGXCvLIffY` / `难解`) verification across all three
+    /// real stream types returned by InnerTube `VISIONOS`:
+    /// 1. `itag=251` (`audio/webm; codecs="opus"`)
+    /// 2. `itag=140` (`audio/mp4; codecs="mp4a.40.2"`)
+    /// 3. `hlsManifestUrl` (`.m3u8` master -> media -> segments)
+    ///
+    /// Each format is relayed through `VirtualFfmpegShim` with the exact `-f mp3 -listen 1`
+    /// arguments used by `mygo-music-youtube-music`, opened via `AudioCache` + `open_decoder`
+    /// with contradictory `media_type = Some("mp3")`, and decoded with `SymphoniaOnly`.
+    #[cfg(feature = "audio-symphonia")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires live YouTube Music network access"]
+    async fn live_youtube_music_decode_all_formats() {
+        const VIDEO_ID: &str = "0dGXCvLIffY";
+        const VISIONOS_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
+        const WEB_REMIX_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+        let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("build reqwest client");
+
+        // 1. Fetch anonymous visitorData (mirrors youtube-music/index.js).
+        let visitor_resp: serde_json::Value = http
+            .post("https://music.youtube.com/youtubei/v1/visitor_id?prettyPrint=false")
+            .header("content-type", "application/json")
+            .header("user-agent", WEB_REMIX_UA)
+            .header("origin", "https://music.youtube.com")
+            .header("referer", "https://music.youtube.com/")
+            .json(&serde_json::json!({
+                "context": {
+                    "client": {
+                        "clientName": "WEB_REMIX",
+                        "clientVersion": "1.20250310.01.00",
+                        "hl": "en",
+                        "gl": "US"
+                    }
+                }
+            }))
+            .send()
+            .await
+            .expect("visitor_id request")
+            .json()
+            .await
+            .expect("visitor_id json");
+
+        let visitor_data = visitor_resp
+            .pointer("/responseContext/visitorData")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+        eprintln!("[live-ytm] visitorData len={}", visitor_data.len());
+
+        // 2. Fetch InnerTube /player using VISIONOS client.
+        let mut player_req = http
+            .post("https://music.youtube.com/youtubei/v1/player?prettyPrint=false")
+            .header("content-type", "application/json")
+            .header("user-agent", VISIONOS_UA)
+            .header("origin", "https://music.youtube.com")
+            .header("x-origin", "https://music.youtube.com")
+            .header("x-youtube-client-name", "101")
+            .header("x-youtube-client-version", "1.02");
+        if !visitor_data.is_empty() {
+            player_req = player_req.header("x-goog-visitor-id", &visitor_data);
+        }
+
+        let player_json: serde_json::Value = player_req
+            .json(&serde_json::json!({
+                "context": {
+                    "client": {
+                        "clientName": "VISIONOS",
+                        "clientVersion": "1.02",
+                        "deviceMake": "Apple",
+                        "deviceModel": "RealityDevice17,1",
+                        "osName": "visionOS",
+                        "osVersion": "26.5.23O471",
+                        "hl": "en",
+                        "gl": "US",
+                        "userAgent": VISIONOS_UA
+                    }
+                },
+                "videoId": VIDEO_ID,
+                "contentCheckOk": true,
+                "racyCheckOk": true
+            }))
+            .send()
+            .await
+            .expect("player request")
+            .json()
+            .await
+            .expect("player json");
+
+        let playability = player_json
+            .pointer("/playabilityStatus/status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("UNKNOWN");
+        let title = player_json
+            .pointer("/videoDetails/title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unknown>");
+        eprintln!("[live-ytm] video={VIDEO_ID} title={title:?} playability={playability}");
+        assert_eq!(
+            playability, "OK",
+            "playabilityStatus must be OK: {player_json}"
+        );
+
+        let adaptive = player_json
+            .pointer("/streamingData/adaptiveFormats")
+            .and_then(|v| v.as_array())
+            .expect("streamingData.adaptiveFormats array");
+
+        let find_itag = |target: i64| -> Option<String> {
+            adaptive.iter().find_map(|fmt| {
+                if fmt.get("itag").and_then(|v| v.as_i64()) == Some(target) {
+                    fmt.get("url").and_then(|v| v.as_str()).map(str::to_owned)
+                } else {
+                    None
+                }
+            })
+        };
+
+        let url_251 = find_itag(251).expect("itag=251 (WebM/Opus) URL must be present");
+        let url_140 = find_itag(140).expect("itag=140 (fMP4/AAC) URL must be present");
+        let url_hls = player_json
+            .pointer("/streamingData/hlsManifestUrl")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .expect("streamingData.hlsManifestUrl must be present");
+
+        let dir = unique_temp_dir("live-ytm");
+        let cache = AudioCache::with_dir(dir.clone(), 16 * 1024 * 1024).expect("cache");
+
+        let run_case = |label: &str,
+                        upstream_url: &str,
+                        expected_codec: Option<&str>,
+                        min_samples: usize,
+                        test_seek_ms: Option<u64>| {
+            let free_port = {
+                let tmp = std::net::TcpListener::bind("127.0.0.1:0").expect("bind port");
+                tmp.local_addr().expect("addr").port()
+            };
+            let relay_url = format!("http://127.0.0.1:{free_port}/");
+            let proc = VirtualFfmpegShim::spawn_str(&[
+                "-nostdin",
+                "-hide_banner",
+                "-nostats",
+                "-reconnect",
+                "1",
+                "-reconnect_streamed",
+                "1",
+                "-reconnect_delay_max",
+                "5",
+                "-rw_timeout",
+                "15000000",
+                "-request_size",
+                "10485760",
+                "-user_agent",
+                VISIONOS_UA,
+                "-i",
+                upstream_url,
+                "-vn",
+                "-c:a",
+                "libmp3lame",
+                "-b:a",
+                "192k",
+                "-id3v2_version",
+                "0",
+                "-write_xing",
+                "0",
+                "-f",
+                "mp3",
+                "-listen",
+                "1",
+                &relay_url,
+            ])
+            .expect("spawn VirtualFfmpegShim relay");
+            // With eager upstream preflight on non-loopback URLs, `Input #0` is emitted once
+            // upstream responds 2xx (mirroring real `youtube-music` plugin polling).
+            let ready_deadline = Instant::now() + Duration::from_secs(20);
+            while !proc.error_output().contains("Input #0")
+                && proc.is_running()
+                && Instant::now() < ready_deadline
+            {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            assert!(
+                proc.error_output().contains("Input #0"),
+                "[live-ytm] {label} VirtualFfmpegShim never became ready; stderr={}",
+                proc.error_output()
+            );
+
+            let mut dec = open_decoder(
+                &cache,
+                &relay_url,
+                Vec::new(),
+                Some("mp3"), // Contradictory plugin media_type like youtube-music serve()
+                None,
+                DecoderPreference::SymphoniaOnly,
+            )
+            .unwrap_or_else(|e| panic!("[live-ytm] {label} open_decoder failed: {e}"));
+
+            let spec = dec.spec();
+            eprintln!(
+                "[live-ytm] {label}: backend={} codec={} rate={} ch={} dur_ms={:?}",
+                dec.backend_name(),
+                spec.codec_name,
+                spec.sample_rate,
+                spec.channels,
+                spec.duration_ms
+            );
+            assert_eq!(dec.backend_name(), "symphonia");
+            if let Some(exp) = expected_codec {
+                assert_eq!(spec.codec_name, exp, "{label}: unexpected codec");
+            }
+            assert!(spec.channels >= 1);
+
+            let mut pcm = Vec::with_capacity(min_samples + 8192);
+            let mut peak = 0.0f32;
+            while pcm.len() < min_samples {
+                let start = pcm.len();
+                let n = dec
+                    .read_pcm(&mut pcm)
+                    .unwrap_or_else(|e| panic!("[live-ytm] {label} read_pcm failed: {e}"));
+                if n == 0 {
+                    break;
+                }
+                for &s in &pcm[start..] {
+                    peak = peak.max(s.abs());
+                }
+            }
+            eprintln!(
+                "[live-ytm] {label}: decoded {} samples, peak={:.4}, pos_ms={}",
+                pcm.len(),
+                peak,
+                dec.position_ms()
+            );
+            assert!(
+                pcm.len() >= min_samples,
+                "{label}: expected >= {min_samples} samples, got {}",
+                pcm.len()
+            );
+            assert!(
+                peak > 0.001,
+                "{label}: expected audible non-zero PCM signal, peak={peak}"
+            );
+
+            if let Some(target_ms) = test_seek_ms {
+                let landed = dec
+                    .seek(target_ms)
+                    .unwrap_or_else(|e| panic!("[live-ytm] {label} seek({target_ms}) failed: {e}"));
+                let mut post_seek = Vec::new();
+                let mut post_peak = 0.0f32;
+                while post_seek.len() < 8192 {
+                    let start = post_seek.len();
+                    let n = dec.read_pcm(&mut post_seek).unwrap_or_else(|e| {
+                        panic!("[live-ytm] {label} post-seek read_pcm failed: {e}")
+                    });
+                    if n == 0 {
+                        break;
+                    }
+                    for &s in &post_seek[start..] {
+                        post_peak = post_peak.max(s.abs());
+                    }
+                }
+                eprintln!(
+                    "[live-ytm] {label}: seek({target_ms}) -> landed={landed}ms, post_seek_samples={}, post_peak={:.4}",
+                    post_seek.len(),
+                    post_peak
+                );
+                assert!(
+                    post_seek.len() >= 4096,
+                    "{label}: post-seek decode too short"
+                );
+                assert!(post_peak > 0.001, "{label}: post-seek audio silent");
+            }
+
+            proc.kill();
+            let _ = proc.wait();
+        };
+
+        // Decode ~2.5s of stereo PCM per stream to get past the quiet 0.5s intro fade-in
+        // of `0dGXCvLIffY` and verify strong audible signal across all three formats.
+        run_case(
+            "itag=251 WebM/Opus",
+            &url_251,
+            Some("opus"),
+            240_000,
+            Some(15_000),
+        );
+        run_case(
+            "itag=140 fMP4/AAC",
+            &url_140,
+            Some("aac"),
+            220_500,
+            Some(15_000),
+        );
+        run_case("hlsManifestUrl (.m3u8)", &url_hls, None, 220_500, None);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

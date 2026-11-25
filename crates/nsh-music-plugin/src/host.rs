@@ -8,13 +8,11 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use nsh_music_audio::virtual_ffmpeg::{
-    is_ffmpeg_command, VirtualFfmpegShim, VirtualProcessHandle,
-};
+use nsh_music_audio::virtual_ffmpeg::VirtualProcessHandle;
 use nsh_music_core::model::SignInPrompt;
 use nsh_music_core::source::SignInPromptCallback;
 use rquickjs::function::{Opt, Rest};
-use rquickjs::{Array, Ctx, Error as JsError, Exception, Function, Object, Promise, Value};
+use rquickjs::{Array, Ctx, Error as JsError, Exception, Function, IntoJs, Object, Promise, Value};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -22,10 +20,17 @@ use crate::crypto;
 use crate::headers::{HeaderRequestKind, RequestHeadersResolver};
 use crate::installer::atomic_write;
 use crate::manifest::{PluginLocales, PluginManifest};
+use crate::mobile_compat::{MobileProcessVirtualizer, resolve_relative_command, with_default_cwd};
+#[cfg(unix)]
+use crate::mobile_compat::{augment_unix_path, resolve_unix_executable};
 
-/// Structured error returned when a plugin tries to spawn a non-ffmpeg external binary on mobile.
+/// Structured error returned when a plugin tries to spawn an unvirtualized external binary on mobile.
+/// Note: Intentionally avoids the substring `"allowed"` (case-insensitive) so optional desktop binary
+/// probes do not trip `/allowed/.test(e.message)`.
 #[derive(Debug, Clone, Error, PartialEq, Eq, Serialize, Deserialize)]
-#[error("MobileSandboxError: external command `{command}` cannot be spawned on {platform}. {migration_path}")]
+#[error(
+    "MobileSandboxError: external command `{command}` is prohibited on {platform}. {migration_path}"
+)]
 #[serde(rename_all = "camelCase")]
 pub struct MobileSandboxError {
     pub code: String,
@@ -41,9 +46,9 @@ impl MobileSandboxError {
         Self {
             code: "MOBILE_SANDBOX_ERROR".to_owned(),
             migration_path: format!(
-                "Mobile sandboxes ({platform}) prohibit spawning `{command}`. \
+                "Spawning external binary `{command}` is prohibited by the {platform} mobile sandbox (not permitted on mobile). \
                  Check `host.capabilities.canSpawnExternal` first; replace external HTTP/signing CLIs with `host.fetch` + `host.crypto`, \
-                 return direct stream URLs with `headers`, or use `host.spawn(\"ffmpeg\", ...)` which is virtualized in-process. \
+                 return direct stream URLs with `headers`, or rely on `host.spawn(\"ffmpeg\" | \"yt-dlp\", ...)` which are virtualized in-process. \
                  See docs/PLUGIN_COMPAT.md for migration steps."
             ),
             command,
@@ -63,6 +68,8 @@ pub struct WebSignInRequest {
     pub user_agent: Option<String>,
     pub eval_js: Option<String>,
     pub cookies_of: Option<String>,
+    /// Cookie names whose presence signals sign-in completion (JS `until`, e.g. `["SAPISID", "__Secure-3PSID"]`).
+    pub until: Vec<String>,
     pub cookie_names: Vec<String>,
     pub match_url: Option<String>,
     pub allow_manual_cookie: bool,
@@ -87,6 +94,10 @@ pub struct WebSignInResult {
 pub type WebSignInHandler =
     Arc<dyn Fn(WebSignInRequest) -> Result<WebSignInResult, String> + Send + Sync>;
 
+/// Callback invoked by `host.openURL(url)` so the embedding app can open `http`/`https` pages
+/// in the system browser or mobile in-app browser on both Desktop and Mobile.
+pub type OpenUrlHandler = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+
 /// Runtime platform override options for `HostContext` (useful for testing mobile sandbox behavior on desktop).
 #[derive(Clone, Default)]
 pub struct HostRuntimeOptions {
@@ -95,6 +106,7 @@ pub struct HostRuntimeOptions {
     pub platform_override: Option<String>,
     pub sign_in_prompt: Option<SignInPromptCallback>,
     pub web_sign_in_handler: Option<WebSignInHandler>,
+    pub open_url_handler: Option<OpenUrlHandler>,
 }
 
 impl std::fmt::Debug for HostRuntimeOptions {
@@ -104,13 +116,17 @@ impl std::fmt::Debug for HostRuntimeOptions {
             .field("is_mobile_override", &self.is_mobile_override)
             .field("platform_override", &self.platform_override)
             .field("has_sign_in_prompt", &self.sign_in_prompt.is_some())
-            .field("has_web_sign_in_handler", &self.web_sign_in_handler.is_some())
+            .field(
+                "has_web_sign_in_handler",
+                &self.web_sign_in_handler.is_some(),
+            )
+            .field("has_open_url_handler", &self.open_url_handler.is_some())
             .finish()
     }
 }
 
 /// External desktop subprocess wrapper matching `mygo-music` & `VirtualProcessHandle` semantics.
-struct ExternalProcessHandle {
+pub(crate) struct ExternalProcessHandle {
     child: Mutex<Child>,
     stdin: Mutex<Option<ChildStdin>>,
     stdout_buf: Arc<Mutex<Vec<u8>>>,
@@ -122,11 +138,28 @@ struct ExternalProcessHandle {
     stderr_thread: Mutex<Option<JoinHandle<()>>>,
     running: Arc<AtomicBool>,
     exit_code: Arc<Mutex<Option<i32>>>,
+    done_cvar: Arc<Condvar>,
 }
 
 impl ExternalProcessHandle {
-    fn spawn(cmd: &str, args: &[String], opts: &SpawnOptions) -> Result<Self, String> {
-        let mut command = Command::new(cmd);
+    pub(crate) fn spawn(cmd: &str, args: &[String], opts: &SpawnOptions) -> Result<Self, String> {
+        #[cfg(unix)]
+        let (program, augmented_path) = {
+            let base_path = opts
+                .env
+                .get("PATH")
+                .cloned()
+                .or_else(|| std::env::var("PATH").ok())
+                .unwrap_or_default();
+            let augmented = augment_unix_path(&base_path);
+            let resolved =
+                resolve_unix_executable(cmd, &augmented).unwrap_or_else(|| PathBuf::from(cmd));
+            (resolved, augmented)
+        };
+        #[cfg(not(unix))]
+        let program = PathBuf::from(cmd);
+
+        let mut command = Command::new(&program);
         command
             .args(args)
             .stdin(Stdio::piped())
@@ -137,6 +170,10 @@ impl ExternalProcessHandle {
         }
         for (k, v) in &opts.env {
             command.env(k, v);
+        }
+        #[cfg(unix)]
+        {
+            command.env("PATH", &augmented_path);
         }
 
         let mut child = command
@@ -151,6 +188,7 @@ impl ExternalProcessHandle {
         let stdout_cvar = Arc::new(Condvar::new());
         let running = Arc::new(AtomicBool::new(true));
         let exit_code = Arc::new(Mutex::new(None));
+        let done_cvar = Arc::new(Condvar::new());
 
         let stdout_thread = if let Some(mut out) = child.stdout.take() {
             let buf = Arc::clone(&stdout_buf);
@@ -179,13 +217,17 @@ impl ExternalProcessHandle {
                             cvar.notify_all();
                         }
                     }
-                    if !rem.is_empty()
-                        && let Ok(mut q) = lines.lock()
                     {
-                        q.push_back(rem.trim_end_matches('\r').to_owned());
+                        let mut q = lines.lock();
+                        if !rem.is_empty()
+                            && let Ok(ref mut q_guard) = q
+                        {
+                            q_guard.push_back(rem.trim_end_matches('\r').to_owned());
+                        }
+                        eof.store(true, Ordering::SeqCst);
+                        cvar.notify_all();
+                        drop(q);
                     }
-                    eof.store(true, Ordering::SeqCst);
-                    cvar.notify_all();
                 })
                 .ok()
         } else {
@@ -199,11 +241,26 @@ impl ExternalProcessHandle {
                 .name(format!("plugin-stderr-{cmd}"))
                 .spawn(move || {
                     let mut chunk = [0u8; 4096];
+                    const MAX_STDERR_BYTES: usize = 64 * 1024;
                     while let Ok(n) = err.read(&mut chunk) {
                         if n == 0 {
                             break;
                         }
                         if let Ok(mut guard) = buf.lock() {
+                            if guard.len() + n > MAX_STDERR_BYTES {
+                                // Keep the first 1 KiB (including `Input #0`) and the latest tail.
+                                let keep_prefix = guard.len().min(1024);
+                                let tail_keep = (MAX_STDERR_BYTES / 2)
+                                    .min(guard.len().saturating_sub(keep_prefix));
+                                let tail_start = guard.len().saturating_sub(tail_keep);
+                                if tail_start > keep_prefix {
+                                    let mut compacted = Vec::with_capacity(MAX_STDERR_BYTES);
+                                    compacted.extend_from_slice(&guard[..keep_prefix]);
+                                    compacted.extend_from_slice(b"\n...\n");
+                                    compacted.extend_from_slice(&guard[tail_start..]);
+                                    *guard = compacted;
+                                }
+                            }
                             guard.extend_from_slice(&chunk[..n]);
                         }
                     }
@@ -225,6 +282,7 @@ impl ExternalProcessHandle {
             stderr_thread: Mutex::new(stderr_thread),
             running,
             exit_code,
+            done_cvar,
         })
     }
 
@@ -281,30 +339,21 @@ impl ExternalProcessHandle {
             return false;
         }
         if let Ok(mut child) = self.child.lock()
-            && let Ok(Some(status)) = child.try_wait() {
-                self.running.store(false, Ordering::SeqCst);
-                if let Ok(mut code) = self.exit_code.lock() {
+            && let Ok(Some(status)) = child.try_wait()
+        {
+            self.running.store(false, Ordering::SeqCst);
+            if let Ok(mut code) = self.exit_code.lock() {
+                if code.is_none() {
                     *code = Some(status.code().unwrap_or(-1));
                 }
-                return false;
+                self.done_cvar.notify_all();
             }
+            return false;
+        }
         true
     }
 
-    fn wait(&self) -> i32 {
-        if let Ok(Some(code)) = self.exit_code.lock().map(|g| *g) {
-            return code;
-        }
-        self.close_stdin();
-        let code = if let Ok(mut child) = self.child.lock() {
-            child
-                .wait()
-                .ok()
-                .and_then(|s| s.code())
-                .unwrap_or(-1)
-        } else {
-            -1
-        };
+    fn join_io_threads(&self) {
         if let Ok(mut th) = self.stdout_thread.lock()
             && let Some(h) = th.take()
         {
@@ -315,48 +364,330 @@ impl ExternalProcessHandle {
         {
             let _ = h.join();
         }
-        self.running.store(false, Ordering::SeqCst);
-        if let Ok(mut guard) = self.exit_code.lock() {
-            *guard = Some(code);
+    }
+
+    fn wait(&self) -> i32 {
+        if let Ok(Some(code)) = self.exit_code.lock().map(|g| *g) {
+            self.join_io_threads();
+            return code;
         }
-        code
+        self.close_stdin();
+        loop {
+            // Never hold `self.child` across a blocking wait so `kill()` and `is_running()`
+            // can acquire `self.child` immediately without deadlocking.
+            let polled = if let Ok(mut child) = self.child.lock() {
+                match child.try_wait() {
+                    Ok(Some(status)) => Some(status.code().unwrap_or(-1)),
+                    Ok(None) => None,
+                    Err(_) => Some(-1),
+                }
+            } else {
+                Some(-1)
+            };
+
+            if let Some(code) = polled {
+                self.running.store(false, Ordering::SeqCst);
+                if let Ok(mut guard) = self.exit_code.lock() {
+                    let final_code = *guard.get_or_insert(code);
+                    self.done_cvar.notify_all();
+                    drop(guard);
+                    self.join_io_threads();
+                    return final_code;
+                }
+                self.join_io_threads();
+                return code;
+            }
+
+            let Ok(guard) = self.exit_code.lock() else {
+                return -1;
+            };
+            if let Some(code) = *guard {
+                drop(guard);
+                self.join_io_threads();
+                return code;
+            }
+            let _ = self
+                .done_cvar
+                .wait_timeout(guard, Duration::from_millis(15));
+        }
     }
 
     fn kill(&self) {
         self.close_stdin();
-        if let Ok(mut child) = self.child.lock() {
+        let code = if let Ok(mut child) = self.child.lock() {
             let _ = child.kill();
-            let _ = child.wait();
+            child.wait().ok().and_then(|s| s.code()).unwrap_or(-1)
+        } else {
+            -1
+        };
+        {
+            let _q = self.stdout_lines.lock();
+            self.stdout_eof.store(true, Ordering::SeqCst);
+            self.stdout_cvar.notify_all();
         }
-        self.stdout_eof.store(true, Ordering::SeqCst);
-        self.stdout_cvar.notify_all();
         self.running.store(false, Ordering::SeqCst);
+        if let Ok(mut guard) = self.exit_code.lock() {
+            if guard.is_none() {
+                *guard = Some(code);
+            }
+            self.done_cvar.notify_all();
+        }
     }
 }
 
-enum ManagedProcess {
+/// Reusable in-process virtual CLI pipe supporting async stdin/stdout/stderr/readLine/wait/kill
+/// semantics matching `mygo-music` spawned process handles (used by shims such as `VirtualYtdlpShim`).
+pub struct VirtualPipeHandle {
+    stdin_buf: Mutex<String>,
+    stdin_closed: AtomicBool,
+    stdin_cvar: Condvar,
+    stdout_buf: Mutex<String>,
+    stderr_buf: Mutex<String>,
+    stdout_lines: Mutex<VecDeque<String>>,
+    stdout_eof: AtomicBool,
+    stdout_cvar: Condvar,
+    running: AtomicBool,
+    killed: AtomicBool,
+    exit_code: Mutex<Option<i32>>,
+    done_cvar: Condvar,
+}
+
+impl VirtualPipeHandle {
+    /// Creates an already-completed virtual pipe handle (ideal for instant `--version` probes).
+    pub fn completed(stdout: String, stderr: String, exit_code: i32) -> Arc<Self> {
+        let mut lines = VecDeque::new();
+        for line in stdout.lines() {
+            lines.push_back(line.trim_end_matches('\r').to_owned());
+        }
+        Arc::new(Self {
+            stdin_buf: Mutex::new(String::new()),
+            stdin_closed: AtomicBool::new(true),
+            stdin_cvar: Condvar::new(),
+            stdout_buf: Mutex::new(stdout),
+            stderr_buf: Mutex::new(stderr),
+            stdout_lines: Mutex::new(lines),
+            stdout_eof: AtomicBool::new(true),
+            stdout_cvar: Condvar::new(),
+            running: AtomicBool::new(false),
+            killed: AtomicBool::new(false),
+            exit_code: Mutex::new(Some(exit_code)),
+            done_cvar: Condvar::new(),
+        })
+    }
+
+    /// Creates a live virtual pipe handle whose background worker pushes output and calls [`Self::finish`].
+    pub fn running() -> Arc<Self> {
+        Arc::new(Self {
+            stdin_buf: Mutex::new(String::new()),
+            stdin_closed: AtomicBool::new(false),
+            stdin_cvar: Condvar::new(),
+            stdout_buf: Mutex::new(String::new()),
+            stderr_buf: Mutex::new(String::new()),
+            stdout_lines: Mutex::new(VecDeque::new()),
+            stdout_eof: AtomicBool::new(false),
+            stdout_cvar: Condvar::new(),
+            running: AtomicBool::new(true),
+            killed: AtomicBool::new(false),
+            exit_code: Mutex::new(None),
+            done_cvar: Condvar::new(),
+        })
+    }
+
+    pub fn write_stdin(&self, data: &str) -> Result<(), String> {
+        if self.stdin_closed.load(Ordering::SeqCst) {
+            return Err("stdin is already closed".to_owned());
+        }
+        if let Ok(mut buf) = self.stdin_buf.lock() {
+            buf.push_str(data);
+        }
+        Ok(())
+    }
+
+    pub fn close_stdin(&self) {
+        // Hold the condvar's mutex across the flag store to prevent lost wakeups in `wait_for_stdin`.
+        let _guard = self.stdin_buf.lock();
+        self.stdin_closed.store(true, Ordering::SeqCst);
+        self.stdin_cvar.notify_all();
+    }
+
+    /// Waits until [`Self::close_stdin`], [`Self::kill`], or `timeout` elapses and returns buffered stdin.
+    pub fn wait_for_stdin(&self, timeout: Duration) -> Option<String> {
+        let deadline = std::time::Instant::now() + timeout;
+        let Ok(mut guard) = self.stdin_buf.lock() else {
+            return None;
+        };
+        while !self.stdin_closed.load(Ordering::SeqCst) && !self.killed.load(Ordering::SeqCst) {
+            let rem = deadline.saturating_duration_since(std::time::Instant::now());
+            if rem.is_zero() {
+                break;
+            }
+            let Ok((next, _)) = self.stdin_cvar.wait_timeout(guard, rem) else {
+                return None;
+            };
+            guard = next;
+        }
+        if self.killed.load(Ordering::SeqCst) {
+            return None;
+        }
+        Some(guard.clone())
+    }
+
+    pub fn push_stdout_line(&self, line: &str) {
+        if let Ok(mut buf) = self.stdout_buf.lock() {
+            buf.push_str(line);
+            buf.push('\n');
+        }
+        if let Ok(mut q) = self.stdout_lines.lock() {
+            q.push_back(line.to_owned());
+        }
+        self.stdout_cvar.notify_all();
+    }
+
+    pub fn push_stderr(&self, msg: &str) {
+        if let Ok(mut buf) = self.stderr_buf.lock() {
+            buf.push_str(msg);
+            if !msg.ends_with('\n') {
+                buf.push('\n');
+            }
+        }
+    }
+
+    pub fn finish(&self, code: i32) {
+        {
+            // Hold `stdout_lines` across `stdout_eof` store to prevent lost wakeups in `read_line_blocking`.
+            let _q = self.stdout_lines.lock();
+            self.stdout_eof.store(true, Ordering::SeqCst);
+            self.stdout_cvar.notify_all();
+        }
+        self.running.store(false, Ordering::SeqCst);
+        if let Ok(mut guard) = self.exit_code.lock() {
+            if guard.is_none() {
+                *guard = Some(code);
+            }
+            self.done_cvar.notify_all();
+        }
+    }
+
+    pub fn read_line_blocking(&self) -> Option<String> {
+        let Ok(mut q) = self.stdout_lines.lock() else {
+            return None;
+        };
+        loop {
+            if let Some(line) = q.pop_front() {
+                return Some(line);
+            }
+            if self.stdout_eof.load(Ordering::SeqCst) {
+                return None;
+            }
+            q = match self.stdout_cvar.wait(q) {
+                Ok(next) => next,
+                Err(_) => return None,
+            };
+        }
+    }
+
+    pub fn stdout(&self) -> String {
+        self.stdout_buf
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn stderr(&self) -> String {
+        self.stderr_buf
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn error_output(&self) -> String {
+        self.stderr()
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
+
+    pub fn is_killed(&self) -> bool {
+        self.killed.load(Ordering::SeqCst)
+    }
+
+    pub fn wait(&self) -> i32 {
+        let Ok(mut guard) = self.exit_code.lock() else {
+            return -1;
+        };
+        while guard.is_none() {
+            guard = match self.done_cvar.wait(guard) {
+                Ok(next) => next,
+                Err(_) => return -1,
+            };
+        }
+        guard.unwrap_or(-1)
+    }
+
+    pub fn kill(&self) {
+        {
+            let _guard = self.stdin_buf.lock();
+            self.killed.store(true, Ordering::SeqCst);
+            self.stdin_closed.store(true, Ordering::SeqCst);
+            self.stdin_cvar.notify_all();
+        }
+        self.finish(-1);
+    }
+}
+
+/// Opaque managed process handle owned by [`HostContext`] (backed by either an in-process
+/// virtual shim such as `VirtualFfmpegShim` / `VirtualYtdlpShim` or a desktop external subprocess).
+pub struct ManagedProcess {
+    inner: ManagedProcessInner,
+}
+
+enum ManagedProcessInner {
     VirtualFfmpeg(VirtualProcessHandle, Mutex<usize>),
+    VirtualPipe(Arc<VirtualPipeHandle>),
     External(ExternalProcessHandle),
 }
 
 impl ManagedProcess {
+    /// Wraps an in-process [`VirtualProcessHandle`] produced by `VirtualFfmpegShim`.
+    pub fn from_virtual_ffmpeg(handle: VirtualProcessHandle, line_cursor: Mutex<usize>) -> Self {
+        Self {
+            inner: ManagedProcessInner::VirtualFfmpeg(handle, line_cursor),
+        }
+    }
+
+    /// Wraps an in-process [`VirtualPipeHandle`] produced by pipe-based virtual CLI shims.
+    pub fn from_virtual_pipe(handle: Arc<VirtualPipeHandle>) -> Self {
+        Self {
+            inner: ManagedProcessInner::VirtualPipe(handle),
+        }
+    }
+
+    pub(crate) fn from_external(handle: ExternalProcessHandle) -> Self {
+        Self {
+            inner: ManagedProcessInner::External(handle),
+        }
+    }
+
     fn write_stdin(&self, data: &str) -> Result<(), String> {
-        match self {
-            Self::VirtualFfmpeg(_, _) => Ok(()),
-            Self::External(h) => h.write_stdin(data),
+        match &self.inner {
+            ManagedProcessInner::VirtualFfmpeg(_, _) => Ok(()),
+            ManagedProcessInner::VirtualPipe(p) => p.write_stdin(data),
+            ManagedProcessInner::External(h) => h.write_stdin(data),
         }
     }
 
     fn close_stdin(&self) {
-        match self {
-            Self::VirtualFfmpeg(_, _) => {}
-            Self::External(h) => h.close_stdin(),
+        match &self.inner {
+            ManagedProcessInner::VirtualFfmpeg(_, _) => {}
+            ManagedProcessInner::VirtualPipe(p) => p.close_stdin(),
+            ManagedProcessInner::External(h) => h.close_stdin(),
         }
     }
 
     fn read_line_blocking(&self) -> Option<String> {
-        match self {
-            Self::VirtualFfmpeg(h, cursor_mutex) => loop {
+        match &self.inner {
+            ManagedProcessInner::VirtualFfmpeg(h, cursor_mutex) => loop {
                 let text = h.stdout();
                 let mut cursor = cursor_mutex.lock().ok()?;
                 let start = (*cursor).min(text.len());
@@ -376,57 +707,65 @@ impl ManagedProcess {
                 drop(cursor);
                 std::thread::sleep(Duration::from_millis(15));
             },
-            Self::External(h) => h.read_line_blocking(),
+            ManagedProcessInner::VirtualPipe(p) => p.read_line_blocking(),
+            ManagedProcessInner::External(h) => h.read_line_blocking(),
         }
     }
 
     fn stdout(&self) -> String {
-        match self {
-            Self::VirtualFfmpeg(h, _) => h.stdout(),
-            Self::External(h) => h.stdout(),
+        match &self.inner {
+            ManagedProcessInner::VirtualFfmpeg(h, _) => h.stdout(),
+            ManagedProcessInner::VirtualPipe(p) => p.stdout(),
+            ManagedProcessInner::External(h) => h.stdout(),
         }
     }
 
     fn stderr(&self) -> String {
-        match self {
-            Self::VirtualFfmpeg(h, _) => h.stderr(),
-            Self::External(h) => h.stderr(),
+        match &self.inner {
+            ManagedProcessInner::VirtualFfmpeg(h, _) => h.stderr(),
+            ManagedProcessInner::VirtualPipe(p) => p.stderr(),
+            ManagedProcessInner::External(h) => h.stderr(),
         }
     }
 
     fn error_output(&self) -> String {
-        match self {
-            Self::VirtualFfmpeg(h, _) => h.error_output(),
-            Self::External(h) => h.stderr(),
+        match &self.inner {
+            ManagedProcessInner::VirtualFfmpeg(h, _) => h.error_output(),
+            ManagedProcessInner::VirtualPipe(p) => p.error_output(),
+            ManagedProcessInner::External(h) => h.stderr(),
         }
     }
 
     fn is_running(&self) -> bool {
-        match self {
-            Self::VirtualFfmpeg(h, _) => h.is_running(),
-            Self::External(h) => h.is_running(),
+        match &self.inner {
+            ManagedProcessInner::VirtualFfmpeg(h, _) => h.is_running(),
+            ManagedProcessInner::VirtualPipe(p) => p.is_running(),
+            ManagedProcessInner::External(h) => h.is_running(),
         }
     }
 
     fn wait(&self) -> i32 {
-        match self {
-            Self::VirtualFfmpeg(h, _) => h.wait(),
-            Self::External(h) => h.wait(),
+        match &self.inner {
+            ManagedProcessInner::VirtualFfmpeg(h, _) => h.wait(),
+            ManagedProcessInner::VirtualPipe(p) => p.wait(),
+            ManagedProcessInner::External(h) => h.wait(),
         }
     }
 
     fn kill(&self) {
-        match self {
-            Self::VirtualFfmpeg(h, _) => h.kill(),
-            Self::External(h) => h.kill(),
+        match &self.inner {
+            ManagedProcessInner::VirtualFfmpeg(h, _) => h.kill(),
+            ManagedProcessInner::VirtualPipe(p) => p.kill(),
+            ManagedProcessInner::External(h) => h.kill(),
         }
     }
 }
 
-#[derive(Debug, Default)]
-struct SpawnOptions {
-    cwd: Option<String>,
-    env: HashMap<String, String>,
+/// Process launch options passed from JS `host.spawn(cmd, args, opts)`.
+#[derive(Debug, Default, Clone)]
+pub struct SpawnOptions {
+    pub cwd: Option<String>,
+    pub env: HashMap<String, String>,
 }
 
 #[derive(Debug, Default)]
@@ -463,16 +802,19 @@ pub struct HostContext {
     no_redirect_client: reqwest::Client,
     sign_in_prompt: RwLock<Option<SignInPromptCallback>>,
     web_sign_in_handler: RwLock<Option<WebSignInHandler>>,
+    open_url_handler: RwLock<Option<OpenUrlHandler>>,
+    virtualizer: MobileProcessVirtualizer,
     is_mobile: bool,
     platform: String,
     granted: AtomicBool,
     next_proc_id: AtomicU64,
     processes: Mutex<HashMap<u64, Arc<ManagedProcess>>>,
+    rescue_relay_ids: Mutex<VecDeque<u64>>,
     abort_tokens: Mutex<HashMap<u64, tokio::sync::oneshot::Sender<()>>>,
 }
 
 impl HostContext {
-    /// Creates a new `HostContext`, loading persisted storage and config for `manifest.id`.
+    /// Creates a new `HostContext`, loading persisted storage, settings, and grant state for `manifest.id`.
     pub fn new(
         plugin_dir: PathBuf,
         data_dir: PathBuf,
@@ -484,7 +826,15 @@ impl HostContext {
         let _ = fs::create_dir_all(&plugin_data_dir);
 
         let storage = load_json_map::<serde_json::Value>(&plugin_data_dir.join("storage.json"));
-        let config = load_json_map::<String>(&plugin_data_dir.join("config.json"));
+        let settings_path = plugin_data_dir.join("settings.json");
+        let config = if settings_path.is_file() {
+            load_json_map::<String>(&settings_path)
+        } else {
+            // Backwards-compatible fallback for older `config.json` files.
+            load_json_map::<String>(&plugin_data_dir.join("config.json"))
+        };
+        let persisted_granted =
+            load_json_value::<bool>(&plugin_data_dir.join("granted.json")).unwrap_or(true);
 
         let header_resolver = RequestHeadersResolver::new(manifest.request_headers.clone());
 
@@ -522,13 +872,24 @@ impl HostContext {
             no_redirect_client,
             sign_in_prompt: RwLock::new(options.sign_in_prompt),
             web_sign_in_handler: RwLock::new(options.web_sign_in_handler),
+            open_url_handler: RwLock::new(options.open_url_handler),
+            virtualizer: MobileProcessVirtualizer::with_default_shims(),
             is_mobile,
             platform,
-            granted: AtomicBool::new(true),
+            granted: AtomicBool::new(persisted_granted),
             next_proc_id: AtomicU64::new(1),
             processes: Mutex::new(HashMap::new()),
+            rescue_relay_ids: Mutex::new(VecDeque::new()),
             abort_tokens: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub(crate) fn http_client(&self) -> &reqwest::Client {
+        &self.http_client
+    }
+
+    pub(crate) fn data_dir(&self) -> &Path {
+        &self.data_dir
     }
 
     pub fn has_web_sign_in_handler(&self) -> bool {
@@ -540,6 +901,7 @@ impl HostContext {
 
     pub fn set_granted(&self, granted: bool) {
         self.granted.store(granted, Ordering::SeqCst);
+        save_json_value(&self.data_dir.join("granted.json"), &granted);
     }
 
     pub fn is_granted(&self) -> bool {
@@ -579,6 +941,16 @@ impl HostContext {
         }
     }
 
+    pub fn set_open_url_handler(&self, handler: Option<OpenUrlHandler>) {
+        if let Ok(mut g) = self.open_url_handler.write() {
+            *g = handler;
+        }
+    }
+
+    pub fn open_url_handler(&self) -> Option<OpenUrlHandler> {
+        self.open_url_handler.read().ok().and_then(|g| g.clone())
+    }
+
     pub fn get_config(&self, key: &str) -> Option<String> {
         self.config.read().ok()?.get(key).cloned()
     }
@@ -588,15 +960,12 @@ impl HostContext {
             g.insert(key.to_owned(), value.to_owned());
             let snapshot = g.clone();
             drop(g);
-            save_json_map(&self.data_dir.join("config.json"), &snapshot);
+            save_json_map(&self.data_dir.join("settings.json"), &snapshot);
         }
     }
 
     pub fn all_config(&self) -> HashMap<String, String> {
-        self.config
-            .read()
-            .map(|g| g.clone())
-            .unwrap_or_default()
+        self.config.read().map(|g| g.clone()).unwrap_or_default()
     }
 
     pub fn cookie_value(&self) -> Option<String> {
@@ -610,7 +979,11 @@ impl HostContext {
             .filter(|s| !s.is_empty())
     }
 
-    pub fn resolve_request_headers(&self, url: &str, kind: HeaderRequestKind) -> Vec<(String, String)> {
+    pub fn resolve_request_headers(
+        &self,
+        url: &str,
+        kind: HeaderRequestKind,
+    ) -> Vec<(String, String)> {
         let cfg = self.all_config();
         let cookie = self.cookie_value();
         self.header_resolver
@@ -660,9 +1033,10 @@ impl HostContext {
 
     pub fn emit_sign_in_prompt(&self, prompt: SignInPrompt) {
         if let Ok(guard) = self.sign_in_prompt.read()
-            && let Some(cb) = guard.as_ref() {
-                cb(prompt);
-            }
+            && let Some(cb) = guard.as_ref()
+        {
+            cb(prompt);
+        }
     }
 
     /// Aborts any in-flight `fetch` requests or `setTimeout` timers cleanly on shutdown.
@@ -696,14 +1070,149 @@ impl HostContext {
         }
     }
 
-    /// Terminates all active spawned processes (both virtual ffmpeg relays and desktop child processes).
-    pub fn kill_all_processes(&self) {
-        self.cancel_all_async();
+    /// Registers a rescue `VirtualFfmpegShim` loopback relay in `self.processes` so shutdown
+    /// cleans it up, trimming and killing older rescue relays beyond 3 to prevent socket leaks.
+    pub(crate) fn register_rescue_relay(&self, handle: VirtualProcessHandle) -> u64 {
+        const MAX_RESCUE_RELAYS: usize = 3;
+        let id = self.next_proc_id.fetch_add(1, Ordering::Relaxed);
+        let managed = Arc::new(ManagedProcess::from_virtual_ffmpeg(handle, Mutex::new(0)));
         if let Ok(mut map) = self.processes.lock() {
-            for (_, proc_handle) in map.drain() {
+            map.insert(id, managed);
+        }
+
+        let mut stale_ids = Vec::new();
+        if let Ok(mut queue) = self.rescue_relay_ids.lock() {
+            queue.push_back(id);
+            while queue.len() > MAX_RESCUE_RELAYS {
+                if let Some(old_id) = queue.pop_front() {
+                    stale_ids.push(old_id);
+                }
+            }
+        }
+
+        if !stale_ids.is_empty() {
+            let stale_procs: Vec<Arc<ManagedProcess>> = self
+                .processes
+                .lock()
+                .ok()
+                .map(|mut map| {
+                    stale_ids
+                        .into_iter()
+                        .filter_map(|old_id| map.remove(&old_id))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for proc_handle in stale_procs {
                 proc_handle.kill();
             }
         }
+
+        id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_process_count(&self) -> usize {
+        self.processes
+            .lock()
+            .ok()
+            .map(|map| map.values().filter(|p| p.is_running()).count())
+            .unwrap_or(0)
+    }
+
+    /// Terminates all active spawned processes (both virtual ffmpeg relays and desktop child processes).
+    pub fn kill_all_processes(&self) {
+        self.cancel_all_async();
+        if let Ok(mut queue) = self.rescue_relay_ids.lock() {
+            queue.clear();
+        }
+        let procs: Vec<Arc<ManagedProcess>> = self
+            .processes
+            .lock()
+            .ok()
+            .map(|mut map| map.drain().map(|(_, p)| p).collect())
+            .unwrap_or_default();
+        for proc_handle in procs {
+            proc_handle.kill();
+        }
+    }
+
+    /// Returns `true` if `host` is permitted by `permissions.network` (optionally including
+    /// loopback hosts `127.0.0.1` / `localhost` when the plugin declares process permissions).
+    pub(crate) fn is_network_host_allowed(
+        &self,
+        host: &str,
+        allow_loopback_for_process: bool,
+    ) -> bool {
+        let host_clean = host
+            .trim()
+            .trim_matches(|c| c == '[' || c == ']')
+            .to_ascii_lowercase();
+        if host_clean.is_empty() {
+            return false;
+        }
+        let mut patterns = self.manifest.all_network_hosts();
+        // Also check wildcard `*` explicitly declared in `permissions.network` / `domains`.
+        let has_star = self
+            .manifest
+            .permissions
+            .network
+            .iter()
+            .chain(self.manifest.domains.iter())
+            .any(|h| h.trim() == "*");
+        if has_star {
+            return true;
+        }
+        if allow_loopback_for_process
+            && !self.manifest.all_process_commands().is_empty()
+            && (self.is_granted() || self.is_mobile)
+        {
+            patterns.push("127.0.0.1".to_owned());
+            patterns.push("localhost".to_owned());
+            patterns.push("::1".to_owned());
+        }
+        patterns
+            .iter()
+            .any(|pat| network_host_matches(pat, &host_clean))
+    }
+
+    /// Validates a `WebSignInRequest` against `permissions.network` and HTTPS requirements
+    /// (matching `mygo-music`'s `checkWebSignIn`).
+    pub(crate) fn check_web_sign_in(&self, req: &WebSignInRequest) -> Result<(), String> {
+        let has_any_network = !self.manifest.all_network_hosts().is_empty()
+            || self
+                .manifest
+                .permissions
+                .network
+                .iter()
+                .chain(self.manifest.domains.iter())
+                .any(|h| h.trim() == "*");
+        if !has_any_network {
+            return Err("webSignIn needs the network permission".to_owned());
+        }
+        let sign_in_url = url::Url::parse(req.url.trim())
+            .map_err(|_| format!("not a secure web address to sign in on: {}", req.url))?;
+        if sign_in_url.scheme() != "https" || sign_in_url.host_str().unwrap_or("").is_empty() {
+            return Err(format!(
+                "not a secure web address to sign in on: {}",
+                req.url
+            ));
+        }
+        if let Some(ref cookies_of) = req.cookies_of {
+            let co_url = url::Url::parse(cookies_of.trim())
+                .map_err(|_| format!("cookiesOf isn't a secure web address: {cookies_of}"))?;
+            let host = co_url.host_str().unwrap_or("");
+            if co_url.scheme() != "https" || host.is_empty() {
+                return Err(format!(
+                    "cookiesOf isn't a secure web address: {cookies_of}"
+                ));
+            }
+            if !self.is_network_host_allowed(host, false) {
+                return Err(format!(
+                    "the plugin can't reach {host}, so it can't have its cookies"
+                ));
+            }
+        }
+        Ok(())
     }
 
     async fn perform_fetch(
@@ -712,6 +1221,17 @@ impl HostContext {
         opts: FetchOptions,
         mut abort_rx: tokio::sync::oneshot::Receiver<()>,
     ) -> Result<FetchResponseData, String> {
+        let parsed_url = url::Url::parse(url).map_err(|e| format!("invalid URL `{url}`: {e}"))?;
+        if !matches!(parsed_url.scheme(), "http" | "https") {
+            return Err(format!("unsupported URL scheme for `{url}`"));
+        }
+        let host = parsed_url.host_str().unwrap_or("");
+        if !self.is_network_host_allowed(host, true) {
+            return Err(format!(
+                "host `{host}` is not permitted by plugin network permission"
+            ));
+        }
+
         let method_str = if opts.method.is_empty() {
             "GET"
         } else {
@@ -809,30 +1329,45 @@ impl HostContext {
         args: &[String],
         opts: &SpawnOptions,
     ) -> Result<(u64, bool, Arc<ManagedProcess>), Result<MobileSandboxError, String>> {
-        // Always intercept ffmpeg on EVERY platform and delegate to VirtualFfmpegShim.
-        if is_ffmpeg_command(cmd) {
-            let vhandle = spawn_virtual_ffmpeg(args).map_err(Err)?;
-            let proc = Arc::new(ManagedProcess::VirtualFfmpeg(vhandle, Mutex::new(0)));
+        // 1. Consult registered virtual process shims (e.g. `ffmpeg`).
+        if let Some((is_virtual, proc)) = self.virtualizer.spawn(cmd, args, opts, self)? {
             let id = self.next_proc_id.fetch_add(1, Ordering::Relaxed);
             if let Ok(mut map) = self.processes.lock() {
                 map.insert(id, Arc::clone(&proc));
             }
-            return Ok((id, true, proc));
+            return Ok((id, is_virtual, proc));
         }
 
-        // Non-ffmpeg binaries are blocked on mobile sandboxes with structured migration guidance.
+        // 2. Non-virtualized binaries are blocked on mobile sandboxes (without `"allowed"` in error text).
         if self.is_mobile {
             return Err(Ok(MobileSandboxError::new(cmd, &self.platform)));
         }
 
+        // 3. Enforce desktop `permissions.process` & Allow Programs matching `mygo-music`.
+        if self.manifest.all_process_commands().is_empty() {
+            return Err(Err("spawn needs the process permission".to_owned()));
+        }
         if !self.granted.load(Ordering::SeqCst) {
+            return Err(Err(
+                "the listener hasn't allowed this plugin to start programs: enable Allow Programs in plugin settings"
+                    .to_owned(),
+            ));
+        }
+
+        let resolved_cmd = resolve_relative_command(&self.plugin_dir, cmd);
+        if !self
+            .manifest
+            .allows_process(&self.plugin_dir, &resolved_cmd)
+        {
             return Err(Err(format!(
-                "permission denied: `{cmd}` requires enabling Allow Programs for this plugin"
+                "{cmd} isn't one of the programs in the plugin's process permission"
             )));
         }
 
-        let handle = ExternalProcessHandle::spawn(cmd, args, opts).map_err(Err)?;
-        let proc = Arc::new(ManagedProcess::External(handle));
+        let effective_opts = with_default_cwd(opts, &self.plugin_dir);
+        let handle =
+            ExternalProcessHandle::spawn(&resolved_cmd, args, &effective_opts).map_err(Err)?;
+        let proc = Arc::new(ManagedProcess::from_external(handle));
         let id = self.next_proc_id.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut map) = self.processes.lock() {
             map.insert(id, Arc::clone(&proc));
@@ -841,11 +1376,7 @@ impl HostContext {
     }
 
     fn run_web_sign_in(&self, req: WebSignInRequest) -> Result<WebSignInResult, String> {
-        let handler = self
-            .web_sign_in_handler
-            .read()
-            .ok()
-            .and_then(|g| g.clone());
+        let handler = self.web_sign_in_handler.read().ok().and_then(|g| g.clone());
 
         if let Some(h) = handler {
             return h(req);
@@ -853,11 +1384,7 @@ impl HostContext {
 
         // Fallback to SignInPromptCallback so UI hosts without a custom WebSignInHandler
         // can still present the sign-in URL / WebView sheet and manual cookie input.
-        let has_prompt = self
-            .sign_in_prompt
-            .read()
-            .ok()
-            .and_then(|g| g.clone());
+        let has_prompt = self.sign_in_prompt.read().ok().and_then(|g| g.clone());
         if let Some(cb) = has_prompt {
             let text = if req.title.is_empty() {
                 format!("Sign in via embedded web view: {}", req.url)
@@ -880,13 +1407,51 @@ impl HostContext {
             });
         }
 
-        Err("host.webSignIn requires an active UI WebView handler or SignInPromptCallback".to_owned())
+        Err(
+            "host.webSignIn requires an active UI WebView handler or SignInPromptCallback"
+                .to_owned(),
+        )
     }
 }
 
-/// Bridge to `nsh_music_audio::virtual_ffmpeg::VirtualFfmpegShim`.
-fn spawn_virtual_ffmpeg(args: &[String]) -> Result<VirtualProcessHandle, String> {
-    VirtualFfmpegShim::spawn(args).map_err(|e| format!("VirtualFfmpegShim failed: {e}"))
+fn network_host_matches(pattern: &str, host_lower: &str) -> bool {
+    let pat = pattern
+        .trim()
+        .trim_matches(|c| c == '[' || c == ']')
+        .to_ascii_lowercase();
+    if pat.is_empty() {
+        return false;
+    }
+    if pat == "*" {
+        return true;
+    }
+    if let Some(suffix) = pat.strip_prefix("*.") {
+        return host_lower == suffix || host_lower.ends_with(&format!(".{suffix}"));
+    }
+    if let Some(suffix) = pat.strip_prefix('.') {
+        return host_lower == suffix || host_lower.ends_with(&format!(".{suffix}"));
+    }
+    // Strip optional scheme/path if pattern came from a requestHeaders URL glob.
+    if pat.contains("://")
+        && let Ok(u) = url::Url::parse(&pat)
+        && let Some(h) = u.host_str()
+    {
+        return host_lower == h.to_ascii_lowercase();
+    }
+    host_lower == pat
+}
+
+fn load_json_value<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
+    let raw = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn save_json_value<T: Serialize>(path: &Path, val: &T) {
+    if let Ok(json) = serde_json::to_string_pretty(val)
+        && let Err(err) = atomic_write(path, json.as_bytes())
+    {
+        log::warn!(target: "nsh_music_plugin", "failed to persist {}: {err}", path.display());
+    }
 }
 
 fn detect_is_mobile() -> bool {
@@ -936,9 +1501,10 @@ fn load_json_map<T: for<'de> Deserialize<'de>>(path: &Path) -> HashMap<String, T
 
 fn save_json_map<T: Serialize>(path: &Path, map: &HashMap<String, T>) {
     if let Ok(json) = serde_json::to_string_pretty(map)
-        && let Err(err) = atomic_write(path, json.as_bytes()) {
-            log::warn!(target: "nsh_music_plugin", "failed to persist {}: {err}", path.display());
-        }
+        && let Err(err) = atomic_write(path, json.as_bytes())
+    {
+        log::warn!(target: "nsh_music_plugin", "failed to persist {}: {err}", path.display());
+    }
 }
 
 /// Injects `globalThis.host` and standard JS helper globals (`console`, `fetch`, `setTimeout`,
@@ -957,7 +1523,7 @@ pub fn install_host_globals<'js>(ctx: &Ctx<'js>, state: Arc<HostContext>) -> rqu
     install_i18n(ctx, &host, Arc::clone(&state))?;
     install_capabilities(ctx, &host, &state)?;
     install_spawn(ctx, &host, Arc::clone(&state))?;
-    install_web_sign_in(ctx, &host, Arc::clone(&state))?;
+    install_web_sign_in(ctx, &host, &globals, Arc::clone(&state))?;
     install_prompt_and_sleep(ctx, &host, &globals, Arc::clone(&state))?;
     install_navigation_and_data_helpers(ctx, &host, Arc::clone(&state))?;
 
@@ -985,7 +1551,11 @@ fn install_fetch<'js>(
     let st_fetch = Arc::clone(&state);
     let native_fetch = Function::new(
         ctx.clone(),
-        move |ctx: Ctx<'js>, req_id: u64, url: String, opts: Opt<Value<'js>>| -> rquickjs::Result<Promise<'js>> {
+        move |ctx: Ctx<'js>,
+              req_id: u64,
+              url: String,
+              opts: Opt<Value<'js>>|
+              -> rquickjs::Result<Promise<'js>> {
             let parsed = parse_fetch_opts(&ctx, opts.0)?;
             let hc = Arc::clone(&st_fetch);
             let abort_rx = hc.register_abort_token(req_id);
@@ -1011,7 +1581,10 @@ fn install_fetch<'js>(
     Ok(())
 }
 
-fn parse_fetch_opts<'js>(ctx: &Ctx<'js>, opts: Option<Value<'js>>) -> rquickjs::Result<FetchOptions> {
+fn parse_fetch_opts<'js>(
+    ctx: &Ctx<'js>,
+    opts: Option<Value<'js>>,
+) -> rquickjs::Result<FetchOptions> {
     let mut out = FetchOptions {
         method: "GET".to_owned(),
         follow_redirects: true,
@@ -1025,31 +1598,37 @@ fn parse_fetch_opts<'js>(ctx: &Ctx<'js>, opts: Option<Value<'js>>) -> rquickjs::
     };
 
     if let Ok(Some(m)) = obj.get::<_, Option<String>>("method")
-        && !m.is_empty() {
-            out.method = m.to_ascii_uppercase();
-        }
+        && !m.is_empty()
+    {
+        out.method = m.to_ascii_uppercase();
+    }
     if let Ok(Some(ms)) = obj.get::<_, Option<u64>>("timeout") {
         out.timeout_ms = Some(ms);
     } else if let Ok(Some(ms)) = obj.get::<_, Option<u64>>("timeoutMs") {
         out.timeout_ms = Some(ms);
     }
     if let Ok(Some(redir)) = obj.get::<_, Option<String>>("redirect")
-        && redir.eq_ignore_ascii_case("manual") {
-            out.follow_redirects = false;
-        }
+        && redir.eq_ignore_ascii_case("manual")
+    {
+        out.follow_redirects = false;
+    }
     if let Ok(Some(headers_val)) = obj.get::<_, Option<Value<'js>>>("headers")
-        && let Some(hobj) = headers_val.into_object() {
-            for entry in hobj.props::<String, Value<'js>>() {
-                if let Ok((k, v)) = entry
-                    && let Some(s) = js_value_to_lossy_string(ctx, v) {
-                        out.headers.push((k, s));
-                    }
+        && let Some(hobj) = headers_val.into_object()
+    {
+        for entry in hobj.props::<String, Value<'js>>() {
+            if let Ok((k, v)) = entry
+                && let Some(s) = js_value_to_lossy_string(ctx, v)
+            {
+                out.headers.push((k, s));
             }
         }
+    }
     if let Ok(Some(body_val)) = obj.get::<_, Option<Value<'js>>>("body")
-        && !body_val.is_undefined() && !body_val.is_null() {
-            out.body = Some(js_value_to_bytes(ctx, body_val)?);
-        }
+        && !body_val.is_undefined()
+        && !body_val.is_null()
+    {
+        out.body = Some(js_value_to_bytes(ctx, body_val)?);
+    }
 
     Ok(out)
 }
@@ -1071,9 +1650,15 @@ fn build_fetch_response_js<'js>(
     let headers_map = data.headers.clone();
     headers_obj.set(
         "get",
-        Function::new(ctx.clone(), move |name: String| -> Option<String> {
-            headers_map.get(&name.to_ascii_lowercase()).cloned()
-        })?,
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>, name: String| -> rquickjs::Result<Value<'js>> {
+                match headers_map.get(&name.to_ascii_lowercase()) {
+                    Some(v) => v.clone().into_js(&ctx),
+                    None => Ok(Value::new_null(ctx)),
+                }
+            },
+        )?,
     )?;
     let headers_has_map = data.headers.clone();
     headers_obj.set(
@@ -1085,27 +1670,33 @@ fn build_fetch_response_js<'js>(
     let set_cookies = data.set_cookies;
     headers_obj.set(
         "getSetCookie",
-        Function::new(ctx.clone(), move |ctx: Ctx<'js>| -> rquickjs::Result<Array<'js>> {
-            let arr = Array::new(ctx)?;
-            for (idx, line) in set_cookies.iter().enumerate() {
-                arr.set(idx, line.as_str())?;
-            }
-            Ok(arr)
-        })?,
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>| -> rquickjs::Result<Array<'js>> {
+                let arr = Array::new(ctx)?;
+                for (idx, line) in set_cookies.iter().enumerate() {
+                    arr.set(idx, line.as_str())?;
+                }
+                Ok(arr)
+            },
+        )?,
     )?;
     let headers_iter_map = data.headers;
     headers_obj.set(
         "entries",
-        Function::new(ctx.clone(), move |ctx: Ctx<'js>| -> rquickjs::Result<Array<'js>> {
-            let arr = Array::new(ctx.clone())?;
-            for (idx, (k, v)) in headers_iter_map.iter().enumerate() {
-                let pair = Array::new(ctx.clone())?;
-                pair.set(0, k.as_str())?;
-                pair.set(1, v.as_str())?;
-                arr.set(idx, pair)?;
-            }
-            Ok(arr)
-        })?,
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>| -> rquickjs::Result<Array<'js>> {
+                let arr = Array::new(ctx.clone())?;
+                for (idx, (k, v)) in headers_iter_map.iter().enumerate() {
+                    let pair = Array::new(ctx.clone())?;
+                    pair.set(0, k.as_str())?;
+                    pair.set(1, v.as_str())?;
+                    arr.set(idx, pair)?;
+                }
+                Ok(arr)
+            },
+        )?,
     )?;
     resp.set("headers", headers_obj)?;
 
@@ -1115,39 +1706,49 @@ fn build_fetch_response_js<'js>(
     let text_copy = body_text.clone();
     resp.set(
         "text",
-        Function::new(ctx.clone(), move |ctx: Ctx<'js>| -> rquickjs::Result<Promise<'js>> {
-            let s = text_copy.clone();
-            Promise::wrap_future(&ctx, async move { Ok::<String, JsError>(s) })
-        })?,
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>| -> rquickjs::Result<Promise<'js>> {
+                let s = text_copy.clone();
+                Promise::wrap_future(&ctx, async move { Ok::<String, JsError>(s) })
+            },
+        )?,
     )?;
 
     let json_copy = body_text;
     resp.set(
         "json",
-        Function::new(ctx.clone(), move |ctx: Ctx<'js>| -> rquickjs::Result<Promise<'js>> {
-            let s = json_copy.clone();
-            let c = ctx.clone();
-            Promise::wrap_future(&ctx, async move {
-                c.json_parse(s.as_bytes())
-                    .map_err(|e| Exception::throw_message(&c, &format!("invalid JSON body: {e}")))
-            })
-        })?,
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>| -> rquickjs::Result<Promise<'js>> {
+                let s = json_copy.clone();
+                let c = ctx.clone();
+                Promise::wrap_future(&ctx, async move {
+                    c.json_parse(s.as_bytes()).map_err(|e| {
+                        Exception::throw_message(&c, &format!("invalid JSON body: {e}"))
+                    })
+                })
+            },
+        )?,
     )?;
 
     let bytes_copy = data.bytes;
     resp.set(
         "bytes",
-        Function::new(ctx.clone(), move |ctx: Ctx<'js>| -> rquickjs::Result<Promise<'js>> {
-            let b = bytes_copy.clone();
-            let c = ctx.clone();
-            Promise::wrap_future(&ctx, async move {
-                let arr = Array::new(c)?;
-                for (idx, byte) in b.into_iter().enumerate() {
-                    arr.set(idx, i32::from(byte))?;
-                }
-                Ok::<Array<'js>, JsError>(arr)
-            })
-        })?,
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>| -> rquickjs::Result<Promise<'js>> {
+                let b = bytes_copy.clone();
+                let c = ctx.clone();
+                Promise::wrap_future(&ctx, async move {
+                    let arr = Array::new(c)?;
+                    for (idx, byte) in b.into_iter().enumerate() {
+                        arr.set(idx, i32::from(byte))?;
+                    }
+                    Ok::<Array<'js>, JsError>(arr)
+                })
+            },
+        )?,
     )?;
 
     Ok(resp)
@@ -1163,12 +1764,15 @@ fn install_storage<'js>(
     let s_get = Arc::clone(&state);
     storage.set(
         "get",
-        Function::new(ctx.clone(), move |ctx: Ctx<'js>, key: String| -> rquickjs::Result<Value<'js>> {
-            match s_get.get_storage(&key) {
-                Some(v) => json_to_js(&ctx, &v),
-                None => Ok(Value::new_null(ctx)),
-            }
-        })?,
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>, key: String| -> rquickjs::Result<Value<'js>> {
+                match s_get.get_storage(&key) {
+                    Some(v) => json_to_js(&ctx, &v),
+                    None => Ok(Value::new_null(ctx)),
+                }
+            },
+        )?,
     )?;
 
     let s_set = Arc::clone(&state);
@@ -1194,13 +1798,16 @@ fn install_storage<'js>(
     let s_keys = Arc::clone(&state);
     storage.set(
         "keys",
-        Function::new(ctx.clone(), move |ctx: Ctx<'js>| -> rquickjs::Result<Array<'js>> {
-            let arr = Array::new(ctx)?;
-            for (idx, k) in s_keys.storage_keys().into_iter().enumerate() {
-                arr.set(idx, k)?;
-            }
-            Ok(arr)
-        })?,
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>| -> rquickjs::Result<Array<'js>> {
+                let arr = Array::new(ctx)?;
+                for (idx, k) in s_keys.storage_keys().into_iter().enumerate() {
+                    arr.set(idx, k)?;
+                }
+                Ok(arr)
+            },
+        )?,
     )?;
 
     let s_clear = Arc::clone(&state);
@@ -1236,22 +1843,28 @@ fn install_config<'js>(
     let c_set = Arc::clone(&state);
     cfg.set(
         "set",
-        Function::new(ctx.clone(), move |ctx: Ctx<'js>, key: String, val: Value<'js>| {
-            let s = js_value_to_lossy_string(&ctx, val).unwrap_or_default();
-            c_set.set_config(&key, &s);
-        })?,
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>, key: String, val: Value<'js>| {
+                let s = js_value_to_lossy_string(&ctx, val).unwrap_or_default();
+                c_set.set_config(&key, &s);
+            },
+        )?,
     )?;
 
     let c_all = Arc::clone(&state);
     cfg.set(
         "all",
-        Function::new(ctx.clone(), move |ctx: Ctx<'js>| -> rquickjs::Result<Object<'js>> {
-            let obj = Object::new(ctx)?;
-            for (k, v) in c_all.all_config() {
-                obj.set(k, v)?;
-            }
-            Ok(obj)
-        })?,
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>| -> rquickjs::Result<Object<'js>> {
+                let obj = Object::new(ctx)?;
+                for (k, v) in c_all.all_config() {
+                    obj.set(k, v)?;
+                }
+                Ok(obj)
+            },
+        )?,
     )?;
 
     let c_setting = Arc::clone(&state);
@@ -1272,18 +1885,24 @@ fn install_crypto<'js>(ctx: &Ctx<'js>, host: &Object<'js>) -> rquickjs::Result<(
 
     cobj.set(
         "md5",
-        Function::new(ctx.clone(), |ctx: Ctx<'js>, data: Value<'js>| -> rquickjs::Result<String> {
-            let bytes = js_value_to_bytes(&ctx, data)?;
-            Ok(crypto::md5_hex(&bytes))
-        })?,
+        Function::new(
+            ctx.clone(),
+            |ctx: Ctx<'js>, data: Value<'js>| -> rquickjs::Result<String> {
+                let bytes = js_value_to_bytes(&ctx, data)?;
+                Ok(crypto::md5_hex(&bytes))
+            },
+        )?,
     )?;
 
     cobj.set(
         "sha256",
-        Function::new(ctx.clone(), |ctx: Ctx<'js>, data: Value<'js>| -> rquickjs::Result<String> {
-            let bytes = js_value_to_bytes(&ctx, data)?;
-            Ok(crypto::sha256_hex(&bytes))
-        })?,
+        Function::new(
+            ctx.clone(),
+            |ctx: Ctx<'js>, data: Value<'js>| -> rquickjs::Result<String> {
+                let bytes = js_value_to_bytes(&ctx, data)?;
+                Ok(crypto::sha256_hex(&bytes))
+            },
+        )?,
     )?;
 
     let hmac_fn = Function::new(
@@ -1297,15 +1916,29 @@ fn install_crypto<'js>(ctx: &Ctx<'js>, host: &Object<'js>) -> rquickjs::Result<(
     cobj.set("hmacSha256", hmac_fn.clone())?;
     cobj.set("hmac_sha256", hmac_fn)?;
 
+    // Supports both `mygo-music`'s 2-arg `aesEcbEncrypt(key, text)` (hex output) AND
+    // legacy 3-arg `aesEcbEncrypt(plaintext, key, encoding)`.
     let aes_ecb_enc = Function::new(
         ctx.clone(),
         |ctx: Ctx<'js>,
-         plaintext: Value<'js>,
-         key: Value<'js>,
+         arg0: Value<'js>,
+         arg1: Value<'js>,
          encoding: Opt<String>|
          -> rquickjs::Result<String> {
-            let pt = js_value_to_bytes(&ctx, plaintext)?;
-            let key_bytes = resolve_aes_key_bytes(&ctx, key)?;
+            let b0 = js_value_to_bytes(&ctx, arg0)?;
+            let b1 = js_value_to_bytes(&ctx, arg1)?;
+            let (pt, key_bytes) = if encoding.0.is_some() {
+                (b0, resolve_aes_key_from_raw(b1))
+            } else {
+                let k0 = try_parse_aes_key(&b0);
+                let k1 = try_parse_aes_key(&b1);
+                match (k0, k1) {
+                    (Some(key), None) => (b1, key),
+                    (None, Some(key)) => (b0, key),
+                    (Some(key), Some(_)) => (b1, key),
+                    (None, None) => (b1, b0),
+                }
+            };
             let ct = crypto::aes_ecb_encrypt(&pt, &key_bytes)
                 .map_err(|e| Exception::throw_message(&ctx, &e.to_string()))?;
             encode_output_bytes(&ct, encoding.0.as_deref())
@@ -1392,36 +2025,48 @@ fn install_crypto<'js>(ctx: &Ctx<'js>, host: &Object<'js>) -> rquickjs::Result<(
 
     cobj.set(
         "base64UrlEncode",
-        Function::new(ctx.clone(), |ctx: Ctx<'js>, data: Value<'js>| -> rquickjs::Result<String> {
-            let bytes = js_value_to_bytes(&ctx, data)?;
-            Ok(crypto::base64_url_encode(&bytes))
-        })?,
+        Function::new(
+            ctx.clone(),
+            |ctx: Ctx<'js>, data: Value<'js>| -> rquickjs::Result<String> {
+                let bytes = js_value_to_bytes(&ctx, data)?;
+                Ok(crypto::base64_url_encode(&bytes))
+            },
+        )?,
     )?;
 
     cobj.set(
         "base64UrlDecode",
-        Function::new(ctx.clone(), |ctx: Ctx<'js>, data: String| -> rquickjs::Result<String> {
-            let bytes = crypto::base64_decode(&data)
-                .map_err(|e| Exception::throw_message(&ctx, &e.to_string()))?;
-            Ok(String::from_utf8_lossy(&bytes).into_owned())
-        })?,
+        Function::new(
+            ctx.clone(),
+            |ctx: Ctx<'js>, data: String| -> rquickjs::Result<String> {
+                let bytes = crypto::base64_decode(&data)
+                    .map_err(|e| Exception::throw_message(&ctx, &e.to_string()))?;
+                Ok(String::from_utf8_lossy(&bytes).into_owned())
+            },
+        )?,
     )?;
 
     cobj.set(
         "hexEncode",
-        Function::new(ctx.clone(), |ctx: Ctx<'js>, data: Value<'js>| -> rquickjs::Result<String> {
-            let bytes = js_value_to_bytes(&ctx, data)?;
-            Ok(crypto::hex_encode(&bytes))
-        })?,
+        Function::new(
+            ctx.clone(),
+            |ctx: Ctx<'js>, data: Value<'js>| -> rquickjs::Result<String> {
+                let bytes = js_value_to_bytes(&ctx, data)?;
+                Ok(crypto::hex_encode(&bytes))
+            },
+        )?,
     )?;
 
     cobj.set(
         "hexDecode",
-        Function::new(ctx.clone(), |ctx: Ctx<'js>, data: String| -> rquickjs::Result<String> {
-            let bytes = crypto::hex_decode(&data)
-                .map_err(|e| Exception::throw_message(&ctx, &e.to_string()))?;
-            Ok(String::from_utf8_lossy(&bytes).into_owned())
-        })?,
+        Function::new(
+            ctx.clone(),
+            |ctx: Ctx<'js>, data: String| -> rquickjs::Result<String> {
+                let bytes = crypto::hex_decode(&data)
+                    .map_err(|e| Exception::throw_message(&ctx, &e.to_string()))?;
+                Ok(String::from_utf8_lossy(&bytes).into_owned())
+            },
+        )?,
     )?;
 
     host.set("crypto", cobj)?;
@@ -1438,23 +2083,16 @@ fn install_log<'js>(
 
     let make_logger = |level: log::Level| -> rquickjs::Result<Function<'js>> {
         let pid = state.plugin_id.clone();
-        Function::new(
-            ctx.clone(),
-            move |ctx: Ctx<'js>, args: Rest<Value<'js>>| {
-                let parts: Vec<String> = args
-                    .0
-                    .into_iter()
-                    .map(|v| format_js_arg(&ctx, v))
-                    .collect();
-                let line = parts.join(" ");
-                match level {
-                    log::Level::Debug => log::debug!(target: "plugin", "[{pid}] {line}"),
-                    log::Level::Info => log::info!(target: "plugin", "[{pid}] {line}"),
-                    log::Level::Warn => log::warn!(target: "plugin", "[{pid}] {line}"),
-                    _ => log::error!(target: "plugin", "[{pid}] {line}"),
-                }
-            },
-        )
+        Function::new(ctx.clone(), move |ctx: Ctx<'js>, args: Rest<Value<'js>>| {
+            let parts: Vec<String> = args.0.into_iter().map(|v| format_js_arg(&ctx, v)).collect();
+            let line = parts.join(" ");
+            match level {
+                log::Level::Debug => log::debug!(target: "plugin", "[{pid}] {line}"),
+                log::Level::Info => log::info!(target: "plugin", "[{pid}] {line}"),
+                log::Level::Warn => log::warn!(target: "plugin", "[{pid}] {line}"),
+                _ => log::error!(target: "plugin", "[{pid}] {line}"),
+            }
+        })
     };
 
     let debug_fn = make_logger(log::Level::Debug)?;
@@ -1494,9 +2132,10 @@ fn install_i18n<'js>(
             if let Some(pobj) = params.0.and_then(|v| v.into_object()) {
                 for entry in pobj.props::<String, Value<'js>>() {
                     if let Ok((k, v)) = entry
-                        && let Some(s) = js_value_to_lossy_string(&ctx, v) {
-                            map.insert(k, s);
-                        }
+                        && let Some(s) = js_value_to_lossy_string(&ctx, v)
+                    {
+                        map.insert(k, s);
+                    }
                 }
             }
             s_t.locales.translate_with_params(&locale, &key, &map)
@@ -1525,7 +2164,9 @@ fn install_capabilities<'js>(
     caps.set("platform", state.platform())?;
     caps.set("isMobile", is_mobile)?;
     caps.set("embeddedFfmpeg", true)?;
+    caps.set("embeddedYtdlp", true)?;
     caps.set("canSpawnExternal", !is_mobile)?;
+    caps.set("openUrl", true)?;
     caps.set(
         "webSignInMode",
         if is_mobile {
@@ -1534,6 +2175,25 @@ fn install_capabilities<'js>(
             "webview"
         },
     )?;
+
+    let vprocs = Array::new(ctx.clone())?;
+    for (idx, name) in state
+        .virtualizer
+        .virtualized_commands()
+        .into_iter()
+        .enumerate()
+    {
+        vprocs.set(idx, name)?;
+    }
+    caps.set("virtualProcesses", vprocs)?;
+
+    let codecs = ["mp3", "aac", "mp4", "flac", "vorbis", "wav", "alac", "opus"];
+    let codecs_arr = Array::new(ctx.clone())?;
+    for (idx, codec) in codecs.into_iter().enumerate() {
+        codecs_arr.set(idx, codec)?;
+    }
+    caps.set("nativeCodecs", codecs_arr)?;
+
     host.set("capabilities", caps)?;
     Ok(())
 }
@@ -1579,14 +2239,16 @@ fn parse_spawn_opts<'js>(ctx: &Ctx<'js>, opts: Option<Value<'js>>) -> SpawnOptio
         out.cwd = Some(cwd);
     }
     if let Ok(Some(env_val)) = obj.get::<_, Option<Value<'js>>>("env")
-        && let Some(eobj) = env_val.into_object() {
-            for entry in eobj.props::<String, Value<'js>>() {
-                if let Ok((k, v)) = entry
-                    && let Some(s) = js_value_to_lossy_string(ctx, v) {
-                        out.env.insert(k, s);
-                    }
+        && let Some(eobj) = env_val.into_object()
+    {
+        for entry in eobj.props::<String, Value<'js>>() {
+            if let Ok((k, v)) = entry
+                && let Some(s) = js_value_to_lossy_string(ctx, v)
+            {
+                out.env.insert(k, s);
             }
         }
+    }
     out
 }
 
@@ -1650,11 +2312,14 @@ fn build_process_handle_js<'js>(
     let p_write = Arc::clone(&proc);
     handle.set(
         "write",
-        Function::new(ctx.clone(), move |ctx: Ctx<'js>, data: String| -> rquickjs::Result<()> {
-            p_write
-                .write_stdin(&data)
-                .map_err(|e| Exception::throw_message(&ctx, &e))
-        })?,
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>, data: String| -> rquickjs::Result<()> {
+                p_write
+                    .write_stdin(&data)
+                    .map_err(|e| Exception::throw_message(&ctx, &e))
+            },
+        )?,
     )?;
 
     let p_close_stdin = Arc::clone(&proc);
@@ -1668,30 +2333,40 @@ fn build_process_handle_js<'js>(
     let p_readline = Arc::clone(&proc);
     handle.set(
         "readLine",
-        Function::new(ctx.clone(), move |ctx: Ctx<'js>| -> rquickjs::Result<Promise<'js>> {
-            let p = Arc::clone(&p_readline);
-            Promise::wrap_future(&ctx, async move {
-                let line = tokio::task::spawn_blocking(move || p.read_line_blocking())
-                    .await
-                    .ok()
-                    .flatten();
-                Ok::<Option<String>, JsError>(line)
-            })
-        })?,
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>| -> rquickjs::Result<Promise<'js>> {
+                let p = Arc::clone(&p_readline);
+                let ctx_inner = ctx.clone();
+                Promise::wrap_future(&ctx, async move {
+                    let line = tokio::task::spawn_blocking(move || p.read_line_blocking())
+                        .await
+                        .ok()
+                        .flatten();
+                    match line {
+                        Some(s) => s.into_js(&ctx_inner),
+                        None => Ok(Value::new_null(ctx_inner)),
+                    }
+                })
+            },
+        )?,
     )?;
 
     let p_wait = Arc::clone(&proc);
     handle.set(
         "wait",
-        Function::new(ctx.clone(), move |ctx: Ctx<'js>| -> rquickjs::Result<Promise<'js>> {
-            let p = Arc::clone(&p_wait);
-            Promise::wrap_future(&ctx, async move {
-                let code = tokio::task::spawn_blocking(move || p.wait())
-                    .await
-                    .unwrap_or(-1);
-                Ok::<i32, JsError>(code)
-            })
-        })?,
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>| -> rquickjs::Result<Promise<'js>> {
+                let p = Arc::clone(&p_wait);
+                Promise::wrap_future(&ctx, async move {
+                    let code = tokio::task::spawn_blocking(move || p.wait())
+                        .await
+                        .unwrap_or(-1);
+                    Ok::<i32, JsError>(code)
+                })
+            },
+        )?,
     )?;
 
     Ok(handle)
@@ -1699,31 +2374,52 @@ fn build_process_handle_js<'js>(
 
 fn install_web_sign_in<'js>(
     ctx: &Ctx<'js>,
-    host: &Object<'js>,
+    _host: &Object<'js>,
+    globals: &Object<'js>,
     state: Arc<HostContext>,
 ) -> rquickjs::Result<()> {
-    // Only expose `host.webSignIn` when the embedding UI host actually supplies a native
-    // WebView handler; otherwise plugins like `bilibili` fall back cleanly to `signInWithQR()`.
-    if !state.has_web_sign_in_handler() {
-        return Ok(());
-    }
+    // Expose `host.webSignIn` dynamically via a property getter in `install_js_polyfills`
+    // so plugins see a callable function whenever `state.has_web_sign_in_handler()` is true
+    // (whether registered before OR after plugin load), and `undefined` otherwise (so plugins
+    // like `bilibili` fall back cleanly to QR sign-in).
+    let state_has = Arc::clone(&state);
+    let has_handler = Function::new(ctx.clone(), move || -> bool {
+        state_has.has_web_sign_in_handler()
+    })?;
 
     let web_signin = Function::new(
         ctx.clone(),
         move |ctx: Ctx<'js>, opts: Value<'js>| -> rquickjs::Result<Promise<'js>> {
             let req = parse_web_sign_in_req(&ctx, &state.plugin_id, opts)?;
+            if let Err(msg) = state.check_web_sign_in(&req) {
+                return Err(Exception::throw_message(&ctx, &msg));
+            }
             let hc = Arc::clone(&state);
             let ctx_inner = ctx.clone();
             Promise::wrap_future(&ctx, async move {
                 let result = tokio::task::spawn_blocking(move || hc.run_web_sign_in(req))
                     .await
-                    .map_err(|e| Exception::throw_message(&ctx_inner, &format!("webSignIn task failed: {e}")))?
+                    .map_err(|e| {
+                        Exception::throw_message(&ctx_inner, &format!("webSignIn task failed: {e}"))
+                    })?
                     .map_err(|msg| Exception::throw_message(&ctx_inner, &msg))?;
+
+                let cookie_str = if result.cookie.is_empty() && !result.cookies.is_empty() {
+                    let mut pairs: Vec<(&String, &String)> = result.cookies.iter().collect();
+                    pairs.sort_by_key(|(a, _)| *a);
+                    pairs
+                        .into_iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                } else {
+                    result.cookie
+                };
 
                 let out = Object::new(ctx_inner.clone())?;
                 out.set("ok", result.ok)?;
                 out.set("url", result.url)?;
-                out.set("cookie", result.cookie)?;
+                out.set("cookie", cookie_str)?;
                 out.set("cancelled", result.cancelled)?;
                 out.set("manualFallback", result.manual_fallback)?;
                 if let Some(eval_res) = result.eval_result {
@@ -1741,8 +2437,26 @@ fn install_web_sign_in<'js>(
         },
     )?;
 
-    host.set("webSignIn", web_signin)?;
+    globals.set("__nshHasWebSignIn", has_handler)?;
+    globals.set("__nshWebSignIn", web_signin)?;
     Ok(())
+}
+
+fn parse_string_list<'js>(obj: &Object<'js>, key: &str) -> Vec<String> {
+    if let Ok(Some(list)) = obj.get::<_, Option<Vec<String>>>(key) {
+        return list
+            .into_iter()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
+    if let Ok(Some(single)) = obj.get::<_, Option<String>>(key) {
+        let trimmed = single.trim();
+        if !trimmed.is_empty() {
+            return vec![trimmed.to_owned()];
+        }
+    }
+    Vec::new()
 }
 
 fn parse_web_sign_in_req<'js>(
@@ -1771,21 +2485,26 @@ fn parse_web_sign_in_req<'js>(
             "host.webSignIn requires a non-empty `url`",
         ));
     }
-    let title = obj.get::<_, Option<String>>("title").ok().flatten().unwrap_or_default();
-    let incognito = obj.get::<_, Option<bool>>("incognito").ok().flatten().unwrap_or(false);
+    let title = obj
+        .get::<_, Option<String>>("title")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let incognito = obj
+        .get::<_, Option<bool>>("incognito")
+        .ok()
+        .flatten()
+        .unwrap_or(false);
     let user_agent = obj.get::<_, Option<String>>("userAgent").ok().flatten();
     let eval_js = obj.get::<_, Option<String>>("evalJs").ok().flatten();
     let cookies_of = obj.get::<_, Option<String>>("cookiesOf").ok().flatten();
     let match_url = obj.get::<_, Option<String>>("matchUrl").ok().flatten();
-    let mut cookie_names = obj
-        .get::<_, Option<Vec<String>>>("cookieNames")
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    if cookie_names.is_empty()
-        && let Ok(Some(until)) = obj.get::<_, Option<Vec<String>>>("until")
-    {
-        cookie_names = until;
+    let mut until = parse_string_list(&obj, "until");
+    let mut cookie_names = parse_string_list(&obj, "cookieNames");
+    if cookie_names.is_empty() && !until.is_empty() {
+        cookie_names = until.clone();
+    } else if until.is_empty() && !cookie_names.is_empty() {
+        until = cookie_names.clone();
     }
     let allow_manual_cookie = obj
         .get::<_, Option<bool>>("allowManualCookie")
@@ -1806,6 +2525,7 @@ fn parse_web_sign_in_req<'js>(
         user_agent,
         eval_js,
         cookies_of,
+        until,
         cookie_names,
         match_url,
         allow_manual_cookie,
@@ -1820,20 +2540,25 @@ fn install_prompt_and_sleep<'js>(
     state: Arc<HostContext>,
 ) -> rquickjs::Result<()> {
     let s_prompt = Arc::clone(&state);
-    let prompt_fn = Function::new(
-        ctx.clone(),
-        move |val: Value<'js>| {
-            let prompt = if let Some(obj) = val.into_object() {
-                SignInPrompt {
-                    qr: obj.get::<_, Option<String>>("qr").ok().flatten().unwrap_or_default(),
-                    text: obj.get::<_, Option<String>>("text").ok().flatten().unwrap_or_default(),
-                }
-            } else {
-                SignInPrompt::default()
-            };
-            s_prompt.emit_sign_in_prompt(prompt);
-        },
-    )?;
+    let prompt_fn = Function::new(ctx.clone(), move |val: Value<'js>| {
+        let prompt = if let Some(obj) = val.into_object() {
+            SignInPrompt {
+                qr: obj
+                    .get::<_, Option<String>>("qr")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default(),
+                text: obj
+                    .get::<_, Option<String>>("text")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default(),
+            }
+        } else {
+            SignInPrompt::default()
+        };
+        s_prompt.emit_sign_in_prompt(prompt);
+    })?;
     host.set("prompt", prompt_fn.clone())?;
     host.set("signInPrompt", prompt_fn)?;
 
@@ -1880,61 +2605,73 @@ fn install_navigation_and_data_helpers<'js>(
     host: &Object<'js>,
     state: Arc<HostContext>,
 ) -> rquickjs::Result<()> {
-    let is_mobile = state.is_mobile();
+    let s_open = Arc::clone(&state);
     host.set(
         "openURL",
-        Function::new(ctx.clone(), move |ctx: Ctx<'js>, address: String| -> rquickjs::Result<()> {
-            let parsed = url::Url::parse(address.trim()).map_err(|_| {
-                Exception::throw_message(&ctx, &format!("not a web address: {address}"))
-            })?;
-            if !matches!(parsed.scheme(), "http" | "https") {
-                return Err(Exception::throw_message(
-                    &ctx,
-                    &format!("not a web address: {address}"),
-                ));
-            }
-            if !is_mobile {
-                #[cfg(target_os = "macos")]
-                let _ = Command::new("open").arg(parsed.as_str()).spawn();
-                #[cfg(target_os = "linux")]
-                let _ = Command::new("xdg-open").arg(parsed.as_str()).spawn();
-                #[cfg(target_os = "windows")]
-                let _ = Command::new("cmd")
-                    .args(["/C", "start", "", parsed.as_str()])
-                    .spawn();
-            }
-            Ok(())
-        })?,
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>, address: String| -> rquickjs::Result<()> {
+                let parsed = url::Url::parse(address.trim()).map_err(|_| {
+                    Exception::throw_message(&ctx, &format!("not a web address: {address}"))
+                })?;
+                if !matches!(parsed.scheme(), "http" | "https") {
+                    return Err(Exception::throw_message(
+                        &ctx,
+                        &format!("not a web address: {address}"),
+                    ));
+                }
+                if let Some(handler) = s_open.open_url_handler() {
+                    return handler(parsed.as_str())
+                        .map_err(|msg| Exception::throw_message(&ctx, &msg));
+                }
+                if !s_open.is_mobile() {
+                    #[cfg(target_os = "macos")]
+                    let _ = Command::new("open").arg(parsed.as_str()).spawn();
+                    #[cfg(target_os = "linux")]
+                    let _ = Command::new("xdg-open").arg(parsed.as_str()).spawn();
+                    #[cfg(target_os = "windows")]
+                    let _ = Command::new("cmd")
+                        .args(["/C", "start", "", parsed.as_str()])
+                        .spawn();
+                    Ok(())
+                } else {
+                    Err(Exception::throw_message(&ctx, "can't open pages here"))
+                }
+            },
+        )?,
     )?;
 
     let s_rm = Arc::clone(&state);
     host.set(
         "removeDataDir",
-        Function::new(ctx.clone(), move |ctx: Ctx<'js>, name: String| -> rquickjs::Result<()> {
-            let rel = Path::new(name.trim());
-            if name.trim().is_empty()
-                || name.trim() == "."
-                || rel.is_absolute()
-                || rel.components().any(|c| {
-                    matches!(
-                        c,
-                        Component::ParentDir | Component::RootDir | Component::Prefix(_)
-                    )
-                })
-            {
-                return Err(Exception::throw_message(
-                    &ctx,
-                    &format!("not a folder of the plugin's data: {name}"),
-                ));
-            }
-            let target = s_rm.data_dir.join(rel);
-            if target.exists() {
-                fs::remove_dir_all(&target).map_err(|e| {
-                    Exception::throw_message(&ctx, &format!("removeDataDir failed: {e}"))
-                })?;
-            }
-            Ok(())
-        })?,
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>, name: String| -> rquickjs::Result<()> {
+                let rel = Path::new(name.trim());
+                if name.trim().is_empty()
+                    || name.trim() == "."
+                    || rel.is_absolute()
+                    || rel.components().any(|c| {
+                        matches!(
+                            c,
+                            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                        )
+                    })
+                {
+                    return Err(Exception::throw_message(
+                        &ctx,
+                        &format!("not a folder of the plugin's data: {name}"),
+                    ));
+                }
+                let target = s_rm.data_dir.join(rel);
+                if target.exists() {
+                    fs::remove_dir_all(&target).map_err(|e| {
+                        Exception::throw_message(&ctx, &format!("removeDataDir failed: {e}"))
+                    })?;
+                }
+                Ok(())
+            },
+        )?,
     )?;
 
     let has_network = !state.manifest.all_network_hosts().is_empty();
@@ -1955,8 +2692,16 @@ fn install_navigation_and_data_helpers<'js>(
                         "waitForRedirect expects an options object",
                     ));
                 };
-                let port = obj.get::<_, Option<u16>>("port").ok().flatten().unwrap_or(0);
-                let path = obj.get::<_, Option<String>>("path").ok().flatten().unwrap_or_default();
+                let port = obj
+                    .get::<_, Option<u16>>("port")
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0);
+                let path = obj
+                    .get::<_, Option<String>>("path")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
                 let timeout_ms = obj
                     .get::<_, Option<u64>>("timeout")
                     .ok()
@@ -1990,8 +2735,9 @@ fn install_navigation_and_data_helpers<'js>(
             ctx.clone(),
             |ctx: Ctx<'js>, input: String, base: Opt<String>| -> rquickjs::Result<Object<'js>> {
                 let parsed = if let Some(b) = base.0.as_deref() {
-                    let base_url = url::Url::parse(b)
-                        .map_err(|e| Exception::throw_message(&ctx, &format!("Invalid base URL: {e}")))?;
+                    let base_url = url::Url::parse(b).map_err(|e| {
+                        Exception::throw_message(&ctx, &format!("Invalid base URL: {e}"))
+                    })?;
                     base_url
                         .join(&input)
                         .map_err(|e| Exception::throw_message(&ctx, &format!("Invalid URL: {e}")))?
@@ -2073,7 +2819,9 @@ async fn await_redirect_once(
         };
         if !expected_path.is_empty() && parsed.path() != expected_path {
             let _ = socket
-                .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
                 .await;
             continue;
         }
@@ -2376,13 +3124,51 @@ fn install_js_polyfills<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<()> {
   globalThis.fetch = wrappedFetch;
   host.fetch = wrappedFetch;
 
+  // Dynamically expose `host.webSignIn` only while a native WebSignInHandler is registered.
+  const _hasWebSignIn = globalThis.__nshHasWebSignIn;
+  const _webSignInFn = globalThis.__nshWebSignIn;
+  delete globalThis.__nshHasWebSignIn;
+  delete globalThis.__nshWebSignIn;
+  if (typeof _hasWebSignIn === "function" && typeof _webSignInFn === "function") {
+    Object.defineProperty(host, "webSignIn", {
+      enumerable: true,
+      configurable: true,
+      get() {
+        return _hasWebSignIn() ? _webSignInFn : undefined;
+      },
+    });
+  }
+
   if (typeof globalThis.TextEncoder !== "function") {
     class TextEncoder {
       encode(str) {
-        const s = unescape(encodeURIComponent(String(str ?? "")));
-        const arr = new Uint8Array(s.length);
-        for (let i = 0; i < s.length; i++) arr[i] = s.charCodeAt(i);
-        return arr;
+        const s = String(str ?? "");
+        const out = [];
+        for (let i = 0; i < s.length; i++) {
+          let cp = s.charCodeAt(i);
+          if (cp >= 0xd800 && cp <= 0xdbff && i + 1 < s.length) {
+            const lo = s.charCodeAt(i + 1);
+            if (lo >= 0xdc00 && lo <= 0xdfff) {
+              cp = 0x10000 + ((cp - 0xd800) << 10) + (lo - 0xdc00);
+              i++;
+            }
+          }
+          if (cp < 0x80) {
+            out.push(cp);
+          } else if (cp < 0x800) {
+            out.push(0xc0 | (cp >> 6), 0x80 | (cp & 0x3f));
+          } else if (cp < 0x10000) {
+            out.push(0xe0 | (cp >> 12), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+          } else {
+            out.push(
+              0xf0 | (cp >> 18),
+              0x80 | ((cp >> 12) & 0x3f),
+              0x80 | ((cp >> 6) & 0x3f),
+              0x80 | (cp & 0x3f)
+            );
+          }
+        }
+        return new Uint8Array(out);
       }
     }
     globalThis.TextEncoder = TextEncoder;
@@ -2392,9 +3178,29 @@ fn install_js_polyfills<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<()> {
       decode(bytes) {
         if (!bytes) return "";
         const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-        let raw = "";
-        for (let i = 0; i < arr.length; i++) raw += String.fromCharCode(arr[i]);
-        try { return decodeURIComponent(escape(raw)); } catch { return raw; }
+        let out = "";
+        for (let i = 0; i < arr.length; ) {
+          const b0 = arr[i++];
+          if (b0 < 0x80) {
+            out += String.fromCharCode(b0);
+          } else if ((b0 & 0xe0) === 0xc0 && i < arr.length) {
+            const cp = ((b0 & 0x1f) << 6) | (arr[i++] & 0x3f);
+            out += String.fromCharCode(cp);
+          } else if ((b0 & 0xf0) === 0xe0 && i + 1 < arr.length) {
+            const cp = ((b0 & 0x0f) << 12) | ((arr[i++] & 0x3f) << 6) | (arr[i++] & 0x3f);
+            out += String.fromCharCode(cp);
+          } else if ((b0 & 0xf8) === 0xf0 && i + 2 < arr.length) {
+            const cp =
+              ((b0 & 0x07) << 18) |
+              ((arr[i++] & 0x3f) << 12) |
+              ((arr[i++] & 0x3f) << 6) |
+              (arr[i++] & 0x3f);
+            out += String.fromCodePoint(cp);
+          } else {
+            out += "\ufffd";
+          }
+        }
+        return out;
       }
     }
     globalThis.TextDecoder = TextDecoder;
@@ -2404,18 +3210,26 @@ fn install_js_polyfills<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<()> {
     ctx.eval::<(), _>(POLYFILLS)
 }
 
+fn try_parse_aes_key(raw: &[u8]) -> Option<Vec<u8>> {
+    if matches!(raw.len(), 16 | 24 | 32) {
+        return Some(raw.to_vec());
+    }
+    if let Ok(s) = std::str::from_utf8(raw)
+        && let Ok(decoded) = crypto::hex_decode(s)
+        && matches!(decoded.len(), 16 | 24 | 32)
+    {
+        return Some(decoded);
+    }
+    None
+}
+
+fn resolve_aes_key_from_raw(raw: Vec<u8>) -> Vec<u8> {
+    try_parse_aes_key(&raw).unwrap_or(raw)
+}
+
 fn resolve_aes_key_bytes<'js>(ctx: &Ctx<'js>, key: Value<'js>) -> rquickjs::Result<Vec<u8>> {
     let raw = js_value_to_bytes(ctx, key)?;
-    if matches!(raw.len(), 16 | 24 | 32) {
-        return Ok(raw);
-    }
-    // Fallback: accept hex-encoded 16/24/32-byte key string (32/48/64 hex chars).
-    if let Ok(s) = std::str::from_utf8(&raw)
-        && let Ok(decoded) = crypto::hex_decode(s)
-            && matches!(decoded.len(), 16 | 24 | 32) {
-                return Ok(decoded);
-            }
-    Ok(raw)
+    Ok(resolve_aes_key_from_raw(raw))
 }
 
 fn resolve_iv_bytes<'js>(ctx: &Ctx<'js>, iv: Value<'js>) -> rquickjs::Result<Vec<u8>> {
@@ -2425,18 +3239,15 @@ fn resolve_iv_bytes<'js>(ctx: &Ctx<'js>, iv: Value<'js>) -> rquickjs::Result<Vec
     }
     if let Ok(s) = std::str::from_utf8(&raw)
         && let Ok(decoded) = crypto::hex_decode(s)
-            && decoded.len() == 16 {
-                return Ok(decoded);
-            }
+        && decoded.len() == 16
+    {
+        return Ok(decoded);
+    }
     Ok(raw)
 }
 
 fn encode_output_bytes(bytes: &[u8], encoding: Option<&str>) -> rquickjs::Result<String> {
-    match encoding
-        .unwrap_or("hex")
-        .to_ascii_lowercase()
-        .as_str()
-    {
+    match encoding.unwrap_or("hex").to_ascii_lowercase().as_str() {
         "base64" | "b64" => Ok(crypto::base64_encode(bytes)),
         "base64url" => Ok(crypto::base64_url_encode(bytes)),
         "hex_upper" | "HEX" => Ok(crypto::hex_encode(bytes).to_ascii_uppercase()),
@@ -2445,14 +3256,8 @@ fn encode_output_bytes(bytes: &[u8], encoding: Option<&str>) -> rquickjs::Result
 }
 
 fn decode_input_bytes(input: &str, encoding: Option<&str>) -> Result<Vec<u8>, String> {
-    match encoding
-        .unwrap_or("hex")
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "base64" | "b64" | "base64url" => {
-            crypto::base64_decode(input).map_err(|e| e.to_string())
-        }
+    match encoding.unwrap_or("hex").to_ascii_lowercase().as_str() {
+        "base64" | "b64" | "base64url" => crypto::base64_decode(input).map_err(|e| e.to_string()),
         _ => crypto::hex_decode(input).map_err(|e| e.to_string()),
     }
 }
@@ -2520,7 +3325,10 @@ fn format_js_arg<'js>(ctx: &Ctx<'js>, val: Value<'js>) -> String {
 }
 
 /// Converts a `serde_json::Value` into a QuickJS `Value`.
-pub(crate) fn json_to_js<'js>(ctx: &Ctx<'js>, val: &serde_json::Value) -> rquickjs::Result<Value<'js>> {
+pub(crate) fn json_to_js<'js>(
+    ctx: &Ctx<'js>,
+    val: &serde_json::Value,
+) -> rquickjs::Result<Value<'js>> {
     if val.is_null() {
         return Ok(Value::new_null(ctx.clone()));
     }
@@ -2529,7 +3337,10 @@ pub(crate) fn json_to_js<'js>(ctx: &Ctx<'js>, val: &serde_json::Value) -> rquick
 }
 
 /// Converts a QuickJS `Value` into a `serde_json::Value`.
-pub(crate) fn js_to_json<'js>(ctx: &Ctx<'js>, val: Value<'js>) -> rquickjs::Result<serde_json::Value> {
+pub(crate) fn js_to_json<'js>(
+    ctx: &Ctx<'js>,
+    val: Value<'js>,
+) -> rquickjs::Result<serde_json::Value> {
     if val.is_undefined() || val.is_null() {
         return Ok(serde_json::Value::Null);
     }

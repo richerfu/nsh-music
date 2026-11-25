@@ -1,5 +1,6 @@
-//! Full-screen / full-window immersive Now Playing overlay adapting cleanly across
-//! Desktop, Pad (Landscape & Portrait), and Phone form factors.
+//! Full-window / full-screen immersive Now Playing stage aligned 1:1 with
+//! `egoist/mygo-music` (`internal/app/ui_nowplaying.go`) across Desktop,
+//! Pad (Landscape & Portrait), and Phone form factors.
 
 pub mod backdrop;
 pub mod lyrics_view;
@@ -9,47 +10,55 @@ pub mod stage;
 pub mod wall;
 
 use nsh_base::{SliderValue, button, slider};
+use nsh_core::element::desktop::title_bar;
 use nsh_core::prelude::*;
-use nsh_music_core::model::{RepeatMode, Track};
+use nsh_music_audio::PlaybackStatus;
+use nsh_music_core::model::{Quality, RepeatMode, Track};
 
 use crate::{
-    state::{AppStore, NowPlayingMode, NowPlayingPanel, NowPlayingStageStyle},
+    state::{AppStore, NowPlayingMode, NowPlayingPanel, Route},
     ui::{
-        controls::play_pause_button,
-        icons::{Icon, icon_reactive},
-        motion,
+        ContextMenuAction,
+        icons::{Icon, icon, icon_reactive},
+        loading_spinner, motion,
         scrubber::scrubber,
-        theme::{self, DeviceForm, colors, font_size, radius},
+        styled_menu,
+        theme::{self, DeviceForm, Elevated, Elevation, colors},
+        track_row::format_duration_ms,
     },
 };
+
+/// Max combined width of the Desktop cover + right pane (`npMaxWidth = 1280`).
+const NP_MAX_WIDTH: f32 = 1280.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PhoneSection {
     Art,
     Lyrics,
+    Stage,
     More,
 }
 
 /// Renders the full-window / full-screen Now Playing overlay stage.
 ///
 /// Adapts across:
-/// - **Desktop**: Full-window immersive overlay with top toolbar (mode switcher,
-///   stage switcher, capability-gated panel tabs, fullscreen & close) and 2-column split.
-/// - **Pad**: Landscape 2-column split; Portrait stacked centerpiece + switchable panels.
-/// - **Phone**: Full-screen sheet with chevron-down dismiss handle, segmented switcher
-///   between Art / Lyrics / Queue & Comments, and `>= 44pt` thumb-zone transport controls.
+/// - **Desktop**: Minimalist top chevron-down dismiss handle, left-aligned floating
+///   tab row (`Lyrics` · `Stage` · `Up Next` · `Wall` · `Comments`), full-window
+///   `Stage` & `Wall` views, or spacious borderless 2-column split (`max-w: 1280`,
+///   `gap: 72`) with centerpiece, clickable artists, `···` menu, gold `Lossless`
+///   badge, borderless white transport, and slim `180pt` volume bar.
+/// - **Pad**: Landscape 2-column split / Portrait stacked layout (plus full-window
+///   `Stage` & `Wall`) with `>= 44pt` touch targets.
+/// - **Phone**: Full-screen sheet with drag pill, chevron-down dismiss handle,
+///   segmented switcher (`Cover` / `Lyrics` / `Stage` / `More`), and `>= 44pt`
+///   thumb-zone transport controls.
 pub fn now_playing_overlay(store: AppStore, form: DeviceForm) -> View {
-    // Auto-fallback to Lyrics whenever Comments or Podcast becomes unavailable
+    // Auto-resolve invalid panel selections whenever source capabilities or episode state change
     effect(move || {
         let cur = store.now_playing_panel.get();
-        let allow_comments = store.active_can("comments");
-        let allow_podcast = store
-            .current_track
-            .with(|t| t.as_ref().is_some_and(Track::is_episode));
-        if (cur == NowPlayingPanel::Comments && !allow_comments)
-            || (cur == NowPlayingPanel::Podcast && !allow_podcast)
-        {
-            store.set_now_playing_panel(NowPlayingPanel::Lyrics);
+        let eff = panels::effective_panel(store);
+        if cur != eff {
+            store.set_now_playing_panel(eff);
         }
     });
 
@@ -62,14 +71,9 @@ pub fn now_playing_overlay(store: AppStore, form: DeviceForm) -> View {
         .overflow_hidden()
         .bg(theme::np_bg)
         .text_color(theme::np_fg)
-        // Layer 1: Dominant-accent GPU WGSL fog / Canvas fallback ambient backdrop
+        // Ambient GPU WGSL fog shader (30fps gated) or clean HSV still backdrop
         .child(backdrop::ambient_backdrop(store))
-        // Layer 2: Cover Wall atmospheric mosaic when `stage_style == Wall`
-        .child(when(
-            move || store.stage_style.get() == NowPlayingStageStyle::Wall,
-            move || wall::cover_wall_mosaic(store, form),
-        ))
-        // Layer 3: Form-factor-adapted interactive stage foreground
+        // Form-factor-adapted interactive stage foreground
         .child(match form {
             DeviceForm::Desktop => desktop_stage(store, form),
             DeviceForm::Pad { landscape: true } => pad_landscape_stage(store, form),
@@ -78,21 +82,207 @@ pub fn now_playing_overlay(store: AppStore, form: DeviceForm) -> View {
         })
 }
 
+fn desktop_side_pad_x() -> f32 {
+    let w = window().width.0;
+    ((w - NP_MAX_WIDTH) * 0.5).max(72.0)
+}
+
+fn desktop_cover_size() -> f32 {
+    let win = window();
+    let side = (win.width.0 * 0.36).min(440.0);
+    side.min(win.height.0 - 436.0).clamp(260.0, 420.0)
+}
+
 // -----------------------------------------------------------------------------
-// Desktop Layout: Full-window toolbar + 2-column split (or fullscreen stage)
+// Desktop Layout (`ui_nowplaying.go:1268-1404`)
 // -----------------------------------------------------------------------------
 
 fn desktop_stage(store: AppStore, form: DeviceForm) -> View {
+    let pointer_in = signal(true);
+    let eff_panel = computed(move || panels::effective_panel(store));
+
     view()
         .relative()
         .flex_1()
         .w_full()
         .h_full()
-        .pt_safe_area_plus(px(14.0))
-        .pb_6()
-        .px_8()
-        .gap_5()
-        // Top Toolbar
+        .on_mouse_enter(move |_: &MouseEvent| pointer_in.set(true))
+        .on_mouse_leave(move |_: &MouseEvent| pointer_in.set(false))
+        // Centered top chevron-down dismiss handle avoiding macOS traffic lights,
+        // Windows/Linux caption buttons, and display notch / safe-area insets
+        .child(
+            view()
+                .w_full()
+                .h(move || px(title_bar().top.0.max(safe_area().top.0).max(44.0)))
+                .pl(move || px(title_bar().left.0.max(safe_area().left.0) + 12.0))
+                .pr(move || px(title_bar().right.0.max(safe_area().right.0) + 12.0))
+                .items_center()
+                .justify_center()
+                .window_drag(true)
+                .transition_all()
+                .duration(move || motion::transition_ms(200.0))
+                .opacity(move || if pointer_in.get() { 1.0_f32 } else { 0.45_f32 })
+                .child(view().window_drag(false).child(stage_icon_button(
+                    Icon::ChevronDown,
+                    34.0,
+                    22.0,
+                    move || theme::np_fg().opacity(0.70),
+                    move || store.t("now_playing.minimize"),
+                    move || store.close_now_playing(),
+                ))),
+        )
+        // Single left-aligned floating tab row aligned with the cover's left edge
+        .child(
+            view()
+                .w_full()
+                .pl(move || px(desktop_side_pad_x().max(safe_area().left.0 + 16.0)))
+                .pr(move || px(desktop_side_pad_x().max(safe_area().right.0 + 16.0)))
+                .h(px(30.0))
+                .flex_row()
+                .items_center()
+                .gap_1p5()
+                .transition_all()
+                .duration(move || motion::transition_ms(200.0))
+                .opacity(move || if pointer_in.get() { 1.0_f32 } else { 0.55_f32 })
+                .child(floating_pane_tabs(store, form))
+                .child(when(
+                    move || eff_panel.get() == NowPlayingPanel::Stage,
+                    move || stage::stage_style_menu_button(store, form),
+                )),
+        )
+        // Main stage viewport: full-window Stage, full-window Wall, or borderless 2-column split
+        .child(
+            view()
+                .flex_1()
+                .w_full()
+                .min_h(px(0.0))
+                .child(dynamic(move || {
+                    let panel = eff_panel.get();
+                    untracked(|| match panel {
+                        NowPlayingPanel::Stage => {
+                            stage::stage_panel(store, form).key("np-desk-stage")
+                        }
+                        NowPlayingPanel::Wall => wall::wall_panel(store, form).key("np-desk-wall"),
+                        _ => desktop_split_body(store, form).key("np-desk-split"),
+                    })
+                })),
+        )
+}
+
+fn desktop_split_body(store: AppStore, form: DeviceForm) -> View {
+    let cover_size = desktop_cover_size();
+    let col_w = cover_size.max(280.0);
+
+    view()
+        .flex_1()
+        .w_full()
+        .min_h(px(0.0))
+        .pl(move || px(desktop_side_pad_x().max(safe_area().left.0 + 16.0)))
+        .pr(move || px(desktop_side_pad_x().max(safe_area().right.0 + 16.0)))
+        .pt(px(20.0))
+        .pb(move || px(safe_area().bottom.0 + 40.0))
+        .flex_row()
+        .items_stretch()
+        .gap(px(72.0))
+        // Left column: centerpiece + subtle mode pills + track info + scrubber/lossless + transport + volume
+        .child(
+            view()
+                .w(px(col_w))
+                .flex_shrink_0()
+                .justify_center()
+                .items_start()
+                .child(retro::retro_centerpiece(store, cover_size))
+                // Unobtrusive Cover / Vinyl / Cassette selector tucked right below centerpiece
+                .child(
+                    view()
+                        .w_full()
+                        .mt_3()
+                        .flex_row()
+                        .items_center()
+                        .justify_center()
+                        .child(compact_mode_pills(store, false)),
+                )
+                // Title + clickable artist links + Like + `···` menu
+                .child(
+                    view()
+                        .w_full()
+                        .mt_5()
+                        .mb_4()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            view()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .gap_1()
+                                .child(
+                                    text(move || {
+                                        store.current_track.with(|t| {
+                                            t.as_ref()
+                                                .map(|tr| SharedString::from(tr.name.clone()))
+                                                .unwrap_or_else(|| store.t("player.idle_title"))
+                                        })
+                                    })
+                                    .number_of_lines(1)
+                                    .text_size(px(22.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .letter_spacing(px(-0.3))
+                                    .text_color(theme::np_fg),
+                                )
+                                .child(clickable_artist_links(store, 15.0, 0.60)),
+                        )
+                        .child(stage_like_button(store, 22.0, false))
+                        .child(song_more_menu(store, 22.0, false)),
+                )
+                // Scrubber + elapsed / Lossless badge / remaining (or Buffering…)
+                .child(stage_scrubber_bar(store, false))
+                .child(scrubber_meta_row(store))
+                // Borderless white transport controls
+                .child(
+                    view()
+                        .w_full()
+                        .mt_3p5()
+                        .mb_4()
+                        .items_center()
+                        .child(stage_transport(store, form, 28.0, true)),
+                )
+                // Slim 180pt volume slider (no `%` noise)
+                .child(
+                    view()
+                        .w_full()
+                        .items_center()
+                        .child(volume_bar(store, form, 180.0)),
+                ),
+        )
+        // Right pane: COMPLETELY BORDERLESS floating directly over the fog backdrop
+        .child(
+            view()
+                .flex_1()
+                .min_w(px(0.0))
+                .min_h(px(0.0))
+                .child(panels::active_panel_content(store, form)),
+        )
+}
+
+// -----------------------------------------------------------------------------
+// Pad Landscape Layout: 2-column split (or full-window Stage / Wall) + >=44pt touch
+// -----------------------------------------------------------------------------
+
+fn pad_landscape_stage(store: AppStore, form: DeviceForm) -> View {
+    let eff_panel = computed(move || panels::effective_panel(store));
+
+    view()
+        .relative()
+        .flex_1()
+        .w_full()
+        .h_full()
+        .pt_safe_area_plus(px(10.0))
+        .pb_safe_area_plus(px(14.0))
+        .pl(move || px(safe_area().left.0 + 24.0))
+        .pr(move || px(safe_area().right.0 + 24.0))
+        .gap_3()
+        // Minimalist top bar: dismiss chevron + floating tabs (+ Stage Style menu)
         .child(
             view()
                 .w_full()
@@ -100,303 +290,98 @@ fn desktop_stage(store: AppStore, form: DeviceForm) -> View {
                 .items_center()
                 .justify_between()
                 .gap_3()
-                .child(mode_switcher(store, false))
-                .child(stage::stage_style_switcher(store, false))
+                .child(stage_icon_button(
+                    Icon::ChevronDown,
+                    44.0,
+                    22.0,
+                    move || theme::np_fg().opacity(0.75),
+                    move || store.t("now_playing.minimize"),
+                    move || store.close_now_playing(),
+                ))
                 .child(
                     view()
+                        .flex_1()
+                        .min_w(px(0.0))
                         .flex_row()
                         .items_center()
-                        .gap_2()
-                        .child(panels::panel_tabs(store, form))
-                        .child(stage_icon_button(
-                            move || {
-                                if store.stage_fullscreen.get() {
-                                    Icon::Shrink
-                                } else {
-                                    Icon::Expand
-                                }
-                            },
-                            34.0,
-                            16.0,
-                            move || store.t("now_playing.stage"),
-                            move || store.toggle_stage_fullscreen(),
-                        ))
-                        .child(stage_icon_button(
-                            Icon::Close,
-                            34.0,
-                            16.0,
-                            move || store.t("now_playing.minimize"),
-                            move || store.close_now_playing(),
+                        .gap_1p5()
+                        .child(floating_pane_tabs(store, form))
+                        .child(when(
+                            move || eff_panel.get() == NowPlayingPanel::Stage,
+                            move || stage::stage_style_menu_button(store, form),
                         )),
                 ),
         )
-        // Main body: fullscreen lyrics stage OR 2-column split
-        .child(
-            when(store.stage_fullscreen, move || {
-                view()
-                    .flex_1()
-                    .w_full()
-                    .min_h(px(0.0))
-                    .gap_4()
-                    .child(panels::active_panel_content(store, form))
-                    .child(
-                        view()
-                            .w_full()
-                            .px_5()
-                            .py_3()
-                            .rounded(px(radius::XL))
-                            .bg(theme::np_surface)
-                            .border_1()
-                            .border_color(theme::np_border)
-                            .flex_row()
-                            .items_center()
-                            .justify_between()
-                            .gap_6()
-                            .child(track_meta_row(store, form, true))
-                            .child(transport_controls(store, form, 44.0))
-                            .child(volume_bar(store, form, 140.0)),
-                    )
-            })
-            .otherwise(move || {
-                view()
-                    .flex_1()
-                    .w_full()
-                    .min_h(px(0.0))
-                    .flex_row()
-                    .items_stretch()
-                    .gap_8()
-                    // Left column: centerpiece + track info + scrubber + transport + volume
-                    .child(
-                        view()
-                            .w(relative(0.44))
-                            .min_w(px(340.0))
-                            .max_w(px(470.0))
-                            .justify_center()
-                            .items_center()
-                            .gap_5()
-                            .child(retro::retro_centerpiece(store, 286.0))
-                            .child(
-                                view()
-                                    .w_full()
-                                    .max_w(px(400.0))
-                                    .gap_4()
-                                    .child(track_meta_row(store, form, false))
-                                    .child(stage_scrubber(store))
-                                    .child(transport_controls(store, form, 52.0))
-                                    .child(volume_bar(store, form, 240.0)),
-                            ),
-                    )
-                    // Right column: switchable Lyrics / Queue / Comments / Podcast panel
-                    .child(
-                        view()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .min_h(px(0.0))
-                            .p_4()
-                            .rounded(px(radius::XL))
-                            .bg(move || theme::np_surface().opacity(0.55))
-                            .border_1()
-                            .border_color(theme::np_border)
-                            .child(panels::active_panel_content(store, form)),
-                    )
-            }),
-        )
-}
-
-// -----------------------------------------------------------------------------
-// Pad Landscape Layout: 2-column split with >= 44pt touch controls
-// -----------------------------------------------------------------------------
-
-fn pad_landscape_stage(store: AppStore, form: DeviceForm) -> View {
-    view()
-        .relative()
-        .flex_1()
-        .w_full()
-        .h_full()
-        .pt_safe_area_plus(px(12.0))
-        .pb_safe_area_plus(px(16.0))
-        .px_5()
-        .gap_4()
-        // Top bar
-        .child(
-            view()
-                .w_full()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .gap_2()
-                .child(stage_icon_button(
-                    Icon::ChevronDown,
-                    44.0,
-                    20.0,
-                    move || store.t("now_playing.minimize"),
-                    move || store.close_now_playing(),
-                ))
-                .child(mode_switcher(store, true))
-                .child(stage::stage_style_switcher(store, true))
-                .child(panels::panel_tabs(store, form)),
-        )
-        // 2-column landscape split
         .child(
             view()
                 .flex_1()
                 .w_full()
                 .min_h(px(0.0))
-                .flex_row()
-                .items_stretch()
-                .gap_5()
-                .child(
-                    view()
-                        .w(relative(0.45))
-                        .min_w(px(300.0))
-                        .justify_center()
-                        .items_center()
-                        .gap_4()
-                        .child(retro::retro_centerpiece(store, 232.0))
-                        .child(
-                            view()
-                                .w_full()
-                                .max_w(px(360.0))
-                                .gap_3()
-                                .child(track_meta_row(store, form, false))
-                                .child(stage_scrubber(store))
-                                .child(transport_controls(store, form, 54.0))
-                                .child(volume_bar(store, form, 200.0)),
-                        ),
-                )
-                .child(
-                    view()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .min_h(px(0.0))
-                        .p_3()
-                        .rounded(px(radius::XL))
-                        .bg(move || theme::np_surface().opacity(0.55))
-                        .border_1()
-                        .border_color(theme::np_border)
-                        .child(panels::active_panel_content(store, form)),
-                ),
+                .child(dynamic(move || {
+                    let panel = eff_panel.get();
+                    untracked(|| match panel {
+                        NowPlayingPanel::Stage => {
+                            stage::stage_panel(store, form).key("np-padl-stage")
+                        }
+                        NowPlayingPanel::Wall => wall::wall_panel(store, form).key("np-padl-wall"),
+                        _ => view()
+                            .key("np-padl-split")
+                            .flex_1()
+                            .w_full()
+                            .min_h(px(0.0))
+                            .flex_row()
+                            .items_stretch()
+                            .gap_8()
+                            .child(
+                                view()
+                                    .w(px(300.0))
+                                    .flex_shrink_0()
+                                    .justify_center()
+                                    .items_center()
+                                    .gap_3()
+                                    .child(retro::retro_centerpiece(store, 240.0))
+                                    .child(compact_mode_pills(store, true))
+                                    .child(
+                                        view()
+                                            .w_full()
+                                            .gap_2p5()
+                                            .child(track_meta_row(store, form, false))
+                                            .child(stage_scrubber_bar(store, false))
+                                            .child(scrubber_meta_row(store))
+                                            .child(stage_transport(store, form, 26.0, true))
+                                            .child(volume_bar(store, form, 180.0)),
+                                    ),
+                            )
+                            // Borderless right pane
+                            .child(
+                                view()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .min_h(px(0.0))
+                                    .child(panels::active_panel_content(store, form)),
+                            ),
+                    })
+                })),
         )
 }
 
 // -----------------------------------------------------------------------------
-// Pad Portrait Layout: Stacked centerpiece + switchable panels
+// Pad Portrait Layout: Stacked centerpiece + borderless panels (or Stage / Wall)
 // -----------------------------------------------------------------------------
 
 fn pad_portrait_stage(store: AppStore, form: DeviceForm) -> View {
-    view()
-        .relative()
-        .flex_1()
-        .w_full()
-        .h_full()
-        .pt_safe_area_plus(px(12.0))
-        .pb_safe_area_plus(px(16.0))
-        .px_5()
-        .gap_4()
-        // Top header bar
-        .child(
-            view()
-                .w_full()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .gap_2()
-                .child(stage_icon_button(
-                    Icon::ChevronDown,
-                    44.0,
-                    20.0,
-                    move || store.t("now_playing.minimize"),
-                    move || store.close_now_playing(),
-                ))
-                .child(mode_switcher(store, true))
-                .child(stage_like_button(store, 44.0)),
-        )
-        // Upper centerpiece + playback deck
-        .child(
-            view()
-                .w_full()
-                .flex_row()
-                .items_center()
-                .gap_5()
-                .child(retro::retro_centerpiece(store, 196.0))
-                .child(
-                    view()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .gap_3()
-                        .child(track_meta_row(store, form, false))
-                        .child(stage_scrubber(store))
-                        .child(transport_controls(store, form, 52.0)),
-                ),
-        )
-        // Switchable panel & stage bar
-        .child(
-            view()
-                .w_full()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .gap_2()
-                .child(panels::panel_tabs(store, form))
-                .child(when(
-                    move || panels::effective_panel(store) == NowPlayingPanel::Lyrics,
-                    move || stage::stage_style_switcher(store, true),
-                )),
-        )
-        // Lower switchable panel container
-        .child(
-            view()
-                .flex_1()
-                .w_full()
-                .min_h(px(0.0))
-                .p_3()
-                .rounded(px(radius::XL))
-                .bg(move || theme::np_surface().opacity(0.55))
-                .border_1()
-                .border_color(theme::np_border)
-                .child(panels::active_panel_content(store, form)),
-        )
-}
-
-// -----------------------------------------------------------------------------
-// Phone Layout: Full-screen sheet with dismiss handle, segmented switcher & >=44pt thumb zone
-// -----------------------------------------------------------------------------
-
-fn phone_sheet_stage(store: AppStore, form: DeviceForm) -> View {
-    let section = signal(PhoneSection::Art);
-
-    // Clicking the Quiet-Part Top Comment card from Phone Lyrics jumps cleanly into Comments
-    effect(move || {
-        if store.now_playing_panel.get() == NowPlayingPanel::Comments
-            && section.get_untracked() == PhoneSection::Lyrics
-        {
-            section.set(PhoneSection::More);
-        }
-    });
+    let eff_panel = computed(move || panels::effective_panel(store));
 
     view()
         .relative()
         .flex_1()
         .w_full()
         .h_full()
-        .pt_safe_area_plus(px(8.0))
+        .pt_safe_area_plus(px(10.0))
         .pb_safe_area_plus(px(14.0))
-        .px_4()
+        .pl(move || px(safe_area().left.0 + 20.0))
+        .pr(move || px(safe_area().right.0 + 20.0))
         .gap_3()
-        // Subtle top drag pill indicator
-        .child(
-            view()
-                .w_full()
-                .items_center()
-                .child(
-                    view()
-                        .w(px(38.0))
-                        .h(px(4.5))
-                        .rounded_full()
-                        .bg(theme::np_faint),
-                ),
-        )
-        // Header row: chevron-down dismiss handle + Art / Lyrics / Queue & Comments switcher
         .child(
             view()
                 .w_full()
@@ -408,12 +393,167 @@ fn phone_sheet_stage(store: AppStore, form: DeviceForm) -> View {
                     Icon::ChevronDown,
                     44.0,
                     22.0,
+                    move || theme::np_fg().opacity(0.75),
                     move || store.t("now_playing.minimize"),
                     move || store.close_now_playing(),
                 ))
-                .child(phone_section_switcher(store, section))
-                .child(stage_like_button(store, 44.0)),
+                .child(
+                    scroll().horizontal().scrollbar(false).flex_1().child(
+                        view()
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
+                            .child(floating_pane_tabs(store, form))
+                            .child(when(
+                                move || eff_panel.get() == NowPlayingPanel::Stage,
+                                move || stage::stage_style_menu_button(store, form),
+                            )),
+                    ),
+                ),
         )
+        .child(
+            view()
+                .flex_1()
+                .w_full()
+                .min_h(px(0.0))
+                .child(dynamic(move || {
+                    let panel = eff_panel.get();
+                    untracked(|| match panel {
+                        NowPlayingPanel::Stage => {
+                            stage::stage_panel(store, form).key("np-padp-stage")
+                        }
+                        NowPlayingPanel::Wall => wall::wall_panel(store, form).key("np-padp-wall"),
+                        _ => view()
+                            .key("np-padp-stack")
+                            .flex_1()
+                            .w_full()
+                            .min_h(px(0.0))
+                            .gap_4()
+                            .child(
+                                view()
+                                    .w_full()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_5()
+                                    .child(
+                                        view()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(retro::retro_centerpiece(store, 196.0))
+                                            .child(compact_mode_pills(store, true)),
+                                    )
+                                    .child(
+                                        view()
+                                            .flex_1()
+                                            .min_w(px(0.0))
+                                            .gap_2p5()
+                                            .child(track_meta_row(store, form, false))
+                                            .child(stage_scrubber_bar(store, false))
+                                            .child(scrubber_meta_row(store))
+                                            .child(stage_transport(store, form, 26.0, true)),
+                                    ),
+                            )
+                            // Borderless lower panel
+                            .child(
+                                view()
+                                    .flex_1()
+                                    .w_full()
+                                    .min_h(px(0.0))
+                                    .child(panels::active_panel_content(store, form)),
+                            ),
+                    })
+                })),
+        )
+}
+
+// -----------------------------------------------------------------------------
+// Phone Layout: Full-screen sheet with drag pill, floating segmented switcher,
+// mini track bar on non-Cover tabs, responsive cover, & >=44pt thumb-zone dock
+// -----------------------------------------------------------------------------
+
+fn phone_cover_size() -> f32 {
+    let win = window();
+    (win.width.0 - 56.0)
+        .min(win.height.0 * 0.38)
+        .clamp(220.0, 320.0)
+}
+
+fn phone_sheet_stage(store: AppStore, form: DeviceForm) -> View {
+    let section = signal(PhoneSection::Art);
+    let is_episode = computed(move || {
+        store
+            .current_track
+            .with(|t| t.as_ref().is_some_and(Track::is_episode))
+    });
+    let cover_size_memo = computed(move || {
+        let raw = phone_cover_size();
+        (raw / 4.0).round() * 4.0
+    });
+
+    // Clicking the Quiet-Part Top Comment card from Lyrics or Stage jumps into Comments
+    effect(move || {
+        let p = store.now_playing_panel.get();
+        let cur = section.get_untracked();
+        if p == NowPlayingPanel::Comments
+            && matches!(cur, PhoneSection::Lyrics | PhoneSection::Stage)
+        {
+            section.set(PhoneSection::More);
+        }
+    });
+
+    view()
+        .relative()
+        .flex_1()
+        .w_full()
+        .h_full()
+        .pt_safe_area_plus(px(6.0))
+        .pb_safe_area_plus(px(14.0))
+        .pl(move || px(safe_area().left.0))
+        .pr(move || px(safe_area().right.0))
+        .gap_2()
+        // Crisp 36×4pt drag pill
+        .child(
+            view().w_full().items_center().pb_0p5().child(
+                view()
+                    .w(px(36.0))
+                    .h(px(4.0))
+                    .rounded_full()
+                    .bg(move || theme::np_fg().opacity(0.28)),
+            ),
+        )
+        // Balanced top header: 44pt dismiss chevron + centered floating segmented switcher + 44pt spacer
+        .child(
+            view()
+                .w_full()
+                .h(px(44.0))
+                .px_3()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap_1()
+                .child(stage_icon_button(
+                    Icon::ChevronDown,
+                    44.0,
+                    22.0,
+                    move || theme::np_fg().opacity(0.84),
+                    move || store.t("now_playing.minimize"),
+                    move || store.close_now_playing(),
+                ))
+                .child(
+                    view()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .items_center()
+                        .justify_center()
+                        .child(phone_section_switcher(store, section)),
+                )
+                .child(view().w(px(44.0)).h(px(44.0)).flex_shrink_0()),
+        )
+        // Compact mini track bar on non-Cover Phone tabs so track identity & quick pause stay visible
+        .child(when(
+            move || section.get() != PhoneSection::Art,
+            move || phone_mini_track_bar(store, section),
+        ))
         // Primary adaptive stage viewport
         .child(
             view()
@@ -427,43 +567,67 @@ fn phone_sheet_stage(store: AppStore, form: DeviceForm) -> View {
                             .key("np-phone-art")
                             .flex_1()
                             .w_full()
+                            .px(px(20.0))
                             .items_center()
                             .justify_center()
-                            .gap_4()
-                            .child(retro::retro_centerpiece(store, 248.0))
-                            .child(mode_switcher(store, true)),
+                            .gap_2p5()
+                            .child(dynamic(move || {
+                                let sz = cover_size_memo.get();
+                                untracked(|| {
+                                    retro::retro_centerpiece(store, sz)
+                                        .key(format!("np-phone-art-{}", sz as i32))
+                                })
+                            }))
+                            .child(compact_mode_pills(store, true)),
 
                         PhoneSection::Lyrics => view()
                             .key("np-phone-lyrics")
                             .flex_1()
                             .w_full()
                             .min_h(px(0.0))
-                            .gap_2()
                             .child(
-                                scroll()
-                                    .horizontal()
-                                    .scrollbar(false)
-                                    .child(stage::stage_style_switcher(store, true)),
+                                when(is_episode, move || panels::podcast_panel(store, form))
+                                    .otherwise(move || lyrics_view::lyrics_view(store, form)),
+                            ),
+
+                        PhoneSection::Stage => view()
+                            .key("np-phone-stage")
+                            .flex_1()
+                            .w_full()
+                            .min_h(px(0.0))
+                            .gap_1p5()
+                            .child(
+                                view().w_full().px(px(20.0)).items_center().child(
+                                    scroll()
+                                        .horizontal()
+                                        .scrollbar(false)
+                                        .child(stage::stage_style_switcher(store, true)),
+                                ),
                             )
-                            .child(lyrics_view::lyrics_view(store, form)),
+                            .child(stage::stage_panel(store, form)),
 
                         PhoneSection::More => view()
                             .key("np-phone-more")
                             .flex_1()
                             .w_full()
                             .min_h(px(0.0))
-                            .gap_2()
+                            .gap_1p5()
                             .child(phone_more_subtabs(store))
                             .child(dynamic(move || {
                                 let panel = panels::effective_panel(store);
                                 untracked(|| match panel {
+                                    NowPlayingPanel::Wall => {
+                                        wall::wall_panel(store, form).key("np-phone-wall")
+                                    }
                                     NowPlayingPanel::Comments => {
                                         panels::comments_panel(store, form).key("np-phone-comments")
                                     }
                                     NowPlayingPanel::Podcast => {
                                         panels::podcast_panel(store, form).key("np-phone-podcast")
                                     }
-                                    NowPlayingPanel::Queue | NowPlayingPanel::Lyrics => {
+                                    NowPlayingPanel::Queue
+                                    | NowPlayingPanel::Lyrics
+                                    | NowPlayingPanel::Stage => {
                                         panels::queue_panel(store, form).key("np-phone-queue")
                                     }
                                 })
@@ -471,34 +635,52 @@ fn phone_sheet_stage(store: AppStore, form: DeviceForm) -> View {
                     })
                 })),
         )
-        // Thumb-zone controls pinned cleanly at bottom (>= 44pt targets)
-        .child(
-            view()
-                .w_full()
-                .gap_3()
-                .pt_2()
-                .child(track_meta_row(store, form, true))
-                .child(stage_scrubber(store))
-                .child(transport_controls(store, form, 58.0)),
-        )
+        // Cover view bottom thumb-zone dock: expressive track info + scrubber/badge + 64pt Play transport
+        .child(when(
+            move || section.get() == PhoneSection::Art,
+            move || phone_cover_bottom_dock(store),
+        ))
+        // Non-Cover tabs without their own bottom bar (`Lyrics`, `Queue`, `Comments`, `Podcast`):
+        // sleek thumb-zone scrubber + elapsed/quality/remaining row (quick pause sits in top mini bar)
+        .child(when(
+            move || {
+                let sec = section.get();
+                sec != PhoneSection::Art
+                    && sec != PhoneSection::Stage
+                    && !(sec == PhoneSection::More
+                        && panels::effective_panel(store) == NowPlayingPanel::Wall)
+            },
+            move || phone_compact_scrubber_dock(store),
+        ))
 }
 
 fn phone_section_switcher(store: AppStore, section: Signal<PhoneSection>) -> View {
     let items: &[(PhoneSection, &str)] = &[
         (PhoneSection::Art, "now_playing.mode.cover"),
         (PhoneSection::Lyrics, "now_playing.panel.lyrics"),
-        (PhoneSection::More, "now_playing.panel.queue"),
+        (PhoneSection::Stage, "now_playing.panel.stage"),
+        (PhoneSection::More, "common.more"),
     ];
 
     view()
+        .relative()
+        .h(px(44.0))
         .flex_row()
         .items_center()
-        .gap_1()
-        .p_1()
-        .rounded_full()
-        .bg(theme::np_surface)
-        .border_1()
-        .border_color(theme::np_border)
+        // Sleek 32pt frosted floating pill track centered vertically behind 44pt touch hit-targets
+        .child(
+            view()
+                .absolute()
+                .left_0()
+                .right_0()
+                .top(px(6.0))
+                .h(px(32.0))
+                .rounded_full()
+                .bg(move || theme::np_fg().opacity(0.09))
+                .border_1()
+                .border_color(move || theme::np_fg().opacity(0.08))
+                .pointer_events(PointerEvents::None),
+        )
         .children(items.iter().copied().map(move |(sec, key)| {
             let active = move || section.get() == sec;
             button()
@@ -507,70 +689,568 @@ fn phone_section_switcher(store: AppStore, section: Signal<PhoneSection>) -> Vie
                 .on_press(move || {
                     section.set(sec);
                     match sec {
-                        PhoneSection::Lyrics => store.set_now_playing_panel(NowPlayingPanel::Lyrics),
+                        PhoneSection::Lyrics => {
+                            store.set_now_playing_panel(NowPlayingPanel::Lyrics);
+                        }
+                        PhoneSection::Stage => {
+                            store.set_now_playing_panel(NowPlayingPanel::Stage);
+                        }
                         PhoneSection::More => {
-                            if store.now_playing_panel.get_untracked() == NowPlayingPanel::Lyrics {
+                            if matches!(
+                                store.now_playing_panel.get_untracked(),
+                                NowPlayingPanel::Lyrics | NowPlayingPanel::Stage
+                            ) {
                                 store.set_now_playing_panel(NowPlayingPanel::Queue);
                             }
                         }
                         PhoneSection::Art => {}
                     }
                 })
+                .min_w(px(44.0))
                 .min_h(px(44.0))
-                .px_3()
+                .px(px(2.5))
                 .items_center()
                 .justify_center()
-                .rounded_full()
-                .bg(move || {
-                    if active() {
-                        theme::np_surface_hover()
-                    } else {
-                        colors::TRANSPARENT
-                    }
-                })
+                .bg(colors::TRANSPARENT)
                 .active(|s| s.scale(motion::press_scale))
                 .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
                 .child(
-                    text(move || store.t(key))
-                        .number_of_lines(1)
-                        .text_size(px(font_size::CAPTION))
-                        .font_weight(FontWeight::MEDIUM)
-                        .style_when(active, |s| s.font_weight(FontWeight::SEMIBOLD))
-                        .text_color(move || {
+                    view()
+                        .h(px(26.0))
+                        .px(px(8.5))
+                        .rounded_full()
+                        .items_center()
+                        .justify_center()
+                        .bg(move || {
                             if active() {
-                                theme::np_fg()
+                                theme::np_fg().opacity(0.20)
                             } else {
-                                theme::np_muted()
+                                colors::TRANSPARENT
                             }
-                        }),
+                        })
+                        .transition_colors()
+                        .duration(move || motion::transition_ms(140.0))
+                        .child(
+                            text(move || store.t(key))
+                                .number_of_lines(1)
+                                .text_size(px(12.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(move || {
+                                    if active() {
+                                        theme::np_fg()
+                                    } else {
+                                        theme::np_fg().opacity(0.62)
+                                    }
+                                }),
+                        ),
                 )
         }))
 }
 
-fn phone_more_subtabs(store: AppStore) -> View {
+/// Compact mini track header rendered at the top of non-Cover Phone tabs so track identity,
+/// quick Play/Pause, and `···` actions remain visible and 1 tap away.
+fn phone_mini_track_bar(store: AppStore, section: Signal<PhoneSection>) -> View {
+    let has_art = computed(move || store.current_artwork_uri.with(|u| !u.is_empty()));
+
+    view().w_full().px(px(20.0)).child(
+        view()
+            .w_full()
+            .min_h(px(56.0))
+            .pl_2p5()
+            .pr_1p5()
+            .py_1p5()
+            .rounded(px(14.0))
+            .bg(move || theme::np_fg().opacity(0.08))
+            .border_1()
+            .border_color(move || theme::np_fg().opacity(0.08))
+            .flex_row()
+            .items_center()
+            .gap_1p5()
+            // Tapping cover/title returns smoothly to Cover view
+            .child(
+                button()
+                    .accessibility_label(move || {
+                        Some(store.current_track.with(|t| {
+                            t.as_ref()
+                                .map(|tr| SharedString::from(tr.name.clone()))
+                                .unwrap_or_else(|| store.t("player.now_playing"))
+                        }))
+                    })
+                    .on_press(move || section.set(PhoneSection::Art))
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .min_h(px(44.0))
+                    .flex_row()
+                    .items_center()
+                    .gap_2p5()
+                    .bg(colors::TRANSPARENT)
+                    .active(|s| s.opacity(0.75))
+                    .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
+                    .child(
+                        view()
+                            .size(px(40.0))
+                            .flex_shrink_0()
+                            .rounded(px(8.0))
+                            .overflow_hidden()
+                            .bg(theme::np_surface)
+                            .border_1()
+                            .border_color(move || theme::np_fg().opacity(0.10))
+                            .items_center()
+                            .justify_center()
+                            .child(when(
+                                move || !has_art.get(),
+                                || icon(Icon::Disc, 16.0, colors::NP_MUTED).opacity(0.55),
+                            ))
+                            .child(when(has_art, move || {
+                                image(move || store.current_artwork_uri.get())
+                                    .object_fit(ResizeMode::Cover)
+                                    .absolute()
+                                    .inset_0()
+                                    .size_full()
+                            })),
+                    )
+                    .child(
+                        view()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .gap_0p5()
+                            .child(
+                                text(move || {
+                                    store.current_track.with(|t| {
+                                        t.as_ref()
+                                            .map(|tr| SharedString::from(tr.name.clone()))
+                                            .unwrap_or_else(|| store.t("player.idle_title"))
+                                    })
+                                })
+                                .number_of_lines(1)
+                                .text_size(px(14.5))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(theme::np_fg),
+                            )
+                            .child(
+                                text(move || {
+                                    let fallback = store.t("track.unknown_artist");
+                                    store.current_track.with(|t| {
+                                        t.as_ref()
+                                            .map(|tr| {
+                                                let names = tr.artist_names();
+                                                if names.is_empty() {
+                                                    fallback.clone()
+                                                } else {
+                                                    SharedString::from(names)
+                                                }
+                                            })
+                                            .unwrap_or(fallback)
+                                    })
+                                })
+                                .number_of_lines(1)
+                                .text_size(px(12.5))
+                                .text_color(move || theme::np_fg().opacity(0.64)),
+                            ),
+                    ),
+            )
+            // Quick Play/Pause button (>= 44pt hit-target with sleek 34pt inner frosted circle)
+            .child(
+                button()
+                    .accessibility_label(move || {
+                        Some(if store.is_playing.get() {
+                            store.t("player.pause")
+                        } else {
+                            store.t("player.play")
+                        })
+                    })
+                    .on_press(move || store.toggle_play())
+                    .min_w(px(44.0))
+                    .min_h(px(44.0))
+                    .flex_shrink_0()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .bg(colors::TRANSPARENT)
+                    .active(|s| s.scale(motion::press_scale))
+                    .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
+                    .child(
+                        view()
+                            .size(px(34.0))
+                            .rounded_full()
+                            .bg(move || theme::np_fg().opacity(0.14))
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                when(
+                                    move || store.playback_status.with(PlaybackStatus::is_loading),
+                                    move || loading_spinner(16.0, theme::np_fg),
+                                )
+                                .otherwise(move || {
+                                    view()
+                                        .pl(move || {
+                                            px(if store.is_playing.get() { 0.0 } else { 1.5 })
+                                        })
+                                        .child(icon_reactive(
+                                            move || {
+                                                if store.is_playing.get() {
+                                                    Icon::Pause
+                                                } else {
+                                                    Icon::Play
+                                                }
+                                            },
+                                            16.0,
+                                            theme::np_fg,
+                                        ))
+                                }),
+                            ),
+                    ),
+            )
+            .child(song_more_menu(store, 19.0, true)),
+    )
+}
+
+/// Phone Cover view bottom dock: expressive 20pt title + 15pt clickable artist + Like & `···`,
+/// tactile scrubber + elapsed/lossless-or-quality/remaining row, and generously spaced
+/// thumb-zone transport with prominent 64pt Play/Pause circle.
+fn phone_cover_bottom_dock(store: AppStore) -> View {
     view()
         .w_full()
+        .px(px(20.0))
+        .pt_1()
+        .gap_3()
+        // Expressive track title (20pt Bold) + clickable artist subtitle (15pt ~68%) + Like & `···`
+        .child(
+            view()
+                .w_full()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(
+                    view()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .gap_1()
+                        .child(
+                            text(move || {
+                                store.current_track.with(|t| {
+                                    t.as_ref()
+                                        .map(|tr| SharedString::from(tr.name.clone()))
+                                        .unwrap_or_else(|| store.t("player.idle_title"))
+                                })
+                            })
+                            .number_of_lines(1)
+                            .text_size(px(20.0))
+                            .font_weight(FontWeight::BOLD)
+                            .letter_spacing(px(-0.35))
+                            .text_color(theme::np_fg),
+                        )
+                        .child(clickable_artist_links(store, 15.0, 0.68)),
+                )
+                .child(
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .flex_shrink_0()
+                        .gap_0p5()
+                        .child(stage_like_button(store, 22.0, true))
+                        .child(song_more_menu(store, 21.0, true)),
+                ),
+        )
+        // Tactile scrubber + elapsed / Lossless-or-quality badge / remaining
+        .child(
+            view()
+                .w_full()
+                .gap_0p5()
+                .child(stage_scrubber_bar(store, false))
+                .child(phone_scrubber_meta_row(store)),
+        )
+        // Generously spaced thumb-zone transport with prominent 64pt Play/Pause circle
+        .child(phone_thumb_transport(store, 64.0))
+}
+
+/// Compact bottom scrubber dock for non-Cover Phone tabs (`Lyrics`, `Queue`, `Comments`, `Podcast`).
+fn phone_compact_scrubber_dock(store: AppStore) -> View {
+    view()
+        .w_full()
+        .px(px(20.0))
+        .pt_1()
+        .gap_0p5()
+        .child(stage_scrubber_bar(store, false))
+        .child(phone_scrubber_meta_row(store))
+}
+
+/// Phone scrubber meta row: elapsed · centered gold `Lossless` OR crisp quality badge · remaining/Buffering.
+pub(crate) fn phone_scrubber_meta_row(store: AppStore) -> View {
+    let has_track = computed(move || store.current_track.with(Option::is_some));
+
+    view()
+        .w_full()
+        .h(px(20.0))
+        .flex_row()
+        .items_center()
+        .justify_between()
+        // Left: elapsed time
+        .child(
+            text(move || format_duration_ms(store.position_ms.get() as i64))
+                .tabular_nums()
+                .text_size(px(11.5))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(move || theme::np_fg().opacity(0.56)),
+        )
+        // Center: gold `Lossless` badge when stream is lossless, else subtle quality badge (`High`/`Standard`)
+        .child(when(has_track, move || {
+            when(
+                move || store.current_is_lossless.get(),
+                move || {
+                    view()
+                        .px_2()
+                        .py_0p5()
+                        .rounded(px(5.0))
+                        .bg(move || theme::lossless_gold().opacity(0.10))
+                        .border_1()
+                        .border_color(move || theme::lossless_gold().opacity(0.55))
+                        .child(
+                            text(move || store.t("player.lossless"))
+                                .text_size(px(9.5))
+                                .font_weight(FontWeight::EXTRA_BOLD)
+                                .letter_spacing(px(0.5))
+                                .text_color(theme::lossless_gold),
+                        )
+                },
+            )
+            .otherwise(move || {
+                view()
+                    .px_2()
+                    .py_0p5()
+                    .rounded(px(5.0))
+                    .bg(move || theme::np_fg().opacity(0.08))
+                    .border_1()
+                    .border_color(move || theme::np_fg().opacity(0.14))
+                    .child(
+                        text(move || {
+                            let key = store.settings.with(|s| match s.audio_quality {
+                                Quality::Lossless | Quality::High => "player.quality.high",
+                                Quality::Standard => "player.quality.standard",
+                            });
+                            store.t(key)
+                        })
+                        .text_size(px(9.5))
+                        .font_weight(FontWeight::BOLD)
+                        .letter_spacing(px(0.4))
+                        .text_color(move || theme::np_fg().opacity(0.68)),
+                    )
+            })
+        }))
+        // Right: buffering spinner or `-MM:SS` remaining
+        .child(
+            when(
+                move || store.playback_status.with(PlaybackStatus::is_loading),
+                move || buffering_badge(store),
+            )
+            .otherwise(move || {
+                text(move || {
+                    let dur = store.duration_ms.get();
+                    let pos = store.position_ms.get().min(dur);
+                    let rem = dur.saturating_sub(pos);
+                    format!("-{}", format_duration_ms(rem as i64))
+                })
+                .tabular_nums()
+                .text_size(px(11.5))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(move || theme::np_fg().opacity(0.56))
+            }),
+        )
+}
+
+/// Generously spaced Phone thumb-zone transport (`Shuffle`, `Prev`, prominent Play/Pause circle,
+/// `Next`, `Repeat` — all `>= 44pt` touch targets, evenly distributed across 360..430pt width).
+pub(crate) fn phone_thumb_transport(store: AppStore, play_circle_pt: f32) -> View {
+    let play_glyph = (play_circle_pt * 0.44).clamp(22.0, 28.0);
+    let skip_glyph = if play_circle_pt >= 60.0 { 28.0 } else { 24.0 };
+    let aux_glyph = if play_circle_pt >= 60.0 { 20.0 } else { 18.0 };
+
+    let active_tint =
+        move || AdaptiveColor::from(theme::artwork_np_accent(store.current_accent.get()));
+
+    view().w_full().items_center().pt_0p5().child(
+        view()
+            .w_full()
+            .max_w(px(360.0))
+            .flex_row()
+            .items_center()
+            .justify_between()
+            // Shuffle (>= 44pt) with active indicator dot
+            .child(phone_toggle_transport_btn(
+                Icon::Shuffle,
+                aux_glyph,
+                move || store.shuffle.get(),
+                active_tint,
+                move || {
+                    if store.shuffle.get() {
+                        store.t("player.shuffle_on")
+                    } else {
+                        store.t("player.shuffle_off")
+                    }
+                },
+                move || store.toggle_shuffle(),
+            ))
+            // Previous (48pt)
+            .child(stage_icon_button(
+                Icon::Prev,
+                48.0,
+                skip_glyph,
+                theme::np_fg,
+                move || store.t("player.prev"),
+                move || store.prev_track(),
+            ))
+            // Prominent Play/Pause circle (64pt on Cover, 54pt on Stage/Wall)
+            .child(Elevated::elevation(
+                button()
+                    .accessibility_label(move || {
+                        Some(if store.is_playing.get() {
+                            store.t("player.pause")
+                        } else {
+                            store.t("player.play")
+                        })
+                    })
+                    .on_press(move || store.toggle_play())
+                    .size(px(play_circle_pt))
+                    .min_w(px(play_circle_pt))
+                    .min_h(px(play_circle_pt))
+                    .flex_shrink_0()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .bg(theme::np_fg)
+                    .transition_all()
+                    .duration(move || motion::transition_ms(120.0))
+                    .active(|s| s.scale(motion::press_scale))
+                    .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
+                    .child(
+                        when(
+                            move || store.playback_status.with(PlaybackStatus::is_loading),
+                            move || loading_spinner(play_glyph * 0.92, theme::np_bg),
+                        )
+                        .otherwise(move || {
+                            view()
+                                .pl(move || px(if store.is_playing.get() { 0.0 } else { 2.5 }))
+                                .child(icon_reactive(
+                                    move || {
+                                        if store.is_playing.get() {
+                                            Icon::Pause
+                                        } else {
+                                            Icon::Play
+                                        }
+                                    },
+                                    play_glyph,
+                                    theme::np_bg,
+                                ))
+                        }),
+                    ),
+                Elevation::Floating,
+            ))
+            // Next (48pt)
+            .child(stage_icon_button(
+                Icon::Next,
+                48.0,
+                skip_glyph,
+                theme::np_fg,
+                move || store.t("player.next"),
+                move || store.next_track(),
+            ))
+            // Repeat (>= 44pt) with active indicator dot
+            .child(phone_toggle_transport_btn(
+                move || match store.repeat.get() {
+                    RepeatMode::One => Icon::RepeatOne,
+                    RepeatMode::Off | RepeatMode::All => Icon::Repeat,
+                },
+                aux_glyph,
+                move || store.repeat.get() != RepeatMode::Off,
+                active_tint,
+                move || match store.repeat.get() {
+                    RepeatMode::Off => store.t("player.repeat_off"),
+                    RepeatMode::All => store.t("player.repeat_all"),
+                    RepeatMode::One => store.t("player.repeat_one"),
+                },
+                move || store.cycle_repeat(),
+            )),
+    )
+}
+
+fn phone_toggle_transport_btn(
+    glyph: impl IntoReactive<Icon>,
+    glyph_size: f32,
+    active: impl IntoReactive<bool>,
+    active_tint: impl IntoReactive<AdaptiveColor>,
+    label: impl IntoReactive<SharedString>,
+    on_press: impl Fn() + 'static,
+) -> impl IntoElement {
+    let active_rx = active.into_reactive();
+    let active_tint_rx = active_tint.into_reactive();
+    let label_rx = label.into_reactive();
+    let active_for_color = active_rx.clone();
+    let active_for_dot = active_rx.clone();
+    let tint_for_dot = active_tint_rx.clone();
+
+    button()
+        .selected(move || active_rx.get())
+        .accessibility_label(move || Some(label_rx.get()))
+        .on_press(on_press)
+        .min_w(px(44.0))
+        .min_h(px(44.0))
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .gap_0p5()
+        .rounded_full()
+        .bg(colors::TRANSPARENT)
+        .transition_all()
+        .duration(move || motion::transition_ms(120.0))
+        .active(|s| s.scale(motion::press_scale))
+        .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
+        .child(icon_reactive(glyph, glyph_size, move || {
+            if active_for_color.get() {
+                active_tint_rx.get()
+            } else {
+                theme::np_fg().opacity(0.54)
+            }
+        }))
+        .child(view().size(px(4.0)).rounded_full().bg(move || {
+            if active_for_dot.get() {
+                tint_for_dot.get()
+            } else {
+                colors::TRANSPARENT
+            }
+        }))
+}
+
+fn phone_more_subtabs(store: AppStore) -> View {
+    let is_episode = computed(move || {
+        store
+            .current_track
+            .with(|t| t.as_ref().is_some_and(Track::is_episode))
+    });
+
+    view()
+        .w_full()
+        .px(px(20.0))
         .flex_row()
         .items_center()
         .justify_center()
-        .gap_2()
+        .gap_1()
         .child(phone_subtab_pill(
             store,
             NowPlayingPanel::Queue,
             "now_playing.panel.queue",
         ))
         .child(when(
-            move || store.active_can("comments"),
-            move || phone_subtab_pill(store, NowPlayingPanel::Comments, "now_playing.panel.comments"),
+            move || !is_episode.get(),
+            move || phone_subtab_pill(store, NowPlayingPanel::Wall, "now_playing.panel.wall"),
         ))
         .child(when(
-            move || {
-                store
-                    .current_track
-                    .with(|t| t.as_ref().is_some_and(Track::is_episode))
-            },
-            move || phone_subtab_pill(store, NowPlayingPanel::Podcast, "now_playing.panel.podcast"),
+            move || store.active_can("comments"),
+            move || phone_comments_subtab_pill(store),
         ))
+        .child(when(is_episode, move || {
+            phone_subtab_pill(store, NowPlayingPanel::Podcast, "now_playing.panel.podcast")
+        }))
 }
 
 fn phone_subtab_pill(
@@ -581,7 +1261,10 @@ fn phone_subtab_pill(
     let active = move || {
         let cur = panels::effective_panel(store);
         if panel == NowPlayingPanel::Queue {
-            matches!(cur, NowPlayingPanel::Queue | NowPlayingPanel::Lyrics)
+            matches!(
+                cur,
+                NowPlayingPanel::Queue | NowPlayingPanel::Lyrics | NowPlayingPanel::Stage
+            )
         } else {
             cur == panel
         }
@@ -590,138 +1273,583 @@ fn phone_subtab_pill(
         .selected(active)
         .accessibility_label(move || Some(store.t(key)))
         .on_press(move || store.set_now_playing_panel(panel))
+        .min_w(px(44.0))
         .min_h(px(44.0))
+        .px(px(2.0))
+        .items_center()
+        .justify_center()
+        .bg(colors::TRANSPARENT)
+        .active(|s| s.scale(motion::press_scale))
+        .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
+        .child(
+            view()
+                .h(px(30.0))
+                .px_3p5()
+                .rounded_full()
+                .items_center()
+                .justify_center()
+                .bg(move || {
+                    if active() {
+                        theme::np_fg().opacity(0.16)
+                    } else {
+                        theme::np_fg().opacity(0.06)
+                    }
+                })
+                .border_1()
+                .border_color(move || {
+                    if active() {
+                        theme::np_fg().opacity(0.14)
+                    } else {
+                        colors::TRANSPARENT
+                    }
+                })
+                .transition_colors()
+                .duration(move || motion::transition_ms(140.0))
+                .child(
+                    text(move || store.t(key))
+                        .number_of_lines(1)
+                        .text_size(px(12.5))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(move || {
+                            if active() {
+                                theme::np_fg()
+                            } else {
+                                theme::np_fg().opacity(0.62)
+                            }
+                        }),
+                ),
+        )
+}
+
+fn phone_comments_subtab_pill(store: AppStore) -> impl IntoElement {
+    let active = move || panels::effective_panel(store) == NowPlayingPanel::Comments;
+    button()
+        .selected(active)
+        .accessibility_label(move || Some(store.t("now_playing.panel.comments")))
+        .on_press(move || store.set_now_playing_panel(NowPlayingPanel::Comments))
+        .min_w(px(44.0))
+        .min_h(px(44.0))
+        .px(px(2.0))
+        .items_center()
+        .justify_center()
+        .bg(colors::TRANSPARENT)
+        .active(|s| s.scale(motion::press_scale))
+        .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
+        .child(
+            view()
+                .h(px(30.0))
+                .px_3p5()
+                .rounded_full()
+                .items_center()
+                .justify_center()
+                .bg(move || {
+                    if active() {
+                        theme::np_fg().opacity(0.16)
+                    } else {
+                        theme::np_fg().opacity(0.06)
+                    }
+                })
+                .border_1()
+                .border_color(move || {
+                    if active() {
+                        theme::np_fg().opacity(0.14)
+                    } else {
+                        colors::TRANSPARENT
+                    }
+                })
+                .transition_colors()
+                .duration(move || motion::transition_ms(140.0))
+                .child(
+                    text(move || {
+                        let base = store.t("now_playing.panel.comments");
+                        let count = store
+                            .comments_total
+                            .get()
+                            .max(store.comments.with(Vec::len));
+                        if count > 0 {
+                            format!("{base} {}", format_compact_count(count))
+                        } else {
+                            base.to_string()
+                        }
+                    })
+                    .tabular_nums()
+                    .number_of_lines(1)
+                    .text_size(px(12.5))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(move || {
+                        if active() {
+                            theme::np_fg()
+                        } else {
+                            theme::np_fg().opacity(0.62)
+                        }
+                    }),
+                ),
+        )
+}
+
+// -----------------------------------------------------------------------------
+// Floating Minimalist Pane Tabs (`ui_nowplaying.go:1443-1566`)
+// -----------------------------------------------------------------------------
+
+fn floating_pane_tabs(store: AppStore, form: DeviceForm) -> View {
+    let touch = form.is_touch();
+    let is_episode = computed(move || {
+        store
+            .current_track
+            .with(|t| t.as_ref().is_some_and(Track::is_episode))
+    });
+
+    view()
+        .flex_row()
+        .items_center()
+        .gap_1p5()
+        // Song tabs: Lyrics · Stage · Up Next · Wall
+        .child(when(
+            move || !is_episode.get(),
+            move || {
+                view()
+                    .flex_row()
+                    .items_center()
+                    .gap_1p5()
+                    .child(floating_tab_btn(
+                        store,
+                        NowPlayingPanel::Lyrics,
+                        "now_playing.panel.lyrics",
+                        touch,
+                    ))
+                    .child(floating_tab_btn(
+                        store,
+                        NowPlayingPanel::Stage,
+                        "now_playing.panel.stage",
+                        touch,
+                    ))
+                    .child(floating_tab_btn(
+                        store,
+                        NowPlayingPanel::Queue,
+                        "now_playing.panel.queue",
+                        touch,
+                    ))
+                    .child(floating_tab_btn(
+                        store,
+                        NowPlayingPanel::Wall,
+                        "now_playing.panel.wall",
+                        touch,
+                    ))
+            },
+        ))
+        // Episode tabs: Podcast (About) · Up Next
+        .child(when(is_episode, move || {
+            view()
+                .flex_row()
+                .items_center()
+                .gap_1p5()
+                .child(floating_tab_btn(
+                    store,
+                    NowPlayingPanel::Podcast,
+                    "now_playing.panel.podcast",
+                    touch,
+                ))
+                .child(floating_tab_btn(
+                    store,
+                    NowPlayingPanel::Queue,
+                    "now_playing.panel.queue",
+                    touch,
+                ))
+        }))
+        // Capability-gated Comments tab with live count (`ui_nowplaying.go:1555-1562`)
+        .child(when(
+            move || store.active_can("comments"),
+            move || floating_comments_tab_btn(store, touch),
+        ))
+}
+
+fn floating_tab_btn(
+    store: AppStore,
+    panel: NowPlayingPanel,
+    i18n_key: &'static str,
+    touch: bool,
+) -> impl IntoElement {
+    let active = move || panels::effective_panel(store) == panel;
+
+    button()
+        .selected(active)
+        .accessibility_label(move || Some(store.t(i18n_key)))
+        .on_press(move || store.set_now_playing_panel(panel))
+        .min_h(px(if touch { 44.0 } else { 28.0 }))
         .px_3p5()
         .items_center()
         .justify_center()
         .rounded_full()
-        .border_1()
-        .border_color(move || {
-            if active() {
-                theme::primary()
-            } else {
-                theme::np_border()
-            }
-        })
         .bg(move || {
             if active() {
-                theme::primary_soft()
+                theme::np_fg().opacity(0.14)
             } else {
-                theme::np_surface()
+                colors::TRANSPARENT
             }
         })
+        .transition_colors()
+        .duration(move || motion::transition_ms(120.0))
+        .hover(|s| s.bg(move || theme::np_fg().opacity(0.08)))
         .active(|s| s.scale(motion::press_scale))
         .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
         .child(
-            text(move || store.t(key))
+            text(move || store.t(i18n_key))
                 .number_of_lines(1)
-                .text_size(px(font_size::CAPTION))
+                .text_size(px(13.0))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(move || {
                     if active() {
-                        theme::primary()
-                    } else {
                         theme::np_fg()
+                    } else {
+                        theme::np_fg().opacity(0.55)
                     }
                 }),
         )
 }
 
+fn floating_comments_tab_btn(store: AppStore, touch: bool) -> impl IntoElement {
+    let active = move || panels::effective_panel(store) == NowPlayingPanel::Comments;
+
+    button()
+        .selected(active)
+        .accessibility_label(move || Some(store.t("now_playing.panel.comments")))
+        .on_press(move || store.set_now_playing_panel(NowPlayingPanel::Comments))
+        .min_h(px(if touch { 44.0 } else { 28.0 }))
+        .px_3p5()
+        .flex_row()
+        .items_center()
+        .justify_center()
+        .gap_1()
+        .rounded_full()
+        .bg(move || {
+            if active() {
+                theme::np_fg().opacity(0.14)
+            } else {
+                colors::TRANSPARENT
+            }
+        })
+        .transition_colors()
+        .duration(move || motion::transition_ms(120.0))
+        .hover(|s| s.bg(move || theme::np_fg().opacity(0.08)))
+        .active(|s| s.scale(motion::press_scale))
+        .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
+        .child(
+            text(move || {
+                let base = store.t("now_playing.panel.comments");
+                let count = store
+                    .comments_total
+                    .get()
+                    .max(store.comments.with(Vec::len));
+                if count > 0 {
+                    format!("{base} {}", format_compact_count(count))
+                } else {
+                    base.to_string()
+                }
+            })
+            .tabular_nums()
+            .number_of_lines(1)
+            .text_size(px(13.0))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(move || {
+                if active() {
+                    theme::np_fg()
+                } else {
+                    theme::np_fg().opacity(0.55)
+                }
+            }),
+        )
+}
+
+fn format_compact_count(n: usize) -> String {
+    if n >= 10_000 {
+        format!("{:.1}w", n as f64 / 10_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
 // -----------------------------------------------------------------------------
-// Shared Stage Controls (Mode Switcher, Track Info, Scrubber, Transport, Volume)
+// Compact Cover / Vinyl / Cassette Pills (under centerpiece, never crowding top bar)
 // -----------------------------------------------------------------------------
 
-fn mode_switcher(store: AppStore, compact: bool) -> View {
-    let modes: &[(NowPlayingMode, Icon, &str)] = &[
-        (NowPlayingMode::Cover, Icon::Disc, "now_playing.mode.cover"),
-        (NowPlayingMode::Vinyl, Icon::Vinyl, "now_playing.mode.vinyl"),
-        (
-            NowPlayingMode::Cassette,
-            Icon::Cassette,
-            "now_playing.mode.cassette",
-        ),
+fn compact_mode_pills(store: AppStore, touch: bool) -> View {
+    let modes: &[(NowPlayingMode, &str)] = &[
+        (NowPlayingMode::Cover, "now_playing.mode.cover"),
+        (NowPlayingMode::Vinyl, "now_playing.mode.vinyl"),
+        (NowPlayingMode::Cassette, "now_playing.mode.cassette"),
     ];
 
     view()
         .flex_row()
         .items_center()
         .gap_1()
-        .p_1()
-        .rounded_full()
-        .bg(theme::np_surface)
-        .border_1()
-        .border_color(theme::np_border)
-        .children(modes.iter().copied().map(move |(mode, glyph, i18n_key)| {
+        .children(modes.iter().copied().map(move |(mode, key)| {
             let active = move || store.now_playing_mode.get() == mode;
-            let min_h = move || {
-                if compact || theme::detect_device_form().is_touch() {
-                    px(44.0)
-                } else {
-                    px(30.0)
-                }
-            };
             button()
                 .selected(active)
-                .accessibility_label(move || Some(store.t(i18n_key)))
+                .accessibility_label(move || Some(store.t(key)))
                 .on_press(move || store.set_now_playing_mode(mode))
-                .min_h(min_h)
-                .px_3()
-                .flex_row()
+                .min_h(px(if touch { 44.0 } else { 24.0 }))
+                .min_w(px(if touch { 44.0 } else { 0.0 }))
+                .px(px(if touch { 2.0 } else { 0.0 }))
                 .items_center()
-                .gap_1p5()
-                .rounded_full()
-                .bg(move || {
-                    if active() {
-                        theme::np_surface_hover()
-                    } else {
-                        colors::TRANSPARENT
-                    }
-                })
-                .border_1()
-                .border_color(move || {
-                    if active() {
-                        theme::np_border()
-                    } else {
-                        colors::TRANSPARENT
-                    }
-                })
-                .transition_all()
-                .duration(move || motion::transition_ms(140.0))
-                .hover(|s| s.bg(theme::np_surface_hover))
+                .justify_center()
+                .bg(colors::TRANSPARENT)
                 .active(|s| s.scale(motion::press_scale))
                 .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
-                .child(icon_reactive(glyph, 14.0, move || {
-                    if active() {
-                        theme::np_fg()
-                    } else {
-                        theme::np_muted()
-                    }
-                }))
                 .child(
-                    text(move || store.t(i18n_key))
-                        .number_of_lines(1)
-                        .text_size(px(font_size::CAPTION))
-                        .font_weight(FontWeight::MEDIUM)
-                        .style_when(active, |s| s.font_weight(FontWeight::SEMIBOLD))
-                        .text_color(move || {
+                    view()
+                        .h(px(if touch { 28.0 } else { 24.0 }))
+                        .px(px(if touch { 12.0 } else { 10.0 }))
+                        .rounded_full()
+                        .items_center()
+                        .justify_center()
+                        .bg(move || {
                             if active() {
-                                theme::np_fg()
+                                theme::np_fg().opacity(if touch { 0.16 } else { 0.12 })
+                            } else if touch {
+                                theme::np_fg().opacity(0.06)
                             } else {
-                                theme::np_muted()
+                                colors::TRANSPARENT
                             }
-                        }),
+                        })
+                        .border_1()
+                        .border_color(move || {
+                            if touch && active() {
+                                theme::np_fg().opacity(0.14)
+                            } else {
+                                colors::TRANSPARENT
+                            }
+                        })
+                        .transition_colors()
+                        .duration(move || motion::transition_ms(120.0))
+                        .hover(|s| s.bg(move || theme::np_fg().opacity(0.10)))
+                        .child(
+                            text(move || store.t(key))
+                                .number_of_lines(1)
+                                .text_size(px(if touch { 12.0 } else { 11.5 }))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(move || {
+                                    if active() {
+                                        theme::np_fg().opacity(0.95)
+                                    } else {
+                                        theme::np_fg().opacity(if touch { 0.56 } else { 0.45 })
+                                    }
+                                }),
+                        ),
                 )
         }))
 }
 
+// -----------------------------------------------------------------------------
+// Shared Stage Controls (Clickable Artists, Song Menu, Scrubber/Lossless, Transport, Volume)
+// -----------------------------------------------------------------------------
+
+/// Clickable artist links navigating to `Route::ArtistDetail` (closing Now Playing first),
+/// matching `mygo-music` `artistLinks`.
+pub(crate) fn clickable_artist_links(store: AppStore, size_pt: f32, muted_alpha: f32) -> View {
+    view().w_full().min_w(px(0.0)).child(dynamic(move || {
+        let artists = store
+            .current_track
+            .with(|t| t.as_ref().map(|tr| tr.artists.clone()).unwrap_or_default());
+        let can_artist = store.active_can("artist");
+        let fallback = store.t("track.unknown_artist");
+
+        untracked(|| {
+            let valid: Vec<_> = artists
+                .into_iter()
+                .filter(|a| !a.name.trim().is_empty())
+                .collect();
+            if valid.is_empty() {
+                return view().child(
+                    text(fallback)
+                        .number_of_lines(1)
+                        .text_size(px(size_pt))
+                        .text_color(move || theme::np_fg().opacity(muted_alpha)),
+                );
+            }
+
+            let len = valid.len();
+            let mut row = view().w_full().flex_row().items_center().flex_wrap();
+            for (i, ar) in valid.into_iter().enumerate() {
+                let is_clickable = can_artist && !ar.id.is_empty();
+                let name = SharedString::from(ar.name.clone());
+                if is_clickable {
+                    let aid = ar.id.clone();
+                    let label_a11y = name.clone();
+                    row = row.child(
+                        button()
+                            .accessibility_label(Some(label_a11y))
+                            .hit_slop(EdgeInsets::all(px(10.0)))
+                            .on_press(move || {
+                                store.close_now_playing();
+                                store.navigate(Route::ArtistDetail { id: aid.clone() });
+                            })
+                            .bg(colors::TRANSPARENT)
+                            .hover(|s| s.text_color(theme::np_fg))
+                            .active(|s| s.opacity(0.75))
+                            .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
+                            .child(
+                                text(name)
+                                    .number_of_lines(1)
+                                    .text_size(px(size_pt))
+                                    .text_color(move || theme::np_fg().opacity(muted_alpha)),
+                            ),
+                    );
+                } else {
+                    row = row.child(
+                        text(name)
+                            .number_of_lines(1)
+                            .text_size(px(size_pt))
+                            .text_color(move || theme::np_fg().opacity(muted_alpha)),
+                    );
+                }
+                if i + 1 < len {
+                    row = row.child(
+                        text(", ")
+                            .text_size(px(size_pt))
+                            .text_color(move || theme::np_fg().opacity(muted_alpha)),
+                    );
+                }
+            }
+            row
+        })
+    }))
+}
+
+/// `···` song action menu (`Play Next`, `Add to Queue`, `Go to Artist`, `Go to Album`,
+/// `Copy Title`, `Download`) matching `mygo-music` `songMenu`.
+pub(crate) fn song_more_menu(store: AppStore, glyph_size: f32, touch: bool) -> View {
+    let target = if touch { 44.0 } else { 32.0 };
+
+    view().flex_shrink_0().child(dynamic(move || {
+        let track_opt = store.current_track.get();
+        let _loc = store.locale.get();
+
+        let Some(tr) = track_opt else {
+            return view();
+        };
+
+        let mut actions = vec![
+            ContextMenuAction::new(store.t("player.play_next"), {
+                let t = tr.clone();
+                move || store.enqueue_next(t.clone())
+            })
+            .icon(Icon::Queue),
+            ContextMenuAction::new(store.t("player.add_to_queue"), {
+                let t = tr.clone();
+                move || store.enqueue(t.clone())
+            })
+            .icon(Icon::Plus),
+        ];
+
+        // Navigation links (close Now Playing cleanly before navigating)
+        let mut first_nav = true;
+        if !tr.show_id.is_empty() && store.active_can("show") {
+            let sid = tr.show_id.clone();
+            let mut act = ContextMenuAction::new(store.t("track.go_to_podcast"), move || {
+                store.close_now_playing();
+                store.navigate(Route::ShowDetail { id: sid.clone() });
+            })
+            .icon(Icon::Podcast);
+            if first_nav {
+                act = act.separator_before();
+                first_nav = false;
+            }
+            actions.push(act);
+        }
+        if let Some(ar) = tr.artists.first()
+            && !ar.id.is_empty()
+            && store.active_can("artist")
+        {
+            let aid = ar.id.clone();
+            let mut act = ContextMenuAction::new(store.t("now_playing.go_to_artist"), move || {
+                store.close_now_playing();
+                store.navigate(Route::ArtistDetail { id: aid.clone() });
+            })
+            .icon(Icon::User);
+            if first_nav {
+                act = act.separator_before();
+                first_nav = false;
+            }
+            actions.push(act);
+        }
+        if !tr.album.id.is_empty() && store.active_can("album") {
+            let aid = tr.album.id.clone();
+            let mut act = ContextMenuAction::new(store.t("now_playing.go_to_album"), move || {
+                store.close_now_playing();
+                store.navigate(Route::AlbumDetail { id: aid.clone() });
+            })
+            .icon(Icon::Disc);
+            if first_nav {
+                act = act.separator_before();
+            }
+            actions.push(act);
+        }
+
+        // Copy & Download actions
+        actions.push(
+            ContextMenuAction::new(store.t("track.copy_title"), {
+                let t = tr.clone();
+                move || store.copy_track_title(&t)
+            })
+            .separator_before(),
+        );
+        actions.push(ContextMenuAction::new(
+            store.t("track.copy_title_artists"),
+            {
+                let t = tr.clone();
+                move || store.copy_track_title_and_artists(&t)
+            },
+        ));
+        if !tr.url.is_empty() {
+            actions.push(
+                ContextMenuAction::new(store.t("track.copy_link"), {
+                    let t = tr.clone();
+                    move || store.copy_track_link(&t)
+                })
+                .icon(Icon::External),
+            );
+        }
+        if store.can_download_track(&tr) {
+            actions.push(
+                ContextMenuAction::new(store.t("track.download"), {
+                    let t = tr.clone();
+                    move || store.download_track(t.clone())
+                })
+                .icon(Icon::Download),
+            );
+        }
+
+        let trigger = button()
+            .accessibility_label(move || Some(store.t("common.more")))
+            .min_w(px(target))
+            .min_h(px(target))
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .bg(colors::TRANSPARENT)
+            .transition_colors()
+            .duration(move || motion::transition_ms(120.0))
+            .hover(|s| s.bg(move || theme::np_fg().opacity(0.10)))
+            .active(|s| s.scale(motion::press_scale))
+            .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
+            .child(icon(Icon::MoreHorizontal, glyph_size, colors::NP_FG).opacity(0.70));
+
+        view().child(styled_menu(trigger, actions))
+    }))
+}
+
 fn track_meta_row(store: AppStore, form: DeviceForm, compact: bool) -> View {
-    let like_size = if form.is_touch() { 44.0 } else { 40.0 };
+    let touch = form.is_touch();
     view()
         .w_full()
         .flex_row()
         .items_center()
         .justify_between()
-        .gap_3()
+        .gap_2()
         .child(
             view()
                 .flex_1()
@@ -736,44 +1864,23 @@ fn track_meta_row(store: AppStore, form: DeviceForm, compact: bool) -> View {
                         })
                     })
                     .number_of_lines(1)
-                    .text_size(px(if compact {
-                        font_size::TITLE
-                    } else {
-                        font_size::TITLE_LG
-                    }))
+                    .text_size(px(if compact { 19.0 } else { 22.0 }))
                     .font_weight(FontWeight::BOLD)
+                    .letter_spacing(px(-0.3))
                     .text_color(theme::np_fg),
                 )
-                .child(
-                    text(move || {
-                        let fallback_artist = store.t("track.unknown_artist");
-                        store.current_track.with(|t| {
-                            t.as_ref()
-                                .map(|tr| {
-                                    let raw_artist = tr.artist_names();
-                                    let artist = if raw_artist.is_empty() {
-                                        fallback_artist.to_string()
-                                    } else {
-                                        raw_artist
-                                    };
-                                    if !tr.album.name.is_empty() && !compact {
-                                        SharedString::from(format!("{artist} · {}", tr.album.name))
-                                    } else {
-                                        SharedString::from(artist)
-                                    }
-                                })
-                                .unwrap_or_default()
-                        })
-                    })
-                    .number_of_lines(1)
-                    .text_size(px(font_size::BODY))
-                    .text_color(theme::np_muted),
-                ),
+                .child(clickable_artist_links(
+                    store,
+                    if compact { 14.0 } else { 15.0 },
+                    0.60,
+                )),
         )
-        .children((!compact).then(|| stage_like_button(store, like_size)))
+        .child(stage_like_button(store, 20.0, touch))
+        .children((!compact).then(|| song_more_menu(store, 20.0, touch)))
 }
 
-fn stage_scrubber(store: AppStore) -> impl IntoElement {
+/// Smoke-enabled scrubber wired to `store.settings.smoke_progress`, `is_playing`, and `current_accent`.
+pub(crate) fn stage_scrubber_bar(store: AppStore, show_labels: bool) -> impl IntoElement {
     let buffered_ratio = move || {
         let dur = store.duration_ms.get();
         if dur == 0 {
@@ -788,29 +1895,129 @@ fn stage_scrubber(store: AppStore) -> impl IntoElement {
         .smoke_mode(move || store.settings.with(|s| s.smoke_progress))
         .playing(move || store.is_playing.get())
         .accent(move || store.current_accent.get())
-        .spectrum(store.spectrum)
-        .show_labels(true)
+        .show_labels(show_labels)
         .on_dark_stage(true)
         .on_seek(move |ms| store.seek(ms))
 }
 
-fn transport_controls(store: AppStore, form: DeviceForm, play_diameter: f32) -> View {
-    let touch = form.is_touch();
-    let aux_btn = if touch { 44.0 } else { 36.0 };
-    let skip_btn = if touch { 48.0 } else { 40.0 };
-
+/// Dedicated `16pt` row under the scrubber: elapsed · gold `Lossless` badge · remaining/Buffering
+/// (`ui_nowplaying.go:1331-1341`, constant height so column never jumps when lossless toggles).
+fn scrubber_meta_row(store: AppStore) -> View {
     view()
         .w_full()
+        .h(px(18.0))
+        .mt_0p5()
         .flex_row()
         .items_center()
         .justify_between()
-        .gap_2()
+        // Left: elapsed time
+        .child(
+            text(move || format_duration_ms(store.position_ms.get() as i64))
+                .tabular_nums()
+                .text_size(px(11.0))
+                .text_color(move || theme::np_fg().opacity(0.50)),
+        )
+        // Center: gold `Lossless` badge (`ui_nowplaying.go:1501-1507`)
+        .child(when(
+            move || store.current_is_lossless.get(),
+            move || {
+                view()
+                    .px_1p5()
+                    .py_0p5()
+                    .rounded(px(4.0))
+                    .border_1()
+                    .border_color(move || theme::lossless_gold().opacity(0.55))
+                    .child(
+                        text(move || store.t("player.lossless"))
+                            .text_size(px(9.5))
+                            .font_weight(FontWeight::EXTRA_BOLD)
+                            .letter_spacing(px(0.6))
+                            .text_color(theme::lossless_gold),
+                    )
+            },
+        ))
+        // Right: animated `loading_spinner` + `Buffering…` when loading, else `-MM:SS` remaining
+        .child(
+            when(
+                move || store.playback_status.with(PlaybackStatus::is_loading),
+                move || buffering_badge(store),
+            )
+            .otherwise(move || {
+                text(move || {
+                    let dur = store.duration_ms.get();
+                    let pos = store.position_ms.get().min(dur);
+                    let rem = dur.saturating_sub(pos);
+                    format!("-{}", format_duration_ms(rem as i64))
+                })
+                .tabular_nums()
+                .text_size(px(11.0))
+                .text_color(move || theme::np_fg().opacity(0.50))
+            }),
+        )
+}
+
+/// Animated spinner + localized `player.buffering` indicator (`#63`).
+pub(crate) fn buffering_badge(store: AppStore) -> View {
+    view()
+        .flex_row()
+        .items_center()
+        .gap_1()
+        .child(loading_spinner(11.0, move || theme::np_fg().opacity(0.65)))
+        .child(
+            text(move || store.t("player.buffering"))
+                .text_size(px(11.0))
+                .text_color(move || theme::np_fg().opacity(0.60)),
+        )
+}
+
+/// Clean borderless white transport (`ui_player.go:2158-2188`):
+/// Shuffle (`0.62x`), Prev (`0.85x`), pure white Play/Pause (`1.25x` — NO red circle!),
+/// Next (`0.85x`), Repeat (`0.62x`). Active Shuffle/Repeat tint with `artwork_np_accent`
+/// on the main split stage or pure white on `stageBar`/`wallBar`.
+pub(crate) fn stage_transport(
+    store: AppStore,
+    form: DeviceForm,
+    size_pt: f32,
+    tint_active_with_accent: bool,
+) -> View {
+    let touch = form.is_touch();
+    let aux_box = if touch {
+        44.0
+    } else {
+        (size_pt * 1.15).max(32.0)
+    };
+    let skip_box = if touch {
+        44.0
+    } else {
+        (size_pt * 1.35).max(36.0)
+    };
+    let play_box = if touch {
+        52.0
+    } else {
+        (size_pt * 1.60).max(42.0)
+    };
+    let gap = if touch { 12.0 } else { size_pt * 0.50 };
+
+    let active_tint = move || {
+        if tint_active_with_accent {
+            AdaptiveColor::from(theme::artwork_np_accent(store.current_accent.get()))
+        } else {
+            theme::np_fg()
+        }
+    };
+
+    view()
+        .flex_row()
+        .items_center()
+        .justify_center()
+        .gap(px(gap))
         // Shuffle
         .child(stage_toggle_icon(
             Icon::Shuffle,
-            aux_btn,
-            18.0,
+            aux_box,
+            size_pt * 0.62,
             move || store.shuffle.get(),
+            active_tint,
             move || {
                 if store.shuffle.get() {
                     store.t("player.shuffle_on")
@@ -820,44 +2027,77 @@ fn transport_controls(store: AppStore, form: DeviceForm, play_diameter: f32) -> 
             },
             move || store.toggle_shuffle(),
         ))
-        // Previous Track
+        // Previous
         .child(stage_icon_button(
             Icon::Prev,
-            skip_btn,
-            22.0,
+            skip_box,
+            size_pt * 0.85,
+            theme::np_fg,
             move || store.t("player.prev"),
             move || store.prev_track(),
         ))
-        // Play / Pause Primary Morph Button
-        .child(play_pause_button(
-            store.is_playing,
-            play_diameter,
-            move || {
-                if store.is_playing.get() {
-                    store.t("player.pause")
-                } else {
-                    store.t("player.play")
-                }
-            },
-            move || store.toggle_play(),
-        ))
-        // Next Track
+        // Pure white borderless Play / Pause (shows spinner if buffering)
+        .child(
+            button()
+                .accessibility_label(move || {
+                    Some(if store.is_playing.get() {
+                        store.t("player.pause")
+                    } else {
+                        store.t("player.play")
+                    })
+                })
+                .on_press(move || store.toggle_play())
+                .min_w(px(play_box))
+                .min_h(px(play_box))
+                .flex_shrink_0()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .bg(colors::TRANSPARENT)
+                .transition_all()
+                .duration(move || motion::transition_ms(120.0))
+                .hover(|s| s.bg(move || theme::np_fg().opacity(0.10)))
+                .active(|s| s.scale(motion::press_scale))
+                .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
+                .child(
+                    when(
+                        move || store.playback_status.with(PlaybackStatus::is_loading),
+                        move || loading_spinner(size_pt * 1.05, theme::np_fg),
+                    )
+                    .otherwise(move || {
+                        icon_reactive(
+                            move || {
+                                if store.is_playing.get() {
+                                    Icon::Pause
+                                } else {
+                                    Icon::Play
+                                }
+                            },
+                            size_pt * 1.25,
+                            theme::np_fg,
+                        )
+                    }),
+                ),
+        )
+        // Next
         .child(stage_icon_button(
             Icon::Next,
-            skip_btn,
-            22.0,
+            skip_box,
+            size_pt * 0.85,
+            theme::np_fg,
             move || store.t("player.next"),
             move || store.next_track(),
         ))
-        // Repeat Cycle
+        // Repeat
         .child(stage_toggle_icon(
             move || match store.repeat.get() {
                 RepeatMode::One => Icon::RepeatOne,
                 RepeatMode::Off | RepeatMode::All => Icon::Repeat,
             },
-            aux_btn,
-            18.0,
+            aux_box,
+            size_pt * 0.62,
             move || store.repeat.get() != RepeatMode::Off,
+            active_tint,
             move || match store.repeat.get() {
                 RepeatMode::Off => store.t("player.repeat_off"),
                 RepeatMode::All => store.t("player.repeat_all"),
@@ -867,7 +2107,9 @@ fn transport_controls(store: AppStore, form: DeviceForm, play_diameter: f32) -> 
         ))
 }
 
-fn volume_bar(store: AppStore, form: DeviceForm, slider_max_w: f32) -> View {
+/// Slim centered volume bar matching `mygo-music` `volumeSlider` (`ui_player.go:2135-2155`) —
+/// speaker mute toggle + clean `180pt` 4pt->5pt slider, ZERO `%` text noise.
+fn volume_bar(store: AppStore, form: DeviceForm, slider_w: f32) -> View {
     let eff_volume = move || {
         if store.muted.get() {
             0.0_f64
@@ -875,14 +2117,13 @@ fn volume_bar(store: AppStore, form: DeviceForm, slider_max_w: f32) -> View {
             store.volume.get() as f64
         }
     };
-    let mute_size = if form.is_touch() { 44.0 } else { 34.0 };
+    let mute_size = if form.is_touch() { 44.0 } else { 28.0 };
 
     view()
-        .w_full()
         .flex_row()
         .items_center()
         .justify_center()
-        .gap_2p5()
+        .gap_1p5()
         .child(stage_icon_button(
             move || {
                 if store.muted.get() || store.volume.get() <= 0.001 {
@@ -892,7 +2133,8 @@ fn volume_bar(store: AppStore, form: DeviceForm, slider_max_w: f32) -> View {
                 }
             },
             mute_size,
-            17.0,
+            16.0,
+            move || theme::np_fg().opacity(0.70),
             move || {
                 if store.muted.get() {
                     store.t("player.unmute")
@@ -903,7 +2145,7 @@ fn volume_bar(store: AppStore, form: DeviceForm, slider_max_w: f32) -> View {
             move || store.toggle_mute(),
         ))
         .child(
-            view().flex_1().max_w(px(slider_max_w)).child(
+            view().w(px(slider_w)).group().child(
                 slider()
                     .value(move || Some(SliderValue::Single(eff_volume())))
                     .min(0.0)
@@ -923,33 +2165,33 @@ fn volume_bar(store: AppStore, form: DeviceForm, slider_max_w: f32) -> View {
                                 if theme::detect_device_form().is_touch() {
                                     px(44.0)
                                 } else {
-                                    px(22.0)
+                                    px(18.0)
                                 }
                             })
                             .justify_center()
                     })
-                    .indicator_style(|s| s.w_full().h(px(4.0)).rounded_full().bg(theme::np_surface))
-                    .range_style(|s| s.rounded_full().bg(theme::np_fg))
-                    .thumb_class("hover:scale-115 active:scale-125 focus-visible:outline-2 focus-visible:outline-ring")
+                    .indicator_style(|s| {
+                        s.w_full()
+                            .h(px(4.0))
+                            .rounded_full()
+                            .bg(move || theme::np_fg().opacity(0.18))
+                            .transition_all()
+                            .duration(move || motion::transition_ms(120.0))
+                            .group_hover(|g| g.h(px(5.0)))
+                    })
+                    .range_style(|s| s.rounded_full().bg(move || theme::np_fg().opacity(0.72)))
                     .thumb_style(|s| {
-                        s.size(px(12.0))
+                        s.size(px(10.0))
                             .rounded_full()
                             .bg(colors::NP_FG)
-                            .shadow_sm()
+                            .opacity(0.0)
+                            .group_hover(|g| g.opacity(1.0))
                     }),
             ),
         )
-        .child(
-            text(move || format!("{}%", (eff_volume() * 100.0).round() as u32))
-                .tabular_nums()
-                .w(px(34.0))
-                .text_right()
-                .text_size(px(font_size::MICRO))
-                .text_color(theme::np_muted),
-        )
 }
 
-fn stage_like_button(store: AppStore, box_size: f32) -> impl IntoElement {
+pub(crate) fn stage_like_button(store: AppStore, glyph_size: f32, touch: bool) -> impl IntoElement {
     let is_liked = computed(move || {
         store
             .current_track
@@ -965,7 +2207,7 @@ fn stage_like_button(store: AppStore, box_size: f32) -> impl IntoElement {
         }
     });
 
-    let target_size = move || px(box_size.max(theme::detect_device_form().min_touch_target()));
+    let target_size = if touch { 44.0 } else { 32.0 };
 
     button()
         .selected(is_liked)
@@ -977,15 +2219,15 @@ fn stage_like_button(store: AppStore, box_size: f32) -> impl IntoElement {
             })
         })
         .on_press(move || store.toggle_like_current())
-        .min_w(target_size)
-        .min_h(target_size)
+        .min_w(px(target_size))
+        .min_h(px(target_size))
         .flex_shrink_0()
         .items_center()
         .justify_center()
         .rounded_full()
         .bg(colors::TRANSPARENT)
-        .hover(|s| s.bg(theme::np_surface_hover))
-        .active(|s| s.bg(theme::np_surface))
+        .hover(|s| s.bg(move || theme::np_fg().opacity(0.10)))
+        .active(|s| s.scale(motion::press_scale))
         .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
         .child(
             view()
@@ -999,12 +2241,12 @@ fn stage_like_button(store: AppStore, box_size: f32) -> impl IntoElement {
                             Icon::Heart
                         }
                     },
-                    20.0,
+                    glyph_size,
                     move || {
                         if is_liked.get() {
                             theme::primary()
                         } else {
-                            theme::np_muted()
+                            theme::np_fg().opacity(0.70)
                         }
                     },
                 )),
@@ -1015,11 +2257,13 @@ fn stage_icon_button(
     glyph: impl IntoReactive<Icon>,
     box_size: f32,
     glyph_size: f32,
+    tint: impl IntoReactive<AdaptiveColor>,
     label: impl IntoReactive<SharedString>,
     on_press: impl Fn() + 'static,
 ) -> impl IntoElement {
     let label_rx = label.into_reactive();
     let target_size = move || px(box_size.max(theme::detect_device_form().min_touch_target()));
+
     button()
         .accessibility_label(move || Some(label_rx.get()))
         .on_press(on_press)
@@ -1031,11 +2275,11 @@ fn stage_icon_button(
         .rounded_full()
         .bg(colors::TRANSPARENT)
         .transition_all()
-        .duration(move || motion::transition_ms(140.0))
-        .hover(|s| s.bg(theme::np_surface_hover))
-        .active(|s| s.bg(theme::np_surface).scale(motion::press_scale))
+        .duration(move || motion::transition_ms(120.0))
+        .hover(|s| s.bg(move || theme::np_fg().opacity(0.10)))
+        .active(|s| s.scale(motion::press_scale))
         .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
-        .child(icon_reactive(glyph, glyph_size, theme::np_fg))
+        .child(icon_reactive(glyph, glyph_size, tint))
 }
 
 fn stage_toggle_icon(
@@ -1043,13 +2287,14 @@ fn stage_toggle_icon(
     box_size: f32,
     glyph_size: f32,
     active: impl IntoReactive<bool>,
+    active_tint: impl IntoReactive<AdaptiveColor>,
     label: impl IntoReactive<SharedString>,
     on_press: impl Fn() + 'static,
 ) -> impl IntoElement {
     let active_rx = active.into_reactive();
+    let active_tint_rx = active_tint.into_reactive();
     let label_rx = label.into_reactive();
-    let active_tint = active_rx.clone();
-    let active_dot = active_rx.clone();
+    let active_for_color = active_rx.clone();
     let target_size = move || px(box_size.max(theme::detect_device_form().min_touch_target()));
 
     button()
@@ -1064,24 +2309,15 @@ fn stage_toggle_icon(
         .rounded_full()
         .bg(colors::TRANSPARENT)
         .transition_all()
-        .duration(move || motion::transition_ms(140.0))
-        .hover(|s| s.bg(theme::np_surface_hover))
-        .active(|s| s.bg(theme::np_surface).scale(motion::press_scale))
+        .duration(move || motion::transition_ms(120.0))
+        .hover(|s| s.bg(move || theme::np_fg().opacity(0.10)))
+        .active(|s| s.scale(motion::press_scale))
         .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
-        .child(
-            view()
-                .items_center()
-                .gap_0p5()
-                .pointer_events(PointerEvents::None)
-                .child(icon_reactive(glyph, glyph_size, move || {
-                    if active_tint.get() {
-                        theme::primary()
-                    } else {
-                        theme::np_muted()
-                    }
-                }))
-                .child(when(move || active_dot.get(), || {
-                    view().size(px(4.0)).rounded_full().bg(theme::primary)
-                })),
-        )
+        .child(icon_reactive(glyph, glyph_size, move || {
+            if active_for_color.get() {
+                active_tint_rx.get()
+            } else {
+                theme::np_fg().opacity(0.45)
+            }
+        }))
 }

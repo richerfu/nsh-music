@@ -2,8 +2,9 @@
 //! `Signal`s and coordinating `LocalMusicSource`, `PluginManager`,
 //! `AudioEngine`, and `ArtworkLoader`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -18,15 +19,18 @@ use nsh_music_core::{
     local::LocalMusicSource,
     lyrics::{ActiveLyric, ParsedLyrics, parse_lyrics},
     model::{
-        Account, Album, AlbumPage, ArtistPage, Browse, Comment, PlayerStyle, Playlist, Quality,
-        RemoteDevice, RepeatMode, SearchKind, SearchResult, Show, ShowPage, SignInPrompt,
-        SourceInfo, StageStyle, Station, Track,
+        Account, Album, AlbumPage, Artist, ArtistPage, Browse, Comment, PlayerStyle, Playlist,
+        Quality, RemoteDevice, RepeatMode, SearchKind, SearchResult, Show, ShowPage, SignInPrompt,
+        SourceError, SourceInfo, StageStyle, Station, Track,
     },
     session::PlaybackSession,
     settings::{AppSettings, ThemeMode},
     source::{MusicSource, RequestKind, SourceCompat},
 };
-use nsh_music_plugin::{PendingPluginInstall, PluginManager, PluginSummary};
+use nsh_music_plugin::{
+    PendingPluginInstall, PluginManager, PluginSummary,
+    host::{WebSignInRequest, WebSignInResult},
+};
 
 use crate::state::artwork::ArtworkLoader;
 use crate::ui::{overlays::ToastController, theme};
@@ -75,6 +79,52 @@ const CAPABILITY_KEYS: &[&str] = &[
     "remotePlay",
 ];
 
+/// Sections inside the Settings window (Desktop), Settings split view (Pad),
+/// and Settings drill-down detail pages (Phone).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum SettingsSection {
+    #[default]
+    General,
+    Plugins,
+    Playback,
+    Cache,
+    Experiments,
+    About,
+}
+
+impl SettingsSection {
+    pub const ALL: [Self; 6] = [
+        Self::General,
+        Self::Plugins,
+        Self::Playback,
+        Self::Cache,
+        Self::Experiments,
+        Self::About,
+    ];
+
+    pub fn key(&self) -> &'static str {
+        match self {
+            Self::General => "general",
+            Self::Plugins => "plugins",
+            Self::Playback => "playback",
+            Self::Cache => "cache",
+            Self::Experiments => "experiments",
+            Self::About => "about",
+        }
+    }
+
+    pub fn title_key(&self) -> &'static str {
+        match self {
+            Self::General => "settings.section.general",
+            Self::Plugins => "settings.section.plugins",
+            Self::Playback => "settings.section.playback",
+            Self::Cache => "settings.section.cache",
+            Self::Experiments => "settings.section.experiments",
+            Self::About => "settings.section.about",
+        }
+    }
+}
+
 /// Top-level navigation destinations across PC, Pad, and Phone shells.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub enum Route {
@@ -105,6 +155,7 @@ pub enum Route {
     Recent,
     Local,
     Settings,
+    SettingsDetail(SettingsSection),
     Plugins,
 }
 
@@ -127,6 +178,7 @@ impl Route {
             Self::Recent => "recent".to_owned(),
             Self::Local => "local".to_owned(),
             Self::Settings => "settings".to_owned(),
+            Self::SettingsDetail(section) => format!("settings:{}", section.key()),
             Self::Plugins => "plugins".to_owned(),
         }
     }
@@ -149,6 +201,7 @@ impl Route {
             Self::Recent => "nav.recent",
             Self::Local => "nav.local",
             Self::Settings => "nav.settings",
+            Self::SettingsDetail(section) => section.title_key(),
             Self::Plugins => "nav.plugins",
         }
     }
@@ -219,7 +272,9 @@ impl NowPlayingStageStyle {
 pub enum NowPlayingPanel {
     #[default]
     Lyrics,
+    Stage,
     Queue,
+    Wall,
     Comments,
     Podcast,
 }
@@ -245,6 +300,10 @@ pub enum ActiveModal {
         source_id: String,
         url: String,
         title: String,
+        cookies_of: Option<String>,
+        until: Vec<String>,
+        user_agent: Option<String>,
+        allow_manual_cookie: bool,
     },
     CreatePlaylist {
         initial_track_id: Option<String>,
@@ -267,6 +326,10 @@ pub struct SourceEntry {
 }
 
 type PendingSignInSlot = Arc<Mutex<Option<(String, SignInPrompt)>>>;
+type WebSignInResponder = std::sync::mpsc::SyncSender<Result<WebSignInResult, String>>;
+type PendingWebSignInSlot = Arc<Mutex<Option<(WebSignInRequest, WebSignInResponder)>>>;
+type ActiveWebSignInSlot = Arc<Mutex<Option<WebSignInResponder>>>;
+type PendingOpenUrlsSlot = Arc<Mutex<Vec<String>>>;
 
 /// Copyable reactive application store owning all fine-grained UI signals and
 /// coordinating backend services (`LocalMusicSource`, `PluginManager`,
@@ -287,6 +350,7 @@ pub struct AppStore {
     pub plugins: Signal<Vec<PluginSummary>>,
     pub plugin_busy: Signal<bool>,
     pub plugin_error: Signal<Option<String>>,
+    pub signing_in_source: Signal<Option<String>>,
     pub backend_caps: Signal<AudioBackendCapabilities>,
 
     // Playback & audio
@@ -303,6 +367,7 @@ pub struct AppStore {
     pub shuffle: Signal<bool>,
     pub repeat: Signal<RepeatMode>,
     pub spectrum: Signal<[f32; SPECTRUM_BANDS]>,
+    pub current_is_lossless: Signal<bool>,
     pub current_artwork_uri: Signal<SharedString>,
     pub current_accent: Signal<Hsla>,
     pub remote_devices: Signal<Vec<RemoteDevice>>,
@@ -311,11 +376,13 @@ pub struct AppStore {
 
     // Lyrics & comments
     pub lyrics: Signal<ParsedLyrics>,
+    pub lyrics_loading: Signal<bool>,
     pub active_lyric: Signal<Option<ActiveLyric>>,
     pub show_translation: Signal<bool>,
     pub show_romaji: Signal<bool>,
     pub comments: Signal<Vec<Comment>>,
     pub comments_total: Signal<usize>,
+    pub comments_loading: Signal<bool>,
 
     // Now Playing overlay
     pub now_playing_open: Signal<bool>,
@@ -351,6 +418,8 @@ pub struct AppStore {
 
     // Settings, locale, theme, modals, toasts
     pub settings: Signal<AppSettings>,
+    pub settings_window_open: Signal<bool>,
+    pub settings_section: Signal<SettingsSection>,
     pub locale: Signal<Locale>,
     pub theme_override: Signal<ThemeMode>,
     pub active_modal: Signal<ActiveModal>,
@@ -362,12 +431,28 @@ pub struct AppStore {
     audio: Stored<AudioEngine>,
     artwork: Stored<ArtworkLoader>,
     session: Stored<PlaybackSession>,
+    settings_path: Stored<PathBuf>,
+    session_path: Stored<PathBuf>,
     last_track_id: Stored<Option<String>>,
+    last_played_reported_id: Stored<Option<String>>,
     last_snapshot: Stored<Option<PlaybackSnapshot>>,
     active_station_id: Stored<Option<String>>,
     pending_sign_in_prompt: Stored<PendingSignInSlot>,
+    has_sign_in_prompt: Stored<Arc<AtomicBool>>,
+    pending_web_sign_in: Stored<PendingWebSignInSlot>,
+    has_web_sign_in_request: Stored<Arc<AtomicBool>>,
+    active_web_sign_in: Stored<ActiveWebSignInSlot>,
+    pending_open_urls: Stored<PendingOpenUrlsSlot>,
+    has_open_url_request: Stored<Arc<AtomicBool>>,
     signing_in_source_id: Stored<Option<String>>,
     search_suggest_gen: Stored<u64>,
+    browse_cache: Stored<HashMap<(String, String), Browse>>,
+    browse_req_gen: Stored<u64>,
+    spectrum_is_zero: Stored<bool>,
+    pending_settings_save: Stored<Arc<Mutex<Option<AppSettings>>>>,
+    settings_saving: Stored<Arc<AtomicBool>>,
+    pending_session_save: Stored<Arc<Mutex<Option<PlaybackSession>>>>,
+    session_saving: Stored<Arc<AtomicBool>>,
     root_owner: Owner,
 }
 
@@ -392,31 +477,154 @@ impl AppStore {
     /// `LocalMusicSource`, `PluginManager`, `AudioEngine`, and `ArtworkLoader`,
     /// starts deep-link handling, and runs the audio engine sync ticker.
     pub fn new() -> Self {
-        let mut settings = AppSettings::load().unwrap_or_default();
-        let session = PlaybackSession::load().unwrap_or_default();
-
-        let local = Arc::new(LocalMusicSource::with_default_storage(
-            settings.local_folders.clone(),
+        let sandbox_root = sandbox_root_dir();
+        let sandbox = sandbox_paths_from_root(&sandbox_root);
+        let use_sandbox = cfg!(any(
+            target_env = "ohos",
+            target_os = "android",
+            target_os = "ios"
         ));
+
+        let settings_path = if use_sandbox {
+            sandbox.settings_path.clone()
+        } else {
+            AppSettings::default_path()
+        };
+        let session_path = if use_sandbox {
+            sandbox.session_path.clone()
+        } else {
+            PlaybackSession::default_path()
+        };
+
+        let mut settings = AppSettings::load_from(&settings_path).unwrap_or_default();
+        let session = PlaybackSession::load_from(&session_path).unwrap_or_default();
+
+        let local = Arc::new(if use_sandbox {
+            LocalMusicSource::with_storage(
+                settings.local_folders.clone(),
+                sandbox.local_covers_dir.clone(),
+                Some(sandbox.local_library_path.clone()),
+            )
+        } else {
+            LocalMusicSource::with_default_storage(settings.local_folders.clone())
+        });
         for f in local.folders() {
             settings.add_local_folder(f);
         }
 
-        let plugin_mgr = Arc::new(
-            PluginManager::with_default_dirs()
+        let plugin_mgr = Arc::new(if use_sandbox {
+            PluginManager::new(&sandbox.plugins_dir, &sandbox.plugin_data_dir)
                 .or_else(|_| {
                     let fallback = std::env::temp_dir().join("nsh-music-plugins");
                     PluginManager::new(fallback.join("installed"), fallback.join("data"))
                 })
-                .expect("initialize plugin manager"),
-        );
+                .expect("initialize plugin manager")
+        } else {
+            PluginManager::with_default_dirs()
+                .or_else(|_| PluginManager::new(&sandbox.plugins_dir, &sandbox.plugin_data_dir))
+                .or_else(|_| {
+                    let fallback = std::env::temp_dir().join("nsh-music-plugins");
+                    PluginManager::new(fallback.join("installed"), fallback.join("data"))
+                })
+                .expect("initialize plugin manager")
+        });
         plugin_mgr.set_locale(settings.locale.code());
         let pending_sign_in_prompt: PendingSignInSlot = Arc::new(Mutex::new(None));
+        let has_sign_in_prompt = Arc::new(AtomicBool::new(false));
         {
             let slot = Arc::clone(&pending_sign_in_prompt);
+            let flag = Arc::clone(&has_sign_in_prompt);
             plugin_mgr.set_sign_in_prompt(Some(Arc::new(move |prompt: SignInPrompt| {
                 if let Ok(mut guard) = slot.lock() {
                     *guard = Some((String::new(), prompt));
+                    flag.store(true, Ordering::Release);
+                }
+            })));
+        }
+
+        let pending_web_sign_in: PendingWebSignInSlot = Arc::new(Mutex::new(None));
+        let has_web_sign_in_request = Arc::new(AtomicBool::new(false));
+        let active_web_sign_in: ActiveWebSignInSlot = Arc::new(Mutex::new(None));
+        {
+            let slot = Arc::clone(&pending_web_sign_in);
+            let flag = Arc::clone(&has_web_sign_in_request);
+            let active_slot = Arc::clone(&active_web_sign_in);
+            plugin_mgr.set_web_sign_in_handler(Some(Arc::new(move |req: WebSignInRequest| {
+                // First attempt native isolated popup WebView sign-in (e.g. macOS NSWindow + WKWebView
+                // capturing HttpOnly cookies directly from its nonPersistentDataStore).
+                let native_opts = nsh_web_signin::WebSignInOptions {
+                    url: req.url.clone(),
+                    title: req.title.clone(),
+                    cookies_of: req.cookies_of.clone(),
+                    until: req.until.clone(),
+                    match_url: req.match_url.clone(),
+                    user_agent: req.user_agent.clone(),
+                    incognito: true,
+                    timeout_ms: req.timeout_ms,
+                };
+                match nsh_web_signin::open_blocking(native_opts) {
+                    Ok(outcome) => {
+                        return Ok(WebSignInResult {
+                            ok: outcome.ok,
+                            url: outcome.url,
+                            cookies: outcome.cookies,
+                            cookie: outcome.cookie,
+                            eval_result: None,
+                            cancelled: outcome.cancelled,
+                            manual_fallback: false,
+                        });
+                    }
+                    Err(nsh_web_signin::SignInError::Unavailable(_)) => {
+                        // Fall through cleanly to the embedded NSH modal sheet (HarmonyOS, headless tests, etc.).
+                    }
+                    Err(err) => {
+                        return Err(err.to_string());
+                    }
+                }
+
+                let timeout = if req.timeout_ms == 0 {
+                    Duration::from_secs(300)
+                } else {
+                    Duration::from_millis(req.timeout_ms)
+                };
+                let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                if let Ok(mut guard) = slot.lock() {
+                    if let Some((_, prev_tx)) = guard.replace((req, tx)) {
+                        let _ = prev_tx.try_send(Ok(WebSignInResult {
+                            cancelled: true,
+                            ..WebSignInResult::default()
+                        }));
+                    }
+                    flag.store(true, Ordering::Release);
+                }
+                match rx.recv_timeout(timeout) {
+                    Ok(res) => res,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if let Ok(mut guard) = active_slot.lock() {
+                            guard.take();
+                        }
+                        Err("web sign-in timed out".to_owned())
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Ok(WebSignInResult {
+                        cancelled: true,
+                        ..WebSignInResult::default()
+                    }),
+                }
+            })));
+        }
+
+        let pending_open_urls: PendingOpenUrlsSlot = Arc::new(Mutex::new(Vec::new()));
+        let has_open_url_request = Arc::new(AtomicBool::new(false));
+        {
+            let slot = Arc::clone(&pending_open_urls);
+            let flag = Arc::clone(&has_open_url_request);
+            plugin_mgr.set_open_url_handler(Some(Arc::new(move |url: &str| {
+                if let Ok(mut guard) = slot.lock() {
+                    guard.push(url.to_owned());
+                    flag.store(true, Ordering::Release);
+                    Ok(())
+                } else {
+                    Err("open URL queue unavailable".to_owned())
                 }
             })));
         }
@@ -429,9 +637,21 @@ impl AppStore {
             quality: settings.audio_quality,
             ..AudioEngineConfig::default()
         };
+        if use_sandbox {
+            audio_cfg.cache.cache_dir = sandbox.audio_cache_dir.clone();
+        }
         audio_cfg.cache.max_bytes = settings.cache_max_mb.max(128) * 1024 * 1024;
-        let audio = AudioEngine::new(audio_cfg)
-            .or_else(|_| AudioEngine::default_engine())
+        let audio = AudioEngine::new(audio_cfg.clone())
+            .or_else(|_| {
+                let mut retry_cfg = audio_cfg.clone();
+                retry_cfg.cache.cache_dir = sandbox.audio_cache_dir.clone();
+                AudioEngine::new(retry_cfg)
+            })
+            .or_else(|_| {
+                let mut retry_cfg = audio_cfg.clone();
+                retry_cfg.cache.cache_dir = std::env::temp_dir().join("nsh-music-audio-cache");
+                AudioEngine::new(retry_cfg)
+            })
             .expect("initialize audio engine");
 
         {
@@ -443,22 +663,35 @@ impl AppStore {
                 } else if let Some(plugin) = mgr_ref.get(&track.source) {
                     plugin.stream(&track.id, quality)
                 } else {
-                    local_ref.stream(&track.id, quality)
+                    Err(SourceError::Message(format!(
+                        "music source '{}' is not loaded",
+                        track.source
+                    )))
                 }
             })));
         }
 
-        let artwork = ArtworkLoader::default_location();
+        let artwork = if use_sandbox {
+            ArtworkLoader::new(sandbox.artwork_cache_dir.clone())
+        } else {
+            ArtworkLoader::default_location()
+        };
         let initial_cache_bytes = audio.cache_used_bytes();
         let initial_locale = settings.locale;
         let initial_theme = settings.theme_mode;
         let initial_mode = NowPlayingMode::from(settings.default_player_style);
         let initial_stage = NowPlayingStageStyle::from(settings.default_stage_style);
+        let initial_panel = if settings.lyrics_stage {
+            NowPlayingPanel::Stage
+        } else {
+            NowPlayingPanel::Lyrics
+        };
         let initial_source_id = if session.active_source_id.is_empty() {
             LocalMusicSource::SOURCE_ID.to_owned()
         } else {
             session.active_source_id.clone()
         };
+        let initial_is_local = initial_source_id == LocalMusicSource::SOURCE_ID;
 
         let store = Self {
             route: signal(Route::Home),
@@ -473,6 +706,7 @@ impl AppStore {
             plugins: signal(Vec::new()),
             plugin_busy: signal(false),
             plugin_error: signal(None),
+            signing_in_source: signal(None),
             backend_caps: signal(audio_backend_capabilities()),
 
             playback_status: signal(PlaybackStatus::Stopped),
@@ -493,6 +727,7 @@ impl AppStore {
             shuffle: signal(session.shuffle),
             repeat: signal(session.repeat),
             spectrum: signal([0.0; SPECTRUM_BANDS]),
+            current_is_lossless: signal(false),
             current_artwork_uri: signal(SharedString::default()),
             current_accent: signal(theme::default_artwork_accent()),
             remote_devices: signal(Vec::new()),
@@ -500,16 +735,18 @@ impl AppStore {
             cache_used_bytes: signal(initial_cache_bytes),
 
             lyrics: signal(ParsedLyrics::default()),
+            lyrics_loading: signal(false),
             active_lyric: signal(None),
             show_translation: signal(true),
             show_romaji: signal(false),
             comments: signal(Vec::new()),
             comments_total: signal(0),
+            comments_loading: signal(false),
 
             now_playing_open: signal(false),
             now_playing_mode: signal(initial_mode),
             stage_style: signal(initial_stage),
-            now_playing_panel: signal(NowPlayingPanel::Lyrics),
+            now_playing_panel: signal(initial_panel),
             stage_fullscreen: signal(false),
 
             search_query: signal(String::new()),
@@ -536,6 +773,8 @@ impl AppStore {
             active_show: signal(None),
 
             settings: signal(settings),
+            settings_window_open: signal(false),
+            settings_section: signal(SettingsSection::General),
             locale: signal(initial_locale),
             theme_override: signal(initial_theme),
             active_modal: signal(ActiveModal::None),
@@ -546,18 +785,38 @@ impl AppStore {
             audio: stored(audio),
             artwork: stored(artwork),
             session: stored(session),
+            settings_path: stored(settings_path),
+            session_path: stored(session_path),
             last_track_id: stored(None),
+            last_played_reported_id: stored(None),
             last_snapshot: stored(None),
             active_station_id: stored(None),
             pending_sign_in_prompt: stored(pending_sign_in_prompt),
+            has_sign_in_prompt: stored(has_sign_in_prompt),
+            pending_web_sign_in: stored(pending_web_sign_in),
+            has_web_sign_in_request: stored(has_web_sign_in_request),
+            active_web_sign_in: stored(active_web_sign_in),
+            pending_open_urls: stored(pending_open_urls),
+            has_open_url_request: stored(has_open_url_request),
             signing_in_source_id: stored(None),
             search_suggest_gen: stored(0),
+            browse_cache: stored(HashMap::new()),
+            browse_req_gen: stored(0),
+            spectrum_is_zero: stored(true),
+            pending_settings_save: stored(Arc::new(Mutex::new(None))),
+            settings_saving: stored(Arc::new(AtomicBool::new(false))),
+            pending_session_save: stored(Arc::new(Mutex::new(None))),
+            session_saving: stored(Arc::new(AtomicBool::new(false))),
             root_owner: Owner::current(),
         };
 
         store.apply_theme_mode(initial_theme);
         store.refresh_sources();
-        store.hydrate_active_source_sync();
+        if initial_is_local {
+            store.hydrate_active_source_sync();
+        } else {
+            store.hydrate_active_source_async();
+        }
         store.refresh_cache_stats();
 
         if let Some(track) = store.current_track.get_untracked() {
@@ -677,13 +936,45 @@ impl AppStore {
 
     /// Navigates to `next`, clearing forward history and loading page data.
     pub fn navigate(&self, next: Route) {
+        let next = match next {
+            Route::Plugins => {
+                self.settings_section.set(SettingsSection::Plugins);
+                let form = untracked(theme::detect_device_form);
+                match form {
+                    theme::DeviceForm::Desktop => {
+                        if self.mobile_drawer_open.get_untracked() {
+                            self.mobile_drawer_open.set(false);
+                        }
+                        self.open_settings_window(SettingsSection::Plugins);
+                        return;
+                    }
+                    theme::DeviceForm::Pad { .. } => Route::Settings,
+                    theme::DeviceForm::Phone => Route::SettingsDetail(SettingsSection::Plugins),
+                }
+            }
+            Route::SettingsDetail(section) => {
+                self.settings_section.set(section);
+                Route::SettingsDetail(section)
+            }
+            other => other,
+        };
+
         let current = self.route.get_untracked();
         if current != next {
             batch(|| {
                 self.route.set(next.clone());
-                self.nav_forward.update(Vec::clear);
-                self.page_scrolled.set(false);
-                self.search_suggest_open.set(false);
+                if self.nav_forward.with_untracked(|f| !f.is_empty()) {
+                    self.nav_forward.update(Vec::clear);
+                }
+                if self.page_scrolled.get_untracked() {
+                    self.page_scrolled.set(false);
+                }
+                if self.search_suggest_open.get_untracked() {
+                    self.search_suggest_open.set(false);
+                }
+                if self.mobile_drawer_open.get_untracked() {
+                    self.mobile_drawer_open.set(false);
+                }
                 self.nav_history.update(|hist| {
                     if hist.last() != Some(&next) {
                         hist.push(next.clone());
@@ -694,9 +985,91 @@ impl AppStore {
                     }
                 });
             });
+            self.load_data_for_route(&next);
+        } else if self.mobile_drawer_open.get_untracked() {
+            self.mobile_drawer_open.set(false);
         }
-        self.mobile_drawer_open.set(false);
-        self.load_data_for_route(&next);
+    }
+
+    /// Switches directly to a Phone/mobile root tab, resetting navigation history
+    /// so top-level root tabs never show a back button.
+    pub fn switch_tab(&self, root: Route) {
+        if self.route.get_untracked() == root {
+            batch(|| {
+                let history_matches = self
+                    .nav_history
+                    .with_untracked(|hist| hist.len() == 1 && hist.first() == Some(&root));
+                if !history_matches {
+                    self.nav_history.set(vec![root.clone()]);
+                }
+                if self.nav_forward.with_untracked(|f| !f.is_empty()) {
+                    self.nav_forward.update(Vec::clear);
+                }
+                if self.page_scrolled.get_untracked() {
+                    self.page_scrolled.set(false);
+                }
+                if self.search_suggest_open.get_untracked() {
+                    self.search_suggest_open.set(false);
+                }
+                if self.mobile_drawer_open.get_untracked() {
+                    self.mobile_drawer_open.set(false);
+                }
+            });
+            return;
+        }
+
+        batch(|| {
+            self.route.set(root.clone());
+            self.nav_history.set(vec![root.clone()]);
+            if self.nav_forward.with_untracked(|f| !f.is_empty()) {
+                self.nav_forward.update(Vec::clear);
+            }
+            if self.page_scrolled.get_untracked() {
+                self.page_scrolled.set(false);
+            }
+            if self.search_suggest_open.get_untracked() {
+                self.search_suggest_open.set(false);
+            }
+            if self.mobile_drawer_open.get_untracked() {
+                self.mobile_drawer_open.set(false);
+            }
+        });
+        self.load_data_for_route(&root);
+    }
+
+    /// Returns whether `route` is a pushed secondary screen on Phone (shows `<` back bar).
+    pub fn is_phone_secondary_route(route: &Route) -> bool {
+        match route {
+            Route::Home | Route::Library | Route::Settings => false,
+            Route::Browse { page, .. } => !page.is_empty(),
+            _ => true,
+        }
+    }
+
+    /// Returns whether this binary was compiled for a mobile sandbox target (iOS, Android, HarmonyOS).
+    pub fn is_mobile_runtime(&self) -> bool {
+        cfg!(any(
+            target_os = "ios",
+            target_os = "android",
+            target_env = "ohos"
+        ))
+    }
+
+    /// Opens the desktop Settings window (or selects `section` inside Settings) and refreshes stats.
+    pub fn open_settings_window(&self, section: SettingsSection) {
+        batch(|| {
+            self.settings_section.set(section);
+            self.settings_window_open.set(true);
+        });
+        self.refresh_cache_stats();
+        if section == SettingsSection::Plugins {
+            self.refresh_sources();
+        }
+    }
+
+    /// Closes the desktop Settings window.
+    pub fn close_settings_window(&self) {
+        self.settings_window_open.set(false);
     }
 
     /// Pops one entry from navigation history into the forward stack.
@@ -775,9 +1148,8 @@ impl AppStore {
     /// Rebuilds the `sources` and `plugins` signals and asynchronously refreshes
     /// account status for any loaded plugin supporting `account`.
     pub fn refresh_sources(&self) {
-        let existing_accounts: std::collections::HashMap<String, Account> = self
-            .sources
-            .with_untracked(|list| {
+        let existing_accounts: std::collections::HashMap<String, Account> =
+            self.sources.with_untracked(|list| {
                 list.iter()
                     .filter_map(|e| e.account.clone().map(|a| (e.info.id.clone(), a)))
                     .collect()
@@ -825,14 +1197,16 @@ impl AppStore {
                 let results = blocking(move || {
                     account_probes
                         .into_iter()
-                        .map(|(id, src)| (id, src.account().ok().flatten()))
+                        .map(|(id, src)| (id, src.account()))
                         .collect::<Vec<_>>()
                 })
                 .await;
                 if let Ok(resolved) = results {
                     store.sources.update(|entries| {
-                        for (id, acc) in resolved {
-                            if let Some(entry) = entries.iter_mut().find(|e| e.info.id == id) {
+                        for (id, acc_res) in resolved {
+                            if let Ok(acc) = acc_res
+                                && let Some(entry) = entries.iter_mut().find(|e| e.info.id == id)
+                            {
                                 entry.account = acc;
                             }
                         }
@@ -842,6 +1216,11 @@ impl AppStore {
         }
     }
 
+    fn invalidate_browse_cache(&self) {
+        self.browse_cache.with(HashMap::clear);
+        self.browse_req_gen.with(|g| *g = g.wrapping_add(1));
+    }
+
     /// Switches the active music source and refreshes home/library/catalog data.
     pub fn select_source(&self, source_id: &str) {
         let target = if source_id.is_empty() {
@@ -849,8 +1228,18 @@ impl AppStore {
         } else {
             source_id.to_owned()
         };
+        self.invalidate_browse_cache();
         batch(|| {
             self.active_source_id.set(target.clone());
+            self.home_data.set(Browse::default());
+            self.browse_data.set(Browse::default());
+            self.playlists.set(Vec::new());
+            self.liked_tracks.set(Vec::new());
+            self.liked_ids.set(HashSet::new());
+            self.recent_tracks.set(Vec::new());
+            self.saved_albums.set(Vec::new());
+            self.stations.set(Vec::new());
+            self.podcasts.set(Vec::new());
             self.search_suggestions.set(Vec::new());
             self.search_suggest_open.set(false);
             self.search_results.set(SearchResult::default());
@@ -864,12 +1253,12 @@ impl AppStore {
         if self.now_playing_panel.get_untracked() == NowPlayingPanel::Comments
             && !self.active_can("comments")
         {
-            self.now_playing_panel.set(NowPlayingPanel::Lyrics);
+            self.now_playing_panel.set(self.preferred_lyrics_panel());
         }
         self.session.with(|s| {
             s.active_source_id = target;
-            let _ = s.save();
         });
+        self.persist_session();
         self.hydrate_active_source_async();
     }
 
@@ -877,27 +1266,90 @@ impl AppStore {
         self.hydrate_active_source_async();
     }
 
+    fn load_browse_if_needed(&self, page: &str, title: &str) {
+        let source_id = self.active_source_id.get_untracked();
+        let cached = self
+            .browse_cache
+            .with(|cache| cache.get(&(source_id, page.to_owned())).cloned());
+        if let Some(mut entry) = cached {
+            if entry.title.is_empty() && !title.is_empty() {
+                entry.title = title.to_owned();
+            }
+            self.browse_req_gen.with(|g| *g = g.wrapping_add(1));
+            batch(|| {
+                if self.browse_loading.get_untracked() {
+                    self.browse_loading.set(false);
+                }
+                if self.browse_data.with_untracked(|cur| cur != &entry) {
+                    self.browse_data.set(entry);
+                }
+            });
+            return;
+        }
+        self.fetch_browse(page, title);
+    }
+
     pub fn refresh_browse(&self, page: &str, title: &str) {
+        self.fetch_browse(page, title);
+    }
+
+    fn fetch_browse(&self, page: &str, title: &str) {
         let src = self.active_source();
+        let source_id = self.active_source_id.get_untracked();
         let page_str = page.to_owned();
         let fallback_title = title.to_owned();
-        self.browse_loading.set(true);
+        let token = self.browse_req_gen.with(|g| {
+            *g = g.wrapping_add(1);
+            *g
+        });
+        if !self.browse_loading.get_untracked() {
+            self.browse_loading.set(true);
+        }
         let store = *self;
         self.spawn_app(async move {
+            let page_bg = page_str.clone();
             let res = blocking(move || {
-                if page_str.is_empty() {
+                if page_bg.is_empty() {
                     src.home()
                 } else {
-                    src.browse(&page_str)
+                    src.browse(&page_bg)
                 }
             })
             .await;
-            store.browse_loading.set(false);
-            if let Ok(Ok(mut browse)) = res {
-                if browse.title.is_empty() && !fallback_title.is_empty() {
-                    browse.title = fallback_title;
+            let still_current = store.browse_req_gen.with(|g| *g == token)
+                && store.active_source_id.get_untracked() == source_id;
+            if !still_current {
+                return;
+            }
+            let mut err_msg: Option<String> = None;
+            batch(|| {
+                if store.browse_loading.get_untracked() {
+                    store.browse_loading.set(false);
                 }
-                store.browse_data.set(browse);
+                match res {
+                    Ok(Ok(mut browse)) => {
+                        if browse.title.is_empty() && !fallback_title.is_empty() {
+                            browse.title = fallback_title;
+                        }
+                        if !browse.sections.is_empty() || source_id == LocalMusicSource::SOURCE_ID {
+                            store.browse_cache.with(|cache| {
+                                cache.insert((source_id.clone(), page_str), browse.clone())
+                            });
+                        }
+                        if store.browse_data.with_untracked(|cur| cur != &browse) {
+                            store.browse_data.set(browse);
+                        }
+                    }
+                    Ok(Err(err)) => {
+                        err_msg = Some(format!("{source_id}: {err}"));
+                    }
+                    Err(err) => {
+                        err_msg = Some(format!("{source_id}: {err}"));
+                    }
+                }
+            });
+            if let Some(msg) = err_msg {
+                store.toasts.error(msg);
             }
         });
     }
@@ -1158,9 +1610,9 @@ impl AppStore {
             let res = blocking(move || mgr.check_update(&pid)).await;
             match res {
                 Ok(Ok(Some(ver))) => {
-                    store.toasts.info(
-                        store.t_fmt("plugins.update_available", &[("version", &ver)]),
-                    );
+                    store
+                        .toasts
+                        .info(store.t_fmt("plugins.update_available", &[("version", &ver)]));
                 }
                 Ok(Ok(None)) => {
                     store.toasts.info(store.t("plugins.up_to_date"));
@@ -1210,6 +1662,7 @@ impl AppStore {
         let res = self.plugin_mgr.with(|m| m.uninstall(plugin_id));
         match res {
             Ok(()) => {
+                self.invalidate_browse_cache();
                 if self.active_source_id.get_untracked() == plugin_id {
                     self.select_source(LocalMusicSource::SOURCE_ID);
                 }
@@ -1227,8 +1680,8 @@ impl AppStore {
             Ok(()) => {
                 self.settings.update(|s| {
                     s.set_plugin_enabled(plugin_id, enabled);
-                    let _ = s.save();
                 });
+                self.persist_settings();
                 self.refresh_sources();
             }
             Err(e) => self.toasts.error(e.to_string()),
@@ -1240,6 +1693,7 @@ impl AppStore {
         match res {
             Ok(src) => {
                 let name = src.info().name;
+                self.invalidate_browse_cache();
                 self.refresh_sources();
                 self.toasts
                     .success(self.t_fmt("plugins.reloaded_fmt", &[("name", &name)]));
@@ -1254,19 +1708,38 @@ impl AppStore {
 
     pub fn set_plugin_setting(&self, plugin_id: &str, key: &str, value: &str) {
         let src = self.source_by_id(plugin_id);
-        match src.set_setting(key, value) {
-            Ok(()) => {
-                self.toasts.success(self.t("common.save"));
+        let key_owned = key.to_owned();
+        let val_owned = value.to_owned();
+        let store = *self;
+        self.spawn_app(async move {
+            match blocking(move || src.set_setting(&key_owned, &val_owned)).await {
+                Ok(Ok(())) => {
+                    store.toasts.success(store.t("common.save"));
+                }
+                Ok(Err(e)) => store.toasts.error(e.to_string()),
+                Err(e) => store.toasts.error(e.to_string()),
             }
-            Err(e) => self.toasts.error(e.to_string()),
-        }
+        });
+    }
+
+    /// Immediately applies a freshly authenticated account onto the matching source entry.
+    pub fn apply_signed_in_account(&self, source_id: &str, account: Account) {
+        self.invalidate_browse_cache();
+        self.sources.update(|entries| {
+            if let Some(entry) = entries.iter_mut().find(|e| e.info.id == source_id) {
+                entry.account = Some(account);
+            }
+        });
     }
 
     pub fn sign_in_source(&self, source_id: &str) {
         let src = self.source_by_id(source_id);
         let id = source_id.to_owned();
         let store = *self;
+        self.signing_in_source.set(Some(id.clone()));
         self.signing_in_source_id.replace(Some(id.clone()));
+        self.has_sign_in_prompt
+            .with(|flag| flag.store(false, Ordering::Release));
         self.pending_sign_in_prompt.with(|m| {
             if let Ok(mut guard) = m.lock() {
                 *guard = None;
@@ -1274,7 +1747,11 @@ impl AppStore {
         });
         self.spawn_app(async move {
             let res = blocking(move || src.sign_in()).await;
+            store.signing_in_source.set(None);
             store.signing_in_source_id.replace(None);
+            store
+                .has_sign_in_prompt
+                .with(|flag| flag.store(false, Ordering::Release));
             store.pending_sign_in_prompt.with(|m| {
                 if let Ok(mut guard) = m.lock() {
                     *guard = None;
@@ -1282,20 +1759,37 @@ impl AppStore {
             });
             match res {
                 Ok(Ok(account)) => {
+                    store.apply_signed_in_account(&id, account.clone());
                     store.refresh_sources();
                     if store.active_source_id.get_untracked() == id {
                         store.hydrate_active_source_async();
+                        if let Route::Browse { page, title } = store.route.get_untracked()
+                            && !page.is_empty()
+                        {
+                            store.refresh_browse(&page, &title);
+                        }
                     }
                     store.close_modal();
-                    store.toasts.success(store.t_fmt(
-                        "plugins.signed_in_as",
-                        &[("name", &account.name)],
-                    ));
+                    store
+                        .toasts
+                        .success(store.t_fmt("plugins.signed_in_as", &[("name", &account.name)]));
                 }
                 Ok(Err(err)) => {
+                    if matches!(
+                        store.active_modal.get_untracked(),
+                        ActiveModal::WebSignIn { .. } | ActiveModal::QrSignIn { .. }
+                    ) {
+                        store.active_modal.set(ActiveModal::None);
+                    }
                     store.toasts.error(format!("{id}: {err}"));
                 }
                 Err(err) => {
+                    if matches!(
+                        store.active_modal.get_untracked(),
+                        ActiveModal::WebSignIn { .. } | ActiveModal::QrSignIn { .. }
+                    ) {
+                        store.active_modal.set(ActiveModal::None);
+                    }
                     store.toasts.error(err.to_string());
                 }
             }
@@ -1304,10 +1798,25 @@ impl AppStore {
 
     pub fn sign_out_source(&self, source_id: &str) {
         let src = self.source_by_id(source_id);
+        let id = source_id.to_owned();
         let store = *self;
         self.spawn_app(async move {
             let _ = blocking(move || src.sign_out()).await;
+            store.invalidate_browse_cache();
+            store.sources.update(|entries| {
+                if let Some(entry) = entries.iter_mut().find(|e| e.info.id == id) {
+                    entry.account = None;
+                }
+            });
             store.refresh_sources();
+            if store.active_source_id.get_untracked() == id {
+                store.hydrate_active_source_async();
+                if let Route::Browse { page, title } = store.route.get_untracked()
+                    && !page.is_empty()
+                {
+                    store.refresh_browse(&page, &title);
+                }
+            }
             store.toasts.info(store.t("plugins.not_signed_in"));
         });
     }
@@ -1446,6 +1955,11 @@ impl AppStore {
         self.toasts.info(self.t("player.add_to_queue"));
     }
 
+    /// Alias for [`Self::enqueue`], matching Now Playing and context menu actions.
+    pub fn add_to_queue(&self, track: Track) {
+        self.enqueue(track);
+    }
+
     pub fn enqueue_next(&self, track: Track) {
         self.audio.with(|a| a.enqueue_next(track.clone()));
         let insert_at = self
@@ -1460,6 +1974,88 @@ impl AppStore {
         self.toasts.info(self.t("player.play_next"));
     }
 
+    /// Alias for [`Self::enqueue_next`], matching Now Playing and context menu actions.
+    pub fn play_next(&self, track: Track) {
+        self.enqueue_next(track);
+    }
+
+    /// Returns a snapshot of the currently loaded track without creating a reactive dependency.
+    pub fn current_track_untracked(&self) -> Option<Track> {
+        self.current_track.get_untracked()
+    }
+
+    /// Navigates to an artist detail page (closing Now Playing if open).
+    pub fn go_to_artist(&self, artist_id: &str) {
+        let id = artist_id.trim();
+        if id.is_empty() {
+            return;
+        }
+        if self.now_playing_open.get_untracked() {
+            self.close_now_playing();
+        }
+        self.navigate(Route::ArtistDetail { id: id.to_owned() });
+    }
+
+    /// Navigates to an album detail page (closing Now Playing if open).
+    pub fn go_to_album(&self, album_id: &str) {
+        let id = album_id.trim();
+        if id.is_empty() {
+            return;
+        }
+        if self.now_playing_open.get_untracked() {
+            self.close_now_playing();
+        }
+        self.navigate(Route::AlbumDetail { id: id.to_owned() });
+    }
+
+    /// Navigates to a podcast show detail page (closing Now Playing if open).
+    pub fn go_to_show(&self, show_id: &str) {
+        let id = show_id.trim();
+        if id.is_empty() {
+            return;
+        }
+        if self.now_playing_open.get_untracked() {
+            self.close_now_playing();
+        }
+        self.navigate(Route::ShowDetail { id: id.to_owned() });
+    }
+
+    /// Navigates to the primary artist of the currently playing track.
+    pub fn go_to_current_artist(&self) {
+        if let Some(id) = self.current_track.with_untracked(|t| {
+            t.as_ref().and_then(|tr| {
+                tr.artists
+                    .iter()
+                    .find(|a| !a.id.is_empty())
+                    .map(|a| a.id.clone())
+            })
+        }) {
+            self.go_to_artist(&id);
+        }
+    }
+
+    /// Navigates to the album of the currently playing track.
+    pub fn go_to_current_album(&self) {
+        if let Some(id) = self.current_track.with_untracked(|t| {
+            t.as_ref()
+                .filter(|tr| !tr.album.id.is_empty())
+                .map(|tr| tr.album.id.clone())
+        }) {
+            self.go_to_album(&id);
+        }
+    }
+
+    /// Navigates to the podcast show of the currently playing episode.
+    pub fn go_to_current_show(&self) {
+        if let Some(id) = self.current_track.with_untracked(|t| {
+            t.as_ref()
+                .filter(|tr| !tr.show_id.is_empty())
+                .map(|tr| tr.show_id.clone())
+        }) {
+            self.go_to_show(&id);
+        }
+    }
+
     pub fn remove_from_queue(&self, index: usize) {
         self.audio.with(|a| a.remove_from_queue(index));
         self.queue.update(|q| {
@@ -1471,14 +2067,18 @@ impl AppStore {
 
     pub fn clear_queue(&self) {
         self.audio.with(|a| a.clear_queue());
+        self.last_track_id.replace(None);
         batch(|| {
             self.queue.set(Vec::new());
             self.current_index.set(None);
             self.current_track.set(None);
             self.playback_status.set(PlaybackStatus::Stopped);
             self.is_playing.set(false);
+            self.current_is_lossless.set(false);
             self.position_ms.set(0);
             self.duration_ms.set(0);
+            self.lyrics_loading.set(false);
+            self.comments_loading.set(false);
         });
     }
 
@@ -1570,12 +2170,15 @@ impl AppStore {
 
     pub fn set_volume(&self, volume: f32) {
         let clamped = volume.clamp(0.0, 1.0);
+        if (self.volume.get_untracked() - clamped).abs() <= 1e-4 {
+            return;
+        }
         self.audio.with(|a| a.set_volume(clamped));
         self.volume.set(clamped);
         self.session.with(|s| {
             s.set_volume(clamped);
-            let _ = s.save();
         });
+        self.persist_session();
     }
 
     pub fn toggle_mute(&self) {
@@ -1584,8 +2187,8 @@ impl AppStore {
         self.muted.set(next);
         self.session.with(|s| {
             s.muted = next;
-            let _ = s.save();
         });
+        self.persist_session();
     }
 
     pub fn toggle_shuffle(&self) {
@@ -1594,8 +2197,8 @@ impl AppStore {
         self.shuffle.set(next);
         self.session.with(|s| {
             s.shuffle = next;
-            let _ = s.save();
         });
+        self.persist_session();
     }
 
     pub fn cycle_repeat(&self) {
@@ -1608,8 +2211,8 @@ impl AppStore {
         self.repeat.set(next);
         self.session.with(|s| {
             s.repeat = next;
-            let _ = s.save();
         });
+        self.persist_session();
     }
 
     /// Refreshes available remote playback devices from the active source.
@@ -1677,8 +2280,8 @@ impl AppStore {
 
         self.session.with(|s| {
             let _ = s.toggle_liked_track(track.clone());
-            let _ = s.save();
         });
+        self.persist_session();
 
         let src = self.source_by_id(&track.source);
         let track_id = track.id.clone();
@@ -1714,14 +2317,16 @@ impl AppStore {
         let name_owned = trimmed.to_owned();
         let store = *self;
         self.spawn_app(async move {
-            let res = blocking(move || -> Result<Playlist, nsh_music_core::model::SourceError> {
-                let pl = src.create_playlist(&name_owned)?;
-                if let Some(tid) = initial_track_id {
-                    let _ = src.add_to_playlist(&pl.id, &[tid]);
-                    return Ok(src.playlist(&pl.id).unwrap_or(pl));
-                }
-                Ok(pl)
-            })
+            let res = blocking(
+                move || -> Result<Playlist, nsh_music_core::model::SourceError> {
+                    let pl = src.create_playlist(&name_owned)?;
+                    if let Some(tid) = initial_track_id {
+                        let _ = src.add_to_playlist(&pl.id, &[tid]);
+                        return Ok(src.playlist(&pl.id).unwrap_or(pl));
+                    }
+                    Ok(pl)
+                },
+            )
             .await;
             if let Ok(Ok(pl)) = res {
                 store.playlists.update(|list| {
@@ -1768,7 +2373,8 @@ impl AppStore {
     pub fn delete_playlist(&self, id: &str) {
         let src = self.active_source();
         let id_owned = id.to_owned();
-        self.playlists.update(|list| list.retain(|p| p.id != id_owned));
+        self.playlists
+            .update(|list| list.retain(|p| p.id != id_owned));
         let is_viewing = matches!(
             self.route.get_untracked(),
             Route::PlaylistDetail { ref id } if id == &id_owned
@@ -1946,12 +2552,13 @@ impl AppStore {
             .await
             {
                 Ok(Some(paths)) if !paths.is_empty() => {
+                    store.invalidate_browse_cache();
                     store.settings.update(|s| {
                         for p in paths {
                             s.add_local_folder(p);
                         }
-                        let _ = s.save();
                     });
+                    store.persist_settings();
                     store.rescan_local_folders();
                 }
                 Ok(_) => {}
@@ -1965,26 +2572,28 @@ impl AppStore {
     pub fn add_local_folder(&self, path: PathBuf) {
         self.settings.update(|s| {
             s.add_local_folder(path);
-            let _ = s.save();
         });
+        self.persist_settings();
         self.rescan_local_folders();
     }
 
     pub fn remove_local_folder(&self, path: &Path) {
         self.settings.update(|s| {
             s.remove_local_folder(path);
-            let _ = s.save();
         });
+        self.persist_settings();
         self.rescan_local_folders();
     }
 
     pub fn rescan_local_folders(&self) {
+        self.invalidate_browse_cache();
         let folders = self.settings.with_untracked(|s| s.local_folders.clone());
         let local = self.local.get();
         let store = *self;
         self.spawn_app(async move {
             let report = blocking(move || local.scan_folders(&folders)).await;
             if let Ok(rep) = report {
+                store.invalidate_browse_cache();
                 store.hydrate_active_source_async();
                 let count = rep.added_tracks.to_string();
                 store
@@ -1998,33 +2607,74 @@ impl AppStore {
     // Now Playing Stage
     // -------------------------------------------------------------------------
 
+    /// Returns the listener's last chosen lyrics presentation (`Stage` vs `Lyrics`),
+    /// matching `egoist/mygo-music`'s `lyricsPaneChosen`.
+    pub fn preferred_lyrics_panel(&self) -> NowPlayingPanel {
+        if self.settings.with_untracked(|s| s.lyrics_stage) {
+            NowPlayingPanel::Stage
+        } else {
+            NowPlayingPanel::Lyrics
+        }
+    }
+
     pub fn open_now_playing(&self) {
-        self.now_playing_open.set(true);
+        if !self.now_playing_open.get_untracked() {
+            self.now_playing_open.set(true);
+        }
+    }
+
+    /// Opens Now Playing directly to `panel`.
+    pub fn open_now_playing_panel(&self, panel: NowPlayingPanel) {
+        self.set_now_playing_panel(panel);
+        self.open_now_playing();
     }
 
     pub fn close_now_playing(&self) {
-        self.now_playing_open.set(false);
-        self.stage_fullscreen.set(false);
+        batch(|| {
+            if self.now_playing_open.get_untracked() {
+                self.now_playing_open.set(false);
+            }
+            if self.stage_fullscreen.get_untracked() {
+                self.stage_fullscreen.set(false);
+            }
+        });
     }
 
     pub fn set_now_playing_mode(&self, mode: NowPlayingMode) {
+        if self.now_playing_mode.get_untracked() == mode {
+            return;
+        }
         self.now_playing_mode.set(mode);
         self.settings.update(|s| {
             s.default_player_style = PlayerStyle::from(mode);
-            let _ = s.save();
         });
+        self.persist_settings();
     }
 
     pub fn set_stage_style(&self, style: NowPlayingStageStyle) {
+        if self.stage_style.get_untracked() == style {
+            return;
+        }
         self.stage_style.set(style);
         self.settings.update(|s| {
             s.default_stage_style = style.to_core();
-            let _ = s.save();
         });
+        self.persist_settings();
     }
 
     pub fn set_now_playing_panel(&self, panel: NowPlayingPanel) {
-        self.now_playing_panel.set(panel);
+        if self.now_playing_panel.get_untracked() != panel {
+            self.now_playing_panel.set(panel);
+        }
+        if matches!(panel, NowPlayingPanel::Lyrics | NowPlayingPanel::Stage) {
+            let want_stage = panel == NowPlayingPanel::Stage;
+            if self.settings.with_untracked(|s| s.lyrics_stage) != want_stage {
+                self.settings.update(|s| {
+                    s.lyrics_stage = want_stage;
+                });
+                self.persist_settings();
+            }
+        }
     }
 
     pub fn toggle_stage_fullscreen(&self) {
@@ -2084,6 +2734,7 @@ impl AppStore {
 
     pub fn search(&self, query: &str) {
         let trimmed = query.trim().to_owned();
+        self.search_suggest_gen.with(|g| *g = g.wrapping_add(1));
         batch(|| {
             self.search_query.set(trimmed.clone());
             self.search_suggest_open.set(false);
@@ -2096,20 +2747,32 @@ impl AppStore {
 
         self.session.with(|s| {
             s.record_search(&trimmed);
-            let _ = s.save();
         });
+        self.persist_session();
         self.recent_searches
             .set(self.session.with(|s| s.recent_searches.clone()));
 
         let kind = self.search_tab.get_untracked();
+        let source_id = self.active_source_id.get_untracked();
         let src = self.active_source();
         self.search_loading.set(true);
         let store = *self;
         self.spawn_app(async move {
             let res = blocking(move || src.search(&trimmed, kind, 0)).await;
+            if store.active_source_id.get_untracked() != source_id {
+                return;
+            }
             store.search_loading.set(false);
-            if let Ok(Ok(result)) = res {
-                store.search_results.set(result);
+            match res {
+                Ok(Ok(result)) => {
+                    store.search_results.set(result);
+                }
+                Ok(Err(err)) => {
+                    store.toasts.error(format!("{source_id}: {err}"));
+                }
+                Err(err) => {
+                    store.toasts.error(format!("{source_id}: {err}"));
+                }
             }
         });
     }
@@ -2125,8 +2788,8 @@ impl AppStore {
     pub fn clear_recent_searches(&self) {
         self.session.with(|s| {
             s.clear_recent_searches();
-            let _ = s.save();
         });
+        self.persist_session();
         self.recent_searches.set(Vec::new());
     }
 
@@ -2135,38 +2798,44 @@ impl AppStore {
     // -------------------------------------------------------------------------
 
     pub fn set_locale(&self, locale: Locale) {
+        if self.locale.get_untracked() == locale {
+            return;
+        }
         self.locale.set(locale);
         self.plugin_mgr.with(|m| m.set_locale(locale.code()));
         self.settings.update(|s| {
             s.locale = locale;
-            let _ = s.save();
         });
+        self.persist_settings();
         self.refresh_sources();
     }
 
     pub fn set_theme(&self, mode: ThemeMode) {
+        if self.theme_override.get_untracked() == mode {
+            return;
+        }
         self.theme_override.set(mode);
         self.apply_theme_mode(mode);
         self.settings.update(|s| {
             s.theme_mode = mode;
-            let _ = s.save();
         });
+        self.persist_settings();
     }
 
     pub fn set_quality(&self, quality: Quality) {
         self.audio.with(|a| a.set_quality(quality));
         self.settings.update(|s| {
             s.audio_quality = quality;
-            let _ = s.save();
         });
+        self.persist_settings();
     }
 
     pub fn set_replay_gain(&self, enabled: bool) {
         self.audio.with(|a| a.set_replay_gain_enabled(enabled));
         self.settings.update(|s| {
             s.replay_gain = enabled;
-            let _ = s.save();
         });
+        self.persist_settings();
     }
 
     pub fn set_crossfade_ms(&self, ms: u32) {
@@ -2174,8 +2843,8 @@ impl AppStore {
         self.audio.with(|a| a.set_crossfade_ms(clamped));
         self.settings.update(|s| {
             s.crossfade_ms = clamped;
-            let _ = s.save();
         });
+        self.persist_settings();
     }
 
     pub fn set_cache_max_mb(&self, mb: u64) {
@@ -2185,8 +2854,8 @@ impl AppStore {
             .with(|a| a.set_cache_max_bytes(clamped * 1024 * 1024));
         self.settings.update(|s| {
             s.cache_max_mb = clamped;
-            let _ = s.save();
         });
+        self.persist_settings();
         self.refresh_cache_stats();
     }
 
@@ -2198,7 +2867,9 @@ impl AppStore {
             let art_bytes = blocking(move || dir_file_bytes(&art_dir))
                 .await
                 .unwrap_or(0);
-            store.cache_used_bytes.set(audio_bytes.saturating_add(art_bytes));
+            store
+                .cache_used_bytes
+                .set(audio_bytes.saturating_add(art_bytes));
         });
     }
 
@@ -2223,15 +2894,15 @@ impl AppStore {
     pub fn set_hot_comments(&self, on: bool) {
         self.settings.update(|s| {
             s.hot_comments = on;
-            let _ = s.save();
         });
+        self.persist_settings();
     }
 
     pub fn set_stage_sparks(&self, on: bool) {
         self.settings.update(|s| {
             s.stage_sparks = on;
-            let _ = s.save();
         });
+        self.persist_settings();
     }
 
     pub fn copy_track_title(&self, track: &Track) {
@@ -2328,8 +2999,7 @@ impl AppStore {
                 .title(title_label)
                 .button_label(btn_label)
                 .filter(FileFilter::new(ext.to_ascii_uppercase(), [ext.as_str()]));
-            if let Some(home) =
-                std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
+            if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
             {
                 let dl_dir = PathBuf::from(home).join("Downloads");
                 if dl_dir.is_dir() {
@@ -2399,36 +3069,36 @@ impl AppStore {
     pub fn set_fog_backdrop(&self, on: bool) {
         self.settings.update(|s| {
             s.fog_backdrop = on;
-            let _ = s.save();
         });
+        self.persist_settings();
     }
 
     pub fn set_smoke_progress(&self, on: bool) {
         self.settings.update(|s| {
             s.smoke_progress = on;
-            let _ = s.save();
         });
+        self.persist_settings();
     }
 
     pub fn set_grow_from_cover(&self, on: bool) {
         self.settings.update(|s| {
             s.grow_from_cover = on;
-            let _ = s.save();
         });
+        self.persist_settings();
     }
 
     pub fn toggle_sidebar_mine(&self) {
         self.settings.update(|s| {
             s.sidebar_mine_collapsed = !s.sidebar_mine_collapsed;
-            let _ = s.save();
         });
+        self.persist_settings();
     }
 
     pub fn toggle_sidebar_saved(&self) {
         self.settings.update(|s| {
             s.sidebar_saved_collapsed = !s.sidebar_saved_collapsed;
-            let _ = s.save();
         });
+        self.persist_settings();
     }
 
     pub fn open_modal(&self, modal: ActiveModal) {
@@ -2438,7 +3108,62 @@ impl AppStore {
         self.active_modal.set(modal);
     }
 
+    /// Resolves an active plugin `host.webSignIn(...)` request with `result` and closes the modal.
+    pub fn submit_web_sign_in_result(&self, result: WebSignInResult) {
+        let responder = self
+            .active_web_sign_in
+            .with(|slot| slot.lock().ok().and_then(|mut g| g.take()))
+            .or_else(|| {
+                self.pending_web_sign_in.with(|slot| {
+                    slot.lock()
+                        .ok()
+                        .and_then(|mut g| g.take().map(|(_, tx)| tx))
+                })
+            });
+        if let Some(tx) = responder {
+            let _ = tx.try_send(Ok(result));
+        }
+        if matches!(
+            self.active_modal.get_untracked(),
+            ActiveModal::WebSignIn { .. }
+        ) {
+            self.active_modal.set(ActiveModal::None);
+        }
+    }
+
+    /// Cancels any active or pending plugin `host.webSignIn(...)` request without hanging the plugin worker.
+    pub fn cancel_web_sign_in(&self) {
+        let active_tx = self
+            .active_web_sign_in
+            .with(|slot| slot.lock().ok().and_then(|mut g| g.take()));
+        if let Some(tx) = active_tx {
+            let _ = tx.try_send(Ok(WebSignInResult {
+                cancelled: true,
+                ..WebSignInResult::default()
+            }));
+        }
+        let pending_tx = self.pending_web_sign_in.with(|slot| {
+            slot.lock()
+                .ok()
+                .and_then(|mut g| g.take().map(|(_, tx)| tx))
+        });
+        if let Some(tx) = pending_tx {
+            let _ = tx.try_send(Ok(WebSignInResult {
+                cancelled: true,
+                ..WebSignInResult::default()
+            }));
+        }
+        self.has_web_sign_in_request
+            .with(|flag| flag.store(false, Ordering::Release));
+    }
+
     pub fn close_modal(&self) {
+        if matches!(
+            self.active_modal.get_untracked(),
+            ActiveModal::WebSignIn { .. }
+        ) {
+            self.cancel_web_sign_in();
+        }
         self.active_modal.set(ActiveModal::None);
     }
 
@@ -2456,6 +3181,7 @@ impl AppStore {
     }
 
     fn hydrate_active_source_sync(&self) {
+        let source_id = self.active_source_id.get_untracked();
         let src = self.active_source();
         let home = src.home().unwrap_or_default();
         let playlists = src.playlists().unwrap_or_default();
@@ -2466,6 +3192,8 @@ impl AppStore {
         let shows = src.shows().unwrap_or_default();
 
         let liked_set: HashSet<String> = liked.iter().map(|t| t.id.clone()).collect();
+        self.browse_cache
+            .with(|cache| cache.insert((source_id, String::new()), home.clone()));
 
         batch(|| {
             self.home_data.set(home.clone());
@@ -2480,14 +3208,63 @@ impl AppStore {
         });
     }
 
-    fn hydrate_active_source_async(&self) {
+    pub fn hydrate_active_source_async(&self) {
+        let source_id = self.active_source_id.get_untracked();
         let src = self.active_source();
         let store = *self;
-        self.browse_loading.set(true);
+        if !self.browse_loading.get_untracked() {
+            self.browse_loading.set(true);
+        }
         self.spawn_app(async move {
-            let bundle = blocking(move || {
+            // Phase 1: Fetch `home()` first so Home renders promptly without waiting
+            // on secondary library calls (which may fail or block when signed out).
+            let src_home = Arc::clone(&src);
+            let home_res = blocking(move || src_home.home()).await;
+
+            if store.active_source_id.get_untracked() != source_id {
+                return;
+            }
+
+            let mut home_err: Option<String> = None;
+            batch(|| {
+                if store.browse_loading.get_untracked() {
+                    store.browse_loading.set(false);
+                }
+                match home_res {
+                    Ok(Ok(home)) => {
+                        if !home.sections.is_empty() || source_id == LocalMusicSource::SOURCE_ID {
+                            store.browse_cache.with(|cache| {
+                                cache.insert((source_id.clone(), String::new()), home.clone());
+                            });
+                        }
+                        if store.home_data.with_untracked(|cur| cur != &home) {
+                            store.home_data.set(home.clone());
+                        }
+                        let on_browse_subpage = matches!(
+                            store.route.get_untracked(),
+                            Route::Browse { ref page, .. } if !page.is_empty()
+                        );
+                        if !on_browse_subpage
+                            && store.browse_data.with_untracked(|cur| cur != &home)
+                        {
+                            store.browse_data.set(home);
+                        }
+                    }
+                    Ok(Err(err)) => {
+                        home_err = Some(format!("{source_id}: {err}"));
+                    }
+                    Err(err) => {
+                        home_err = Some(format!("{source_id}: {err}"));
+                    }
+                }
+            });
+            if let Some(msg) = home_err {
+                store.toasts.error(msg);
+            }
+
+            // Phase 2: Hydrate secondary library slices asynchronously after Home settles.
+            let lib_bundle = blocking(move || {
                 (
-                    src.home().unwrap_or_default(),
                     src.playlists().unwrap_or_default(),
                     src.liked(0).map(|p| p.tracks).unwrap_or_default(),
                     src.recent().unwrap_or_default(),
@@ -2498,12 +3275,13 @@ impl AppStore {
             })
             .await;
 
-            store.browse_loading.set(false);
-            if let Ok((home, playlists, liked, recent, albums, stations, shows)) = bundle {
+            if store.active_source_id.get_untracked() != source_id {
+                return;
+            }
+
+            if let Ok((playlists, liked, recent, albums, stations, shows)) = lib_bundle {
                 let liked_set: HashSet<String> = liked.iter().map(|t| t.id.clone()).collect();
                 batch(|| {
-                    store.home_data.set(home.clone());
-                    store.browse_data.set(home);
                     store.playlists.set(playlists);
                     store.liked_tracks.set(liked);
                     store.liked_ids.set(liked_set);
@@ -2518,45 +3296,163 @@ impl AppStore {
 
     fn load_data_for_route(&self, route: &Route) {
         let src = self.active_source();
+        let source_id = self.active_source_id.get_untracked();
         let store = *self;
         match route {
             Route::Home => {
-                if self.home_data.with_untracked(|h| h.sections.is_empty()) {
+                let cached = self
+                    .browse_cache
+                    .with(|cache| cache.contains_key(&(source_id, String::new())));
+                if !cached && self.home_data.with_untracked(|h| h.sections.is_empty()) {
                     self.hydrate_active_source_async();
                 }
             }
             Route::Browse { page, title } => {
-                self.refresh_browse(page, title);
+                self.load_browse_if_needed(page, title);
             }
             Route::PlaylistDetail { id } => {
                 let id = id.clone();
                 self.spawn_app(async move {
-                    if let Ok(Ok(pl)) = blocking(move || src.playlist(&id)).await {
-                        store.active_playlist.set(Some(pl));
+                    let id_bg = id.clone();
+                    let res = blocking(move || src.playlist(&id_bg)).await;
+                    if store.active_source_id.get_untracked() != source_id {
+                        return;
+                    }
+                    match res {
+                        Ok(Ok(mut pl)) => {
+                            if pl.id.is_empty() {
+                                pl.id = id;
+                            }
+                            store.active_playlist.set(Some(pl));
+                        }
+                        Ok(Err(err)) => {
+                            store.toasts.error(format!("{source_id}: {err}"));
+                            store.active_playlist.set(Some(Playlist {
+                                id,
+                                ..Default::default()
+                            }));
+                        }
+                        Err(err) => {
+                            store.toasts.error(format!("{source_id}: {err}"));
+                            store.active_playlist.set(Some(Playlist {
+                                id,
+                                ..Default::default()
+                            }));
+                        }
                     }
                 });
             }
             Route::AlbumDetail { id } => {
                 let id = id.clone();
                 self.spawn_app(async move {
-                    if let Ok(Ok(alb)) = blocking(move || src.album(&id)).await {
-                        store.active_album.set(Some(alb));
+                    let id_bg = id.clone();
+                    let res = blocking(move || src.album(&id_bg)).await;
+                    if store.active_source_id.get_untracked() != source_id {
+                        return;
+                    }
+                    match res {
+                        Ok(Ok(mut alb)) => {
+                            if alb.album.id.is_empty() {
+                                alb.album.id = id;
+                            }
+                            store.active_album.set(Some(alb));
+                        }
+                        Ok(Err(err)) => {
+                            store.toasts.error(format!("{source_id}: {err}"));
+                            store.active_album.set(Some(AlbumPage {
+                                album: Album {
+                                    id,
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            }));
+                        }
+                        Err(err) => {
+                            store.toasts.error(format!("{source_id}: {err}"));
+                            store.active_album.set(Some(AlbumPage {
+                                album: Album {
+                                    id,
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            }));
+                        }
                     }
                 });
             }
             Route::ArtistDetail { id } => {
                 let id = id.clone();
                 self.spawn_app(async move {
-                    if let Ok(Ok(art)) = blocking(move || src.artist(&id)).await {
-                        store.active_artist.set(Some(art));
+                    let id_bg = id.clone();
+                    let res = blocking(move || src.artist(&id_bg)).await;
+                    if store.active_source_id.get_untracked() != source_id {
+                        return;
+                    }
+                    match res {
+                        Ok(Ok(mut art)) => {
+                            if art.artist.id.is_empty() {
+                                art.artist.id = id;
+                            }
+                            store.active_artist.set(Some(art));
+                        }
+                        Ok(Err(err)) => {
+                            store.toasts.error(format!("{source_id}: {err}"));
+                            store.active_artist.set(Some(ArtistPage {
+                                artist: Artist {
+                                    id,
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            }));
+                        }
+                        Err(err) => {
+                            store.toasts.error(format!("{source_id}: {err}"));
+                            store.active_artist.set(Some(ArtistPage {
+                                artist: Artist {
+                                    id,
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            }));
+                        }
                     }
                 });
             }
             Route::ShowDetail { id } => {
                 let id = id.clone();
                 self.spawn_app(async move {
-                    if let Ok(Ok(show_page)) = blocking(move || src.show(&id, 0)).await {
-                        store.active_show.set(Some(show_page));
+                    let id_bg = id.clone();
+                    let res = blocking(move || src.show(&id_bg, 0)).await;
+                    if store.active_source_id.get_untracked() != source_id {
+                        return;
+                    }
+                    match res {
+                        Ok(Ok(mut show_page)) => {
+                            if show_page.show.id.is_empty() {
+                                show_page.show.id = id;
+                            }
+                            store.active_show.set(Some(show_page));
+                        }
+                        Ok(Err(err)) => {
+                            store.toasts.error(format!("{source_id}: {err}"));
+                            store.active_show.set(Some(ShowPage {
+                                show: Show {
+                                    id,
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            }));
+                        }
+                        Err(err) => {
+                            store.toasts.error(format!("{source_id}: {err}"));
+                            store.active_show.set(Some(ShowPage {
+                                show: Show {
+                                    id,
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            }));
+                        }
                     }
                 });
             }
@@ -2577,6 +3473,12 @@ impl AppStore {
             Route::Settings => {
                 self.refresh_cache_stats();
             }
+            Route::SettingsDetail(section) => {
+                self.refresh_cache_stats();
+                if *section == SettingsSection::Plugins {
+                    self.refresh_sources();
+                }
+            }
             Route::Plugins => {
                 self.refresh_sources();
             }
@@ -2584,9 +3486,73 @@ impl AppStore {
         }
     }
 
+    fn persist_settings(&self) {
+        let snapshot = self.settings.get_untracked();
+        let path = self.settings_path.get();
+        let slot = self.pending_settings_save.get();
+        let saving = self.settings_saving.get();
+        if let Ok(mut guard) = slot.lock() {
+            *guard = Some(snapshot);
+        }
+        if !saving.swap(true, Ordering::AcqRel) {
+            self.spawn_app(async move {
+                let _ = blocking(move || {
+                    loop {
+                        let next = slot.lock().ok().and_then(|mut g| g.take());
+                        match next {
+                            Some(cfg) => {
+                                let _ = cfg.save_to(&path);
+                            }
+                            None => {
+                                saving.store(false, Ordering::Release);
+                                let has_more = slot.lock().ok().is_some_and(|g| g.is_some());
+                                if !has_more || saving.swap(true, Ordering::AcqRel) {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                })
+                .await;
+            });
+        }
+    }
+
+    fn persist_session(&self) {
+        let snapshot = self.session.with(|s| s.clone());
+        let path = self.session_path.get();
+        let slot = self.pending_session_save.get();
+        let saving = self.session_saving.get();
+        if let Ok(mut guard) = slot.lock() {
+            *guard = Some(snapshot);
+        }
+        if !saving.swap(true, Ordering::AcqRel) {
+            self.spawn_app(async move {
+                let _ = blocking(move || {
+                    loop {
+                        let next = slot.lock().ok().and_then(|mut g| g.take());
+                        match next {
+                            Some(sess) => {
+                                let _ = sess.save_to(&path);
+                            }
+                            None => {
+                                saving.store(false, Ordering::Release);
+                                let has_more = slot.lock().ok().is_some_and(|g| g.is_some());
+                                if !has_more || saving.swap(true, Ordering::AcqRel) {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                })
+                .await;
+            });
+        }
+    }
+
     fn on_track_changed(&self, track: &Track) {
-        let src = self.source_by_id(&track.source);
-        src.played(track);
+        self.last_played_reported_id.replace(None);
+
         self.recent_tracks.update(|list| {
             list.retain(|t| t.id != track.id);
             list.insert(0, track.clone());
@@ -2595,9 +3561,11 @@ impl AppStore {
             }
         });
         if track.is_episode() {
-            self.now_playing_panel.set(NowPlayingPanel::Podcast);
+            if self.now_playing_panel.get_untracked() != NowPlayingPanel::Podcast {
+                self.now_playing_panel.set(NowPlayingPanel::Podcast);
+            }
         } else if self.now_playing_panel.get_untracked() == NowPlayingPanel::Podcast {
-            self.now_playing_panel.set(NowPlayingPanel::Lyrics);
+            self.now_playing_panel.set(self.preferred_lyrics_panel());
         }
         self.load_track_extras(track);
     }
@@ -2617,32 +3585,68 @@ impl AppStore {
             track.album.image_url.clone()
         };
 
-        self.current_accent
-            .set(ArtworkLoader::accent_for_seed(&seed));
-
-        let src = self.source_by_id(&track.source);
-        let headers = src.request_headers_for(&raw_cover, RequestKind::Image);
-        let loader = self.artwork.get();
-        let store = *self;
-
-        self.spawn_app(async move {
-            let resolved =
-                background(async move { loader.load(&raw_cover, 600, &seed, &headers).await }).await;
-            if let Ok(art) = resolved
-                && store.last_track_id.with(|id| id.as_deref() == Some(&track_id))
-            {
+        let trimmed_cover = raw_cover.trim();
+        let mut artwork_resolved_sync = false;
+        if trimmed_cover.is_empty() {
+            // No real cover URL to resolve; apply deterministic fallback accent immediately.
+            let fallback = ArtworkLoader::accent_for_seed(&seed);
+            if self.current_accent.get_untracked() != fallback {
+                self.current_accent.set(fallback);
+            }
+        } else {
+            // Preserve the previous track's accent until the real cover resolves so the
+            // Now Playing backdrop never flashes a random seed color (matching mygo-music).
+            // If already cached in memory, apply immediately without waiting.
+            let expanded = ArtworkLoader::resolve_template(trimmed_cover, 600);
+            if let Some(hit) = self.artwork.with(|l| l.cached(&expanded, 600)) {
+                artwork_resolved_sync = true;
                 batch(|| {
-                    store.current_artwork_uri.set(art.uri);
-                    store.current_accent.set(art.accent);
+                    if self.current_artwork_uri.get_untracked() != hit.uri {
+                        self.current_artwork_uri.set(hit.uri);
+                    }
+                    if self.current_accent.get_untracked() != hit.accent {
+                        self.current_accent.set(hit.accent);
+                    }
                 });
             }
-        });
+        }
+
+        if !artwork_resolved_sync {
+            let src = self.source_by_id(&track.source);
+            let headers = src.request_headers_for(&raw_cover, RequestKind::Image);
+            let loader = self.artwork.get();
+            let store = *self;
+
+            self.spawn_app(async move {
+                let resolved =
+                    background(async move { loader.load(&raw_cover, 600, &seed, &headers).await })
+                        .await;
+                if let Ok(art) = resolved
+                    && store
+                        .last_track_id
+                        .with(|id| id.as_deref() == Some(&track_id))
+                {
+                    batch(|| {
+                        if store.current_artwork_uri.get_untracked() != art.uri {
+                            store.current_artwork_uri.set(art.uri);
+                        }
+                        if store.current_accent.get_untracked() != art.accent {
+                            store.current_accent.set(art.accent);
+                        }
+                    });
+                }
+            });
+        }
 
         let src_lrc = self.source_by_id(&track.source);
         let tid_lrc = track.id.clone();
         let tid_check = track.id.clone();
         let store_lrc = *self;
         let can_comments = src_lrc.can("comments");
+        batch(|| {
+            self.lyrics_loading.set(true);
+            self.comments_loading.set(can_comments);
+        });
         self.spawn_app(async move {
             let res = blocking(move || {
                 let lyrics = src_lrc
@@ -2658,41 +3662,94 @@ impl AppStore {
             })
             .await;
 
-            if let Ok((parsed, comment_page)) = res
-                && store_lrc
-                    .last_track_id
-                    .with(|id| id.as_deref() == Some(tid_check.as_str()))
+            if store_lrc
+                .last_track_id
+                .with(|id| id.as_deref() == Some(tid_check.as_str()))
             {
-                let pos = store_lrc.position_ms.get_untracked();
-                let active = parsed.active_position(pos as i64);
-                batch(|| {
-                    store_lrc.lyrics.set(parsed);
-                    store_lrc.active_lyric.set(active);
-                    store_lrc.comments.set(comment_page.comments);
-                    store_lrc.comments_total.set(comment_page.total);
-                    if !can_comments
-                        && store_lrc.now_playing_panel.get_untracked() == NowPlayingPanel::Comments
-                    {
-                        store_lrc.now_playing_panel.set(NowPlayingPanel::Lyrics);
+                match res {
+                    Ok((parsed, comment_page)) => {
+                        let pos = store_lrc.position_ms.get_untracked();
+                        let active = parsed.active_position(pos as i64);
+                        batch(|| {
+                            store_lrc.lyrics.set(parsed);
+                            store_lrc.active_lyric.set(active);
+                            store_lrc.comments.set(comment_page.comments);
+                            store_lrc.comments_total.set(comment_page.total);
+                            store_lrc.lyrics_loading.set(false);
+                            store_lrc.comments_loading.set(false);
+                            if !can_comments
+                                && store_lrc.now_playing_panel.get_untracked()
+                                    == NowPlayingPanel::Comments
+                            {
+                                store_lrc
+                                    .now_playing_panel
+                                    .set(store_lrc.preferred_lyrics_panel());
+                            }
+                        });
                     }
-                });
+                    Err(_) => {
+                        batch(|| {
+                            store_lrc.lyrics_loading.set(false);
+                            store_lrc.comments_loading.set(false);
+                        });
+                    }
+                }
             }
         });
     }
 
     fn update_active_lyric(&self, position_ms: u64) {
-        let next = self
+        let (next, word_synced) = self
             .lyrics
-            .with_untracked(|lrc| lrc.active_position(position_ms as i64));
-        if self.active_lyric.get_untracked() != next {
+            .with_untracked(|lrc| (lrc.active_position(position_ms as i64), lrc.word_synced));
+        let prev = self.active_lyric.get_untracked();
+        let should_update = match (prev, next) {
+            (None, None) => false,
+            (Some(_), None) | (None, Some(_)) => true,
+            (Some(p), Some(n)) => {
+                if p.line_index != n.line_index || p.word_index != n.word_index {
+                    true
+                } else {
+                    let np_open = self.now_playing_open.get_untracked();
+                    let panel = self.now_playing_panel.get_untracked();
+                    let wants_progress =
+                        np_open && (panel == NowPlayingPanel::Stage || word_synced);
+                    wants_progress
+                        && ((p.word_progress - n.word_progress).abs() >= 0.015
+                            || (p.line_progress - n.line_progress).abs() >= 0.02)
+                }
+            }
+        };
+        if should_update {
             self.active_lyric.set(next);
         }
     }
 
+    fn needs_spectrum(&self) -> bool {
+        if self.now_playing_open.get_untracked() {
+            return true;
+        }
+        if self.settings.with_untracked(|s| s.smoke_progress) {
+            return true;
+        }
+        !matches!(
+            self.route.get_untracked(),
+            Route::Settings
+                | Route::SettingsDetail(_)
+                | Route::Plugins
+                | Route::Radio
+                | Route::Podcasts
+                | Route::Playlists
+        )
+    }
+
     fn sync_from_audio_engine(&self) {
-        if let Some((source_id, prompt)) = self
-            .pending_sign_in_prompt
-            .with(|m| m.lock().ok().and_then(|mut g| g.take()))
+        if self
+            .has_sign_in_prompt
+            .with(|flag| flag.swap(false, Ordering::AcqRel))
+            && let Some((source_id, prompt)) = self
+                .pending_sign_in_prompt
+                .with(|m| m.lock().ok().and_then(|mut g| g.take()))
         {
             let sid = if !source_id.is_empty() {
                 source_id
@@ -2701,61 +3758,221 @@ impl AppStore {
                     .with(|s| s.clone())
                     .unwrap_or_else(|| self.active_source_id.get_untracked())
             };
-            self.active_modal
-                .set(ActiveModal::QrSignIn { source_id: sid, prompt });
+            self.active_modal.set(ActiveModal::QrSignIn {
+                source_id: sid,
+                prompt,
+            });
+        }
+
+        if self
+            .has_web_sign_in_request
+            .with(|flag| flag.swap(false, Ordering::AcqRel))
+            && let Some((req, tx)) = self
+                .pending_web_sign_in
+                .with(|m| m.lock().ok().and_then(|mut g| g.take()))
+        {
+            self.active_web_sign_in.with(|slot| {
+                if let Ok(mut guard) = slot.lock()
+                    && let Some(prev_tx) = guard.replace(tx)
+                {
+                    let _ = prev_tx.try_send(Ok(WebSignInResult {
+                        cancelled: true,
+                        ..WebSignInResult::default()
+                    }));
+                }
+            });
+            let sid = if !req.plugin_id.is_empty() {
+                req.plugin_id
+            } else {
+                self.signing_in_source_id
+                    .with(|s| s.clone())
+                    .unwrap_or_else(|| self.active_source_id.get_untracked())
+            };
+            self.active_modal.set(ActiveModal::WebSignIn {
+                source_id: sid,
+                url: req.url,
+                title: req.title,
+                cookies_of: req.cookies_of,
+                until: req.until,
+                user_agent: req.user_agent,
+                allow_manual_cookie: req.allow_manual_cookie,
+            });
+        }
+
+        if self
+            .has_open_url_request
+            .with(|flag| flag.swap(false, Ordering::AcqRel))
+        {
+            let urls = self.pending_open_urls.with(|m| {
+                m.lock()
+                    .map(|mut g| std::mem::take(&mut *g))
+                    .unwrap_or_default()
+            });
+            for url in urls {
+                self.spawn_app(async move {
+                    let _ = nsh_core::element::open_url(url).await;
+                });
+            }
         }
 
         let snap = self.audio.with(|a| a.snapshot());
-        let spec = self.audio.with(|a| a.spectrum());
 
-        let snapshot_changed = self
-            .last_snapshot
-            .with(|prev| prev.as_ref() != Some(&snap));
+        let snapshot_changed = self.last_snapshot.with(|prev| prev.as_ref() != Some(&snap));
 
         if snapshot_changed {
-            self.last_snapshot.replace(Some(snap.clone()));
-
             let engine_has_track = snap.current_track.is_some();
             let engine_playing = snap.status.is_playing();
+            let status_changed = self.playback_status.with_untracked(|s| *s != snap.status);
+            let track_changed = snap.current_track.as_ref().is_some_and(|tr| {
+                self.last_track_id
+                    .with(|prev| prev.as_deref() != Some(tr.id.as_str()))
+            });
+            let queue_changed = !snap.queue.is_empty()
+                && self
+                    .last_snapshot
+                    .with(|prev| prev.as_ref().is_none_or(|p| p.queue != snap.queue));
+            let track_meta_changed = track_changed
+                || self.last_snapshot.with(|prev| {
+                    prev.as_ref().and_then(|p| p.current_track.as_ref())
+                        != snap.current_track.as_ref()
+                });
 
+            self.last_snapshot.replace(Some(snap.clone()));
+
+            let mut pos_updated = false;
+            let mut playback_error_toast: Option<String> = None;
             batch(|| {
                 if engine_has_track || snap.status != PlaybackStatus::Stopped {
-                    self.playback_status.set(snap.status.clone());
-                    self.is_playing.set(engine_playing);
-                    self.position_ms.set(snap.position_ms);
-                    if snap.duration_ms > 0 {
+                    if status_changed {
+                        self.playback_status.set(snap.status.clone());
+                        if let PlaybackStatus::Error(ref msg) = snap.status {
+                            log::warn!(target: "nsh_music_ui", "playback error: {msg}");
+                            playback_error_toast = Some(msg.clone());
+                        }
+                    }
+                    if self.is_playing.get_untracked() != engine_playing {
+                        self.is_playing.set(engine_playing);
+                    }
+
+                    let cur_pos = self.position_ms.get_untracked();
+                    if snap.position_ms != cur_pos {
+                        let np_open = self.now_playing_open.get_untracked();
+                        let panel = self.now_playing_panel.get_untracked();
+                        let fine_pos = np_open
+                            && (panel == NowPlayingPanel::Stage
+                                || (panel == NowPlayingPanel::Lyrics
+                                    && self.lyrics.with_untracked(|l| l.word_synced))
+                                || self.settings.with_untracked(|s| s.smoke_progress));
+                        let pos_threshold: u64 = if fine_pos { 30 } else { 100 };
+                        let boundary_hit = snap.position_ms == 0
+                            || (snap.duration_ms > 0 && snap.position_ms >= snap.duration_ms);
+                        if status_changed
+                            || track_changed
+                            || boundary_hit
+                            || snap.position_ms < cur_pos
+                            || snap.position_ms.abs_diff(cur_pos) >= pos_threshold
+                        {
+                            self.position_ms.set(snap.position_ms);
+                            pos_updated = true;
+                        }
+                    }
+
+                    if snap.duration_ms > 0 && self.duration_ms.get_untracked() != snap.duration_ms
+                    {
                         self.duration_ms.set(snap.duration_ms);
                     }
-                    self.buffered_ms.set(snap.buffered_ms);
-                    self.volume.set(snap.volume);
-                    self.muted.set(snap.muted);
-                    self.shuffle.set(snap.shuffle);
-                    self.repeat.set(snap.repeat);
+                    let cur_buf = self.buffered_ms.get_untracked();
+                    if snap.buffered_ms != cur_buf
+                        && (snap.buffered_ms.abs_diff(cur_buf) >= 250
+                            || snap.buffered_ms == snap.duration_ms
+                            || snap.buffered_ms == 0)
+                    {
+                        self.buffered_ms.set(snap.buffered_ms);
+                    }
+                    if (self.volume.get_untracked() - snap.volume).abs() > 1e-4 {
+                        self.volume.set(snap.volume);
+                    }
+                    if self.muted.get_untracked() != snap.muted {
+                        self.muted.set(snap.muted);
+                    }
+                    if self.shuffle.get_untracked() != snap.shuffle {
+                        self.shuffle.set(snap.shuffle);
+                    }
+                    if self.repeat.get_untracked() != snap.repeat {
+                        self.repeat.set(snap.repeat);
+                    }
+                    if self.current_is_lossless.get_untracked() != snap.is_lossless {
+                        self.current_is_lossless.set(snap.is_lossless);
+                    }
+                } else if self.current_is_lossless.get_untracked() {
+                    self.current_is_lossless.set(false);
                 }
-                if !snap.queue.is_empty() {
+
+                if queue_changed {
                     self.queue.set(snap.queue.clone());
+                }
+                if !snap.queue.is_empty()
+                    && self.current_index.get_untracked() != snap.current_index
+                {
                     self.current_index.set(snap.current_index);
                 }
                 if let Some(ref tr) = snap.current_track {
-                    let changed_track = self
-                        .last_track_id
-                        .with(|prev| prev.as_deref() != Some(tr.id.as_str()));
-                    self.current_track.set(Some(tr.clone()));
-                    if changed_track {
+                    if track_meta_changed {
+                        self.current_track.set(Some(tr.clone()));
+                    }
+                    if track_changed {
                         self.on_track_changed(tr);
+                    }
+                } else if snap.status == PlaybackStatus::Stopped {
+                    if self.lyrics_loading.get_untracked() {
+                        self.lyrics_loading.set(false);
+                    }
+                    if self.comments_loading.get_untracked() {
+                        self.comments_loading.set(false);
                     }
                 }
             });
 
-            if engine_has_track {
+            if let Some(msg) = playback_error_toast {
+                self.toasts.error(msg);
+            }
+
+            if snap.status == PlaybackStatus::Playing
+                && let Some(ref tr) = snap.current_track
+                && self
+                    .last_played_reported_id
+                    .with(|prev| prev.as_deref() != Some(tr.id.as_str()))
+            {
+                self.last_played_reported_id.replace(Some(tr.id.clone()));
+                let src = self.source_by_id(&tr.source);
+                let played_track = tr.clone();
+                self.spawn_app(async move {
+                    let _ = blocking(move || {
+                        src.played(&played_track);
+                    })
+                    .await;
+                });
+            }
+
+            if engine_has_track && (pos_updated || track_changed || status_changed) {
                 self.update_active_lyric(snap.position_ms);
             }
         }
 
-        if self.is_playing.get_untracked() {
-            self.spectrum.set(spec);
-        } else if self.spectrum.with_untracked(|s| s.iter().any(|&v| v > 0.001)) {
+        if self.is_playing.get_untracked() && self.needs_spectrum() {
+            let spec = self.audio.with(|a| a.spectrum());
+            let changed = self.spectrum.with_untracked(|prev| {
+                prev.iter()
+                    .zip(spec.iter())
+                    .any(|(a, b)| (a - b).abs() >= 0.015)
+            });
+            if changed {
+                self.spectrum.set(spec);
+                self.spectrum_is_zero.replace(false);
+            }
+        } else if !self.spectrum_is_zero.get() {
             self.spectrum.set([0.0; SPECTRUM_BANDS]);
+            self.spectrum_is_zero.replace(true);
         }
     }
 }
@@ -2801,7 +4018,10 @@ fn dir_file_bytes(dir: &Path) -> u64 {
 }
 
 fn infer_audio_ext(media_type: &str, url: &str) -> String {
-    let mt = media_type.trim().trim_start_matches('.').to_ascii_lowercase();
+    let mt = media_type
+        .trim()
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
     for ext in ["flac", "m4a", "mp3", "ogg", "opus", "wav", "aac", "alac"] {
         if mt == ext || mt.ends_with(&format!("/{ext}")) {
             return ext.to_owned();
@@ -2834,5 +4054,463 @@ fn sanitize_filename(name: &str) -> String {
         "track".to_owned()
     } else {
         trimmed.to_owned()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SandboxPaths {
+    settings_path: PathBuf,
+    session_path: PathBuf,
+    local_covers_dir: PathBuf,
+    local_library_path: PathBuf,
+    plugins_dir: PathBuf,
+    plugin_data_dir: PathBuf,
+    audio_cache_dir: PathBuf,
+    artwork_cache_dir: PathBuf,
+}
+
+fn sandbox_root_dir() -> PathBuf {
+    if let Some(dir) = nsh_core::element::data_dir()
+        && std::fs::create_dir_all(&dir).is_ok()
+    {
+        return dir;
+    }
+    #[cfg(target_env = "ohos")]
+    {
+        let fallback = PathBuf::from("/data/storage/el2/base/haps/entry/files/nsh-music");
+        if std::fs::create_dir_all(&fallback).is_ok() {
+            return fallback;
+        }
+    }
+    let fallback = std::env::temp_dir().join("nsh-music");
+    let _ = std::fs::create_dir_all(&fallback);
+    fallback
+}
+
+fn sandbox_paths_from_root(root: &Path) -> SandboxPaths {
+    SandboxPaths {
+        settings_path: root.join("settings.json"),
+        session_path: root.join("session.json"),
+        local_covers_dir: root.join("local-covers"),
+        local_library_path: root.join("local-library.json"),
+        plugins_dir: root.join("plugins"),
+        plugin_data_dir: root.join("plugin-data"),
+        audio_cache_dir: root.join("audio-cache"),
+        artwork_cache_dir: root.join("artwork-cache"),
+    }
+}
+
+#[cfg(test)]
+impl AppStore {
+    fn new_isolated_for_test(root: &Path) -> Self {
+        let sandbox = sandbox_paths_from_root(root);
+        let settings = AppSettings::default();
+        let session = PlaybackSession::default();
+        let local = Arc::new(LocalMusicSource::with_storage(
+            Vec::new(),
+            sandbox.local_covers_dir.clone(),
+            Some(sandbox.local_library_path.clone()),
+        ));
+        let plugin_mgr = Arc::new(
+            PluginManager::new(&sandbox.plugins_dir, &sandbox.plugin_data_dir)
+                .expect("init isolated plugin manager"),
+        );
+        let mut audio_cfg = AudioEngineConfig::default();
+        audio_cfg.cache.cache_dir = sandbox.audio_cache_dir.clone();
+        let audio =
+            AudioEngine::with_output(audio_cfg, Box::new(nsh_music_audio::NullOutput::new()))
+                .expect("init isolated audio engine");
+        let artwork = ArtworkLoader::new(sandbox.artwork_cache_dir.clone());
+
+        Self {
+            route: signal(Route::Home),
+            nav_history: signal(vec![Route::Home]),
+            nav_forward: signal(Vec::new()),
+            page_scrolled: signal(false),
+            sidebar_collapsed: signal(false),
+            mobile_drawer_open: signal(false),
+
+            active_source_id: signal(LocalMusicSource::SOURCE_ID.to_owned()),
+            sources: signal(Vec::new()),
+            plugins: signal(Vec::new()),
+            plugin_busy: signal(false),
+            plugin_error: signal(None),
+            signing_in_source: signal(None),
+            backend_caps: signal(audio_backend_capabilities()),
+
+            playback_status: signal(PlaybackStatus::Stopped),
+            is_playing: signal(false),
+            current_track: signal(None),
+            queue: signal(Vec::new()),
+            current_index: signal(None),
+            position_ms: signal(0),
+            duration_ms: signal(0),
+            buffered_ms: signal(0),
+            volume: signal(1.0),
+            muted: signal(false),
+            shuffle: signal(false),
+            repeat: signal(RepeatMode::Off),
+            spectrum: signal([0.0; SPECTRUM_BANDS]),
+            current_is_lossless: signal(false),
+            current_artwork_uri: signal(SharedString::default()),
+            current_accent: signal(theme::default_artwork_accent()),
+            remote_devices: signal(Vec::new()),
+            active_remote_device: signal(None),
+            cache_used_bytes: signal(0),
+
+            lyrics: signal(ParsedLyrics::default()),
+            lyrics_loading: signal(false),
+            active_lyric: signal(None),
+            show_translation: signal(true),
+            show_romaji: signal(false),
+            comments: signal(Vec::new()),
+            comments_total: signal(0),
+            comments_loading: signal(false),
+
+            now_playing_open: signal(false),
+            now_playing_mode: signal(NowPlayingMode::Cover),
+            stage_style: signal(NowPlayingStageStyle::Flow),
+            now_playing_panel: signal(NowPlayingPanel::Lyrics),
+            stage_fullscreen: signal(false),
+
+            search_query: signal(String::new()),
+            search_tab: signal(SearchKind::Tracks),
+            search_results: signal(SearchResult::default()),
+            search_loading: signal(false),
+            recent_searches: signal(Vec::new()),
+            search_suggestions: signal(Vec::new()),
+            search_suggest_open: signal(false),
+
+            home_data: signal(Browse::default()),
+            browse_data: signal(Browse::default()),
+            browse_loading: signal(false),
+            playlists: signal(Vec::new()),
+            active_playlist: signal(None),
+            active_album: signal(None),
+            active_artist: signal(None),
+            liked_tracks: signal(Vec::new()),
+            liked_ids: signal(HashSet::new()),
+            recent_tracks: signal(Vec::new()),
+            saved_albums: signal(Vec::new()),
+            stations: signal(Vec::new()),
+            podcasts: signal(Vec::new()),
+            active_show: signal(None),
+
+            settings: signal(settings),
+            settings_window_open: signal(false),
+            settings_section: signal(SettingsSection::General),
+            locale: signal(Locale::En),
+            theme_override: signal(ThemeMode::System),
+            active_modal: signal(ActiveModal::None),
+            toasts: ToastController::new(),
+
+            local: stored(local),
+            plugin_mgr: stored(plugin_mgr),
+            audio: stored(audio),
+            artwork: stored(artwork),
+            session: stored(session),
+            settings_path: stored(sandbox.settings_path),
+            session_path: stored(sandbox.session_path),
+            last_track_id: stored(None),
+            last_played_reported_id: stored(None),
+            last_snapshot: stored(None),
+            active_station_id: stored(None),
+            pending_sign_in_prompt: stored(Arc::new(Mutex::new(None))),
+            has_sign_in_prompt: stored(Arc::new(AtomicBool::new(false))),
+            pending_web_sign_in: stored(Arc::new(Mutex::new(None))),
+            has_web_sign_in_request: stored(Arc::new(AtomicBool::new(false))),
+            active_web_sign_in: stored(Arc::new(Mutex::new(None))),
+            pending_open_urls: stored(Arc::new(Mutex::new(Vec::new()))),
+            has_open_url_request: stored(Arc::new(AtomicBool::new(false))),
+            signing_in_source_id: stored(None),
+            search_suggest_gen: stored(0),
+            browse_cache: stored(HashMap::new()),
+            browse_req_gen: stored(0),
+            spectrum_is_zero: stored(true),
+            pending_settings_save: stored(Arc::new(Mutex::new(None))),
+            settings_saving: stored(Arc::new(AtomicBool::new(false))),
+            pending_session_save: stored(Arc::new(Mutex::new(None))),
+            session_saving: stored(Arc::new(AtomicBool::new(false))),
+            root_owner: Owner::current(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nsh_music_audio::NullOutput;
+
+    #[component]
+    fn AuthStoreTestApp() -> impl IntoElement {
+        let root =
+            std::env::temp_dir().join(format!("nsh-music-auth-store-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = AppStore::new_isolated_for_test(&root);
+
+        assert!(store.signing_in_source.get_untracked().is_none());
+
+        store.sources.set(vec![SourceEntry {
+            info: SourceInfo {
+                id: "ytm-test".to_owned(),
+                name: "YouTube Music".to_owned(),
+                ..SourceInfo::default()
+            },
+            compat: SourceCompat::default(),
+            is_local: false,
+            account: None,
+            capabilities: HashSet::new(),
+        }]);
+
+        store.apply_signed_in_account(
+            "ytm-test",
+            Account {
+                id: "u42".to_owned(),
+                name: "Alice".to_owned(),
+                image_url: String::new(),
+                page: String::new(),
+            },
+        );
+
+        let applied = store.sources.with_untracked(|list| {
+            list.iter()
+                .find(|e| e.info.id == "ytm-test")
+                .and_then(|e| e.account.clone())
+        });
+        assert_eq!(
+            applied.as_ref().map(|a| (a.id.as_str(), a.name.as_str())),
+            Some(("u42", "Alice"))
+        );
+
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        store.active_web_sign_in.with(|slot| {
+            *slot.lock().unwrap() = Some(tx);
+        });
+        store.open_modal(ActiveModal::WebSignIn {
+            source_id: "ytm-test".to_owned(),
+            url: "https://music.youtube.com/".to_owned(),
+            title: "Sign In".to_owned(),
+            cookies_of: Some("https://music.youtube.com".to_owned()),
+            until: vec!["SAPISID".to_owned()],
+            user_agent: None,
+            allow_manual_cookie: true,
+        });
+        assert!(matches!(
+            store.active_modal.get_untracked(),
+            ActiveModal::WebSignIn { .. }
+        ));
+
+        store.submit_web_sign_in_result(WebSignInResult {
+            ok: true,
+            url: "https://music.youtube.com/".to_owned(),
+            cookie: "SAPISID=tok".to_owned(),
+            ..WebSignInResult::default()
+        });
+        assert_eq!(store.active_modal.get_untracked(), ActiveModal::None);
+        let received = rx
+            .try_recv()
+            .expect("responder channel receives result")
+            .expect("result is Ok");
+        assert!(received.ok);
+        assert_eq!(received.cookie, "SAPISID=tok");
+
+        store.audio.with(|a| a.shutdown());
+        let _ = std::fs::remove_dir_all(&root);
+
+        view()
+            .test_id("auth-store-test-ok")
+            .w(px(120.0))
+            .h(px(40.0))
+            .child(text("ok"))
+    }
+
+    #[test]
+    fn apply_signed_in_account_and_submit_web_sign_in_result_work() {
+        let viewport = nsh_core::geometry::Size::new(
+            nsh_core::geometry::Points(400.0),
+            nsh_core::geometry::Points(300.0),
+        );
+        let root = nsh_engine::Root::of::<AuthStoreTestApp>()
+            .tokens(crate::app_tokens())
+            .app_id("com.richerfu.nshmusic.auth_store_test");
+        let mut config = nsh_engine::EngineConfig::new(root);
+        config.viewport = viewport;
+        config.environment = nsh_engine::Environment {
+            window: viewport,
+            ..nsh_engine::Environment::default()
+        };
+        let mut app = nsh_testing::Headless::start(config).expect("headless auth test starts");
+        app.wait_for("id:auth-store-test-ok")
+            .expect("auth store assertions passed");
+    }
+
+    #[component]
+    fn BrowseCacheStoreTestApp() -> impl IntoElement {
+        let root = std::env::temp_dir().join(format!(
+            "nsh-music-browse-cache-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = AppStore::new_isolated_for_test(&root);
+        store.hydrate_active_source_sync();
+
+        let browse_root = Route::Browse {
+            page: String::new(),
+            title: String::new(),
+        };
+
+        // Track reactive route notifications to verify repeated switch_tab is a true no-op.
+        let route_writes = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let route_writes_eff = std::rc::Rc::clone(&route_writes);
+        effect(move || {
+            let _ = store.route.get();
+            route_writes_eff.set(route_writes_eff.get() + 1);
+        });
+
+        // 1. Home -> Browse hits cache populated by hydrate_active_source_sync (browse_loading stays false).
+        store.switch_tab(browse_root.clone());
+        assert_eq!(store.route.get_untracked(), browse_root);
+        assert!(
+            !store.browse_loading.get_untracked(),
+            "Home -> Browse must hit browse_cache without setting browse_loading"
+        );
+
+        // 2. Repeated switch_tab to active Browse tab is a no-op with zero redundant route updates.
+        let writes_before = route_writes.get();
+        store.switch_tab(browse_root.clone());
+        store.switch_tab(browse_root.clone());
+        store.navigate(browse_root.clone());
+        assert_eq!(
+            route_writes.get(),
+            writes_before,
+            "repeated switch_tab / navigate to active Browse must not emit redundant route writes"
+        );
+        assert!(!store.browse_loading.get_untracked());
+
+        // 3. Home -> Browse -> Library -> Browse hits cache with browse_loading == false every step.
+        store.switch_tab(Route::Library);
+        assert_eq!(store.route.get_untracked(), Route::Library);
+        assert!(!store.browse_loading.get_untracked());
+
+        store.switch_tab(browse_root.clone());
+        assert_eq!(store.route.get_untracked(), browse_root);
+        assert!(
+            !store.browse_loading.get_untracked(),
+            "Browse -> Library -> Browse must hit cache with browse_loading == false"
+        );
+
+        store.audio.with(|a| a.shutdown());
+        let _ = std::fs::remove_dir_all(&root);
+
+        view()
+            .test_id("browse-cache-test-ok")
+            .w(px(120.0))
+            .h(px(40.0))
+            .child(text("ok"))
+    }
+
+    #[test]
+    fn browse_tab_switching_is_idempotent_and_uses_cache() {
+        let viewport = nsh_core::geometry::Size::new(
+            nsh_core::geometry::Points(400.0),
+            nsh_core::geometry::Points(300.0),
+        );
+        let root = nsh_engine::Root::of::<BrowseCacheStoreTestApp>()
+            .tokens(crate::app_tokens())
+            .app_id("com.richerfu.nshmusic.browse_cache_test");
+        let mut config = nsh_engine::EngineConfig::new(root);
+        config.viewport = viewport;
+        config.environment = nsh_engine::Environment {
+            window: viewport,
+            ..nsh_engine::Environment::default()
+        };
+        let mut app =
+            nsh_testing::Headless::start(config).expect("headless browse cache test starts");
+        app.wait_for("id:browse-cache-test-ok")
+            .expect("browse cache & idempotent switch_tab assertions passed");
+    }
+
+    #[test]
+    fn sandbox_paths_stay_inside_root_and_audio_engine_initializes() {
+        let root = std::env::temp_dir().join(format!(
+            "nsh-music-sandbox-paths-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let paths = sandbox_paths_from_root(&root);
+        let expected = [
+            (&paths.settings_path, "settings.json"),
+            (&paths.session_path, "session.json"),
+            (&paths.local_covers_dir, "local-covers"),
+            (&paths.local_library_path, "local-library.json"),
+            (&paths.plugins_dir, "plugins"),
+            (&paths.plugin_data_dir, "plugin-data"),
+            (&paths.audio_cache_dir, "audio-cache"),
+            (&paths.artwork_cache_dir, "artwork-cache"),
+        ];
+        for (path, leaf) in expected {
+            assert!(
+                path.starts_with(&root),
+                "{} must stay inside {}",
+                path.display(),
+                root.display()
+            );
+            assert_eq!(path.file_name().and_then(|n| n.to_str()), Some(leaf));
+        }
+
+        let mut cfg = AudioEngineConfig::default();
+        cfg.cache.cache_dir = paths.audio_cache_dir.clone();
+        let engine = AudioEngine::with_output(cfg, Box::new(NullOutput::new()))
+            .expect("AudioEngine initializes with sandbox audio_cache_dir");
+        assert!(paths.audio_cache_dir.is_dir());
+        engine.shutdown();
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn settings_section_and_phone_secondary_route_classification() {
+        for section in SettingsSection::ALL {
+            assert!(!section.key().is_empty());
+            assert!(section.title_key().starts_with("settings.section."));
+            let route = Route::SettingsDetail(section);
+            assert_eq!(route.key(), format!("settings:{}", section.key()));
+            assert_eq!(route.title_key(), section.title_key());
+            assert!(AppStore::is_phone_secondary_route(&route));
+        }
+
+        // Root Phone tabs are never secondary routes.
+        assert!(!AppStore::is_phone_secondary_route(&Route::Home));
+        assert!(!AppStore::is_phone_secondary_route(&Route::Browse {
+            page: String::new(),
+            title: String::new(),
+        }));
+        assert!(!AppStore::is_phone_secondary_route(&Route::Library));
+        assert!(!AppStore::is_phone_secondary_route(&Route::Settings));
+
+        // Drilled-down / sub-pages ARE secondary routes.
+        for secondary in [
+            Route::Browse {
+                page: "charts".to_owned(),
+                title: "Charts".to_owned(),
+            },
+            Route::Search,
+            Route::Liked,
+            Route::Playlists,
+            Route::PlaylistDetail { id: "p1".into() },
+            Route::AlbumDetail { id: "a1".into() },
+            Route::ArtistDetail { id: "ar1".into() },
+            Route::ShowDetail { id: "s1".into() },
+            Route::Recent,
+            Route::Local,
+            Route::Radio,
+            Route::Podcasts,
+        ] {
+            assert!(
+                AppStore::is_phone_secondary_route(&secondary),
+                "{secondary:?} should be a secondary route on Phone"
+            );
+        }
     }
 }

@@ -7,6 +7,7 @@
 
 use nsh_base::{SheetEvent, button, sheet};
 use nsh_core::prelude::*;
+use nsh_music_audio::PlaybackStatus;
 use nsh_music_core::model::{NavItem, Playlist};
 
 use crate::{
@@ -14,11 +15,11 @@ use crate::{
     state::{ActiveModal, AppStore, NowPlayingPanel, Route},
     ui::{
         controls::{
-            artwork_box, heart_button, icon_button, icon_button_tinted, play_pause_button,
-            source_pill,
+            artwork_box, heart_button, icon_button, icon_button_tinted,
+            play_pause_button_buffering, source_pill,
         },
         icons::{Icon, icon, icon_reactive},
-        motion,
+        loading_spinner, motion,
         theme::{self, DeviceForm, Elevated, Elevation, colors, font_size, radius},
     },
 };
@@ -78,7 +79,7 @@ fn pad_landscape_body(store: AppStore, form: DeviceForm) -> View {
                 .h_full()
                 .child(pad_top_bar(store, false))
                 .child(pad_main_viewport(store, form))
-                .child(pad_floating_player_dock(store)),
+                .child(pad_floating_player_dock(store, true)),
         )
 }
 
@@ -89,7 +90,7 @@ fn pad_portrait_body(store: AppStore, form: DeviceForm) -> View {
         .h_full()
         .child(pad_top_bar(store, true))
         .child(pad_main_viewport(store, form))
-        .child(pad_floating_player_dock(store))
+        .child(pad_floating_player_dock(store, false))
 }
 
 fn pad_left_rail(store: AppStore) -> View {
@@ -97,12 +98,13 @@ fn pad_left_rail(store: AppStore) -> View {
 
     view()
         .test_id("pad-icon-rail")
-        .w(px(PAD_RAIL_WIDTH))
+        .w(move || px(PAD_RAIL_WIDTH + safe_area().left.0))
         .flex_shrink_0()
         .h_full()
         .pt(move || px(safe_area().top.0 + 10.0))
         .pb(move || px(safe_area().bottom.0 + 12.0))
-        .px_2()
+        .pl(move || px(safe_area().left.0 + 8.0))
+        .pr_2()
         .items_center()
         .justify_between()
         .bg(theme::sidebar)
@@ -201,13 +203,6 @@ fn pad_left_rail(store: AppStore) -> View {
                 .border_color(theme::sidebar_border)
                 .child(pad_rail_item(
                     store,
-                    Icon::Plugin,
-                    "nav.plugins",
-                    Route::Plugins,
-                    "pad-nav-plugins",
-                ))
-                .child(pad_rail_item(
-                    store,
                     Icon::Settings,
                     "nav.settings",
                     Route::Settings,
@@ -224,9 +219,10 @@ fn pad_rail_item(
     test_id: &'static str,
 ) -> impl IntoElement {
     let target_check = target.clone();
-    let active = computed(move || match (&store.route.get(), &target_check) {
-        (Route::Browse { page: a, .. }, Route::Browse { page: b, .. }) => b.is_empty() || a == b,
-        (a, b) => a == b,
+    let active = computed(move || {
+        let current = store.route.get();
+        let custom = active_custom_nav(store);
+        pad_route_matches(&current, &target_check, &custom)
     });
 
     button()
@@ -347,12 +343,25 @@ fn pad_top_bar(store: AppStore, show_drawer_btn: bool) -> View {
         .flex_shrink_0()
         .pt(move || px(safe_area().top.0 + 8.0))
         .pb_2()
-        .px_4()
+        .pl(move || {
+            if show_drawer_btn {
+                px(safe_area().left.0 + 16.0)
+            } else {
+                px(16.0)
+            }
+        })
+        .pr(move || px(safe_area().right.0 + 16.0))
         .flex_row()
         .items_center()
         .justify_between()
         .gap_3()
-        .glass_bar_surface()
+        .bg(move || {
+            if store.page_scrolled.get() {
+                theme::card()
+            } else {
+                theme::bg()
+            }
+        })
         .border_b_1()
         .border_color(theme::border)
         .child(
@@ -416,9 +425,13 @@ fn pad_top_bar(store: AppStore, show_drawer_btn: bool) -> View {
                     },
                 ))
                 .child(
-                    source_pill(move || store.active_source_name(), true, move || {
-                        store.open_modal(ActiveModal::SourceSwitcher);
-                    })
+                    source_pill(
+                        move || store.active_source_name(),
+                        true,
+                        move || {
+                            store.open_modal(ActiveModal::SourceSwitcher);
+                        },
+                    )
                     .min_w(px(44.0))
                     .min_h(px(44.0))
                     .test_id("pad-source-switcher"),
@@ -449,7 +462,10 @@ fn pad_top_bar(store: AppStore, show_drawer_btn: bool) -> View {
                     icon_button_tinted(
                         Icon::Settings,
                         move || {
-                            if store.route.get() == Route::Settings {
+                            if matches!(
+                                store.route.get(),
+                                Route::Settings | Route::SettingsDetail(_)
+                            ) {
                                 theme::primary()
                             } else {
                                 theme::fg()
@@ -472,7 +488,7 @@ fn pad_main_viewport(store: AppStore, form: DeviceForm) -> View {
         .child(pages::render_route(store, form))
 }
 
-fn pad_floating_player_dock(store: AppStore) -> View {
+fn pad_floating_player_dock(store: AppStore, has_left_rail: bool) -> View {
     let track_seed = computed(move || {
         store.current_track.with(|t| match t {
             Some(tr) if !tr.album.id.is_empty() => SharedString::from(tr.album.id.clone()),
@@ -487,171 +503,211 @@ fn pad_floating_player_dock(store: AppStore) -> View {
             .with(|t| t.as_ref().is_some_and(|tr| store.is_liked(&tr.id)))
     });
 
-    let progress_ratio = move || {
+    let is_loading = computed(move || store.playback_status.with(PlaybackStatus::is_loading));
+
+    let progress_ratio = computed(move || {
         let dur = store.duration_ms.get();
         if dur == 0 {
             0.0_f32
         } else {
-            (store.position_ms.get() as f32 / dur as f32).clamp(0.0, 1.0)
+            let raw = (store.position_ms.get() as f32 / dur as f32).clamp(0.0, 1.0);
+            (raw * 400.0).round() / 400.0
         }
-    };
+    });
 
     view()
         .w_full()
-        .px_4()
+        .pl(move || {
+            if has_left_rail {
+                px(16.0)
+            } else {
+                px(safe_area().left.0 + 16.0)
+            }
+        })
+        .pr(move || px(safe_area().right.0 + 16.0))
         .pt_1()
         .pb(move || px(safe_area().bottom.0 + 12.0))
         .flex_shrink_0()
         .child(
-            view()
-                .test_id("pad-player-dock")
-                .w_full()
-                .h(px(PAD_DOCK_HEIGHT))
-                .rounded(px(radius::XL))
-                .glass_surface()
-                .overflow_hidden()
-                .child(
-                    view()
-                        .flex_1()
-                        .w_full()
-                        .px_3p5()
-                        .flex_row()
-                        .items_center()
-                        .justify_between()
-                        .gap_3()
-                        // Tappable artwork + metadata.
-                        .child(
-                            button()
-                                .test_id("pad-now-playing-trigger")
-                                .accessibility_label(move || Some(store.t("now_playing.expand")))
-                                .on_press(move || store.open_now_playing())
-                                .flex_1()
-                                .min_w(px(44.0))
-                                .min_h(px(48.0))
-                                .flex_row()
-                                .items_center()
-                                .gap_3()
-                                .rounded(px(radius::CONTROL))
-                                .active(|s| s.opacity(0.8))
-                                .focus_visible(|s| {
-                                    s.outline(px(2.0)).outline_color(theme::ring)
+            Elevated::elevation(
+                view()
+                    .test_id("pad-player-dock")
+                    .w_full()
+                    .h(px(PAD_DOCK_HEIGHT))
+                    .rounded(px(radius::XL))
+                    .bg(theme::card_elevated)
+                    .border_1()
+                    .border_color(theme::border)
+                    .overflow_hidden(),
+                Elevation::Floating,
+            )
+            .child(
+                view()
+                    .flex_1()
+                    .w_full()
+                    .px_3p5()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    // Tappable artwork + metadata.
+                    .child(
+                        button()
+                            .test_id("pad-now-playing-trigger")
+                            .accessibility_label(move || Some(store.t("now_playing.expand")))
+                            .on_press(move || store.open_now_playing())
+                            .flex_1()
+                            .min_w(px(44.0))
+                            .min_h(px(48.0))
+                            .flex_row()
+                            .items_center()
+                            .gap_3()
+                            .rounded(px(radius::CONTROL))
+                            .active(|s| s.opacity(0.8))
+                            .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
+                            .child(dynamic(move || {
+                                let seed = track_seed.get();
+                                untracked(move || {
+                                    artwork_box(
+                                        store.current_artwork_uri,
+                                        seed,
+                                        48.0,
+                                        radius::CONTROL,
+                                    )
                                 })
-                                .child(dynamic(move || {
-                                    let seed = track_seed.get();
-                                    untracked(move || {
-                                        artwork_box(
-                                            store.current_artwork_uri,
-                                            seed,
-                                            48.0,
-                                            radius::CONTROL,
-                                        )
-                                    })
-                                }))
-                                .child(
-                                    view()
-                                        .flex_1()
-                                        .min_w(px(0.0))
-                                        .gap_0p5()
-                                        .child(
-                                            text(move || {
-                                                store.current_track.with(|t| match t {
-                                                    Some(tr) => SharedString::from(tr.name.clone()),
-                                                    None => store.t("player.idle_title"),
-                                                })
+                            }))
+                            .child(
+                                view()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .gap_0p5()
+                                    .child(
+                                        text(move || {
+                                            store.current_track.with(|t| match t {
+                                                Some(tr) => SharedString::from(tr.name.clone()),
+                                                None => store.t("player.idle_title"),
                                             })
-                                            .number_of_lines(1)
-                                            .text_size(px(font_size::BODY_MOBILE))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(theme::fg),
-                                        )
-                                        .child(
-                                            text(move || {
-                                                store.current_track.with(|t| match t {
-                                                    Some(tr) => {
-                                                        SharedString::from(tr.artist_names())
+                                        })
+                                        .number_of_lines(1)
+                                        .text_size(px(font_size::BODY_MOBILE))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(theme::fg),
+                                    )
+                                    .child(
+                                        view()
+                                            .w_full()
+                                            .min_w(px(0.0))
+                                            .flex_row()
+                                            .items_center()
+                                            .gap_1p5()
+                                            .child(when(is_loading, move || {
+                                                loading_spinner(11.0, theme::muted_fg)
+                                            }))
+                                            .child(
+                                                text(move || match store.playback_status.get() {
+                                                    PlaybackStatus::Loading => {
+                                                        store.t("player.buffering")
                                                     }
-                                                    None => SharedString::default(),
+                                                    PlaybackStatus::Error(msg) => {
+                                                        SharedString::from(msg)
+                                                    }
+                                                    _ => store.current_track.with(|t| match t {
+                                                        Some(tr) => {
+                                                            SharedString::from(tr.artist_names())
+                                                        }
+                                                        None => SharedString::default(),
+                                                    }),
                                                 })
-                                            })
-                                            .number_of_lines(1)
-                                            .text_size(px(font_size::CAPTION))
-                                            .text_color(theme::muted_fg),
-                                        ),
-                                ),
-                        )
-                        // Touch-friendly (>= 44pt) transport controls.
-                        .child(
-                            view()
-                                .flex_row()
-                                .items_center()
-                                .gap_1()
-                                .flex_shrink_0()
-                                .child(heart_button(
-                                    track_liked,
-                                    move || {
-                                        if track_liked.get() {
-                                            store.t("player.unlike")
-                                        } else {
-                                            store.t("player.like")
-                                        }
-                                    },
-                                    move || store.toggle_like_current(),
-                                ))
-                                .child(
-                                    icon_button(
-                                        Icon::Prev,
-                                        move || store.t("player.prev"),
-                                        move || store.prev_track(),
-                                    )
-                                    .test_id("pad-prev-btn"),
+                                                .flex_1()
+                                                .min_w(px(0.0))
+                                                .number_of_lines(1)
+                                                .text_size(px(font_size::CAPTION))
+                                                .text_color(move || {
+                                                    if matches!(
+                                                        store.playback_status.get(),
+                                                        PlaybackStatus::Error(_)
+                                                    ) {
+                                                        theme::danger()
+                                                    } else {
+                                                        theme::muted_fg()
+                                                    }
+                                                }),
+                                            ),
+                                    ),
+                            ),
+                    )
+                    // Touch-friendly (>= 44pt) transport controls.
+                    .child(
+                        view()
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
+                            .flex_shrink_0()
+                            .child(heart_button(
+                                track_liked,
+                                move || {
+                                    if track_liked.get() {
+                                        store.t("player.unlike")
+                                    } else {
+                                        store.t("player.like")
+                                    }
+                                },
+                                move || store.toggle_like_current(),
+                            ))
+                            .child(
+                                icon_button(
+                                    Icon::Prev,
+                                    move || store.t("player.prev"),
+                                    move || store.prev_track(),
                                 )
-                                .child(play_pause_button(
-                                    store.is_playing,
-                                    44.0,
-                                    move || {
-                                        if store.is_playing.get() {
-                                            store.t("player.pause")
-                                        } else {
-                                            store.t("player.play")
-                                        }
-                                    },
-                                    move || store.toggle_play(),
-                                ))
-                                .child(
-                                    icon_button(
-                                        Icon::Next,
-                                        move || store.t("player.next"),
-                                        move || store.next_track(),
-                                    )
-                                    .test_id("pad-next-btn"),
+                                .test_id("pad-prev-btn"),
+                            )
+                            .child(play_pause_button_buffering(
+                                store.is_playing,
+                                is_loading,
+                                44.0,
+                                move || {
+                                    if is_loading.get() {
+                                        store.t("player.buffering")
+                                    } else if store.is_playing.get() {
+                                        store.t("player.pause")
+                                    } else {
+                                        store.t("player.play")
+                                    }
+                                },
+                                move || store.toggle_play(),
+                            ))
+                            .child(
+                                icon_button(
+                                    Icon::Next,
+                                    move || store.t("player.next"),
+                                    move || store.next_track(),
                                 )
-                                .child(
-                                    icon_button_tinted(
-                                        Icon::Queue,
-                                        theme::muted_fg,
-                                        move || store.t("player.queue"),
-                                        move || {
-                                            store.set_now_playing_panel(NowPlayingPanel::Queue);
-                                            store.open_now_playing();
-                                        },
-                                    )
-                                    .test_id("pad-queue-btn"),
-                                ),
-                        ),
-                )
-                // Bottom progress hairline.
-                .child(
+                                .test_id("pad-next-btn"),
+                            )
+                            .child(
+                                icon_button_tinted(
+                                    Icon::Queue,
+                                    theme::muted_fg,
+                                    move || store.t("player.queue"),
+                                    move || {
+                                        store.set_now_playing_panel(NowPlayingPanel::Queue);
+                                        store.open_now_playing();
+                                    },
+                                )
+                                .test_id("pad-queue-btn"),
+                            ),
+                    ),
+            )
+            // Bottom progress hairline.
+            .child(
+                view().w_full().h(px(2.5)).bg(theme::track_rail).child(
                     view()
-                        .w_full()
-                        .h(px(2.5))
-                        .bg(theme::track_rail)
-                        .child(
-                            view()
-                                .h_full()
-                                .w(move || relative(progress_ratio()))
-                                .bg(theme::primary),
-                        ),
+                        .h_full()
+                        .w(move || relative(progress_ratio.get()))
+                        .bg(theme::primary),
                 ),
+            ),
         )
 }
 
@@ -671,7 +727,7 @@ fn pad_drawer_sheet(store: AppStore) -> impl IntoElement {
         })
         .backdrop_style(|s| s.bg(theme::scrim))
         .popup_style(|s| {
-            s.w(px(284.0))
+            s.w(move || px(284.0 + safe_area().left.0))
                 .h_full()
                 .bg(theme::sidebar)
                 .border_r_1()
@@ -684,7 +740,8 @@ fn pad_drawer_sheet(store: AppStore) -> impl IntoElement {
                 .w_full()
                 .pt(move || px(safe_area().top.0 + 16.0))
                 .pb(move || px(safe_area().bottom.0 + 16.0))
-                .px_3()
+                .pl(move || px(safe_area().left.0 + 12.0))
+                .pr_3()
                 .gap_3()
                 .child(
                     view()
@@ -721,10 +778,14 @@ fn pad_drawer_sheet(store: AppStore) -> impl IntoElement {
                         )),
                 )
                 .child(
-                    source_pill(move || store.active_source_name(), true, move || {
-                        store.set_mobile_drawer_open(false);
-                        store.open_modal(ActiveModal::SourceSwitcher);
-                    })
+                    source_pill(
+                        move || store.active_source_name(),
+                        true,
+                        move || {
+                            store.set_mobile_drawer_open(false);
+                            store.open_modal(ActiveModal::SourceSwitcher);
+                        },
+                    )
                     .w_full()
                     .min_h(px(44.0)),
                 )
@@ -749,17 +810,18 @@ fn pad_drawer_sheet(store: AppStore) -> impl IntoElement {
                                 },
                             ))
                             .child(when(
-                                move || {
-                                    store.active_can("stations") || store.active_can("radio")
-                                },
+                                move || store.active_can("stations") || store.active_can("radio"),
                                 move || drawer_row(store, Icon::Radio, "nav.radio", Route::Radio),
                             ))
                             .child(when(
+                                move || store.active_can("shows") || store.active_can("podcasts"),
                                 move || {
-                                    store.active_can("shows") || store.active_can("podcasts")
-                                },
-                                move || {
-                                    drawer_row(store, Icon::Podcast, "nav.podcasts", Route::Podcasts)
+                                    drawer_row(
+                                        store,
+                                        Icon::Podcast,
+                                        "nav.podcasts",
+                                        Route::Podcasts,
+                                    )
                                 },
                             ))
                             .child(each(
@@ -877,12 +939,6 @@ fn pad_drawer_sheet(store: AppStore) -> impl IntoElement {
                             ))
                             .child(drawer_row(
                                 store,
-                                Icon::Plugin,
-                                "nav.plugins",
-                                Route::Plugins,
-                            ))
-                            .child(drawer_row(
-                                store,
                                 Icon::Settings,
                                 "nav.settings",
                                 Route::Settings,
@@ -899,9 +955,10 @@ fn drawer_row(
     target: Route,
 ) -> impl IntoElement {
     let target_check = target.clone();
-    let active = computed(move || match (&store.route.get(), &target_check) {
-        (Route::Browse { page: a, .. }, Route::Browse { page: b, .. }) => b.is_empty() || a == b,
-        (a, b) => a == b,
+    let active = computed(move || {
+        let current = store.route.get();
+        let custom = active_custom_nav(store);
+        pad_route_matches(&current, &target_check, &custom)
     });
 
     button()
@@ -1038,4 +1095,18 @@ fn active_custom_nav(store: AppStore) -> Vec<NavItem> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
+}
+
+fn pad_route_matches(current: &Route, target: &Route, custom_nav: &[NavItem]) -> bool {
+    match (current, target) {
+        (Route::Browse { page: a, .. }, Route::Browse { page: b, .. }) => {
+            if b.is_empty() {
+                a.is_empty() || !custom_nav.iter().any(|item| item.page == *a)
+            } else {
+                a == b
+            }
+        }
+        (Route::Settings | Route::SettingsDetail(_), Route::Settings) => true,
+        _ => current == target,
+    }
 }

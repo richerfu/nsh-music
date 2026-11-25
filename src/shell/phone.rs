@@ -1,26 +1,27 @@
 //! Phone application shell:
-//! - Respects `safe_area()` top & bottom insets
-//! - Compact top header with source selector capsule (`store.active_source_name()`) & quick search/settings buttons
-//! - Capability-gated quick pills (`Radio`, `Podcasts`, `Liked`, `Recent`, custom active source `info.navigation`)
-//! - Floating `58pt` mini-player dock above tabs expanding full-screen Now Playing on tap
-//! - Bottom 4-tab bar (`Home`, `Browse`, `Library`, `Settings`), all touch targets `>= 44pt`
+//! - Respects `safe_area()` 4-edge insets
+//! - Contextual top navigation bar:
+//!   - Root tabs (`Home`, `Browse`, `Library`): bold tab title + single compact source capsule + contextual Refresh (`Home`/`Browse`) + Search (zero back/duplicate settings buttons)
+//!   - Root `Settings` tab: clean header title only
+//!   - Level-2 pushed screens: `<` Back button + centered dynamic route title + contextual `+` Install (`Plugins`) or Refresh (`Browse`/`Radio`/`Podcasts`)
+//! - Floating `58pt` mini-player dock expanding full-screen Now Playing on tap (respects `safe_area().bottom` when tabs are hidden)
+//! - Bottom 4-tab bar (`Home`, `Browse`, `Library`, `Settings`) visible only on root tabs, switching via `store.switch_tab(...)`
 //! - `on_back_press` closing modal -> Now Playing -> drawer -> `store.go_back()`
 
 use nsh_base::button;
 use nsh_core::prelude::*;
-use nsh_music_core::model::NavItem;
+use nsh_music_audio::PlaybackStatus;
 
 use crate::{
     pages,
-    state::{ActiveModal, AppStore, Route},
+    state::{ActiveModal, AppStore, Route, SettingsSection},
     ui::{
         controls::{
-            artwork_box, icon_button, icon_button_tinted, pill_button, play_pause_button,
-            source_pill,
+            artwork_box, icon_button, icon_button_tinted, play_pause_button_buffering, source_pill,
         },
         icons::{Icon, icon_reactive},
-        motion,
-        theme::{self, DeviceForm, Elevated, colors, font_size, radius},
+        loading_spinner, motion,
+        theme::{self, DeviceForm, Elevated, Elevation, colors, font_size, radius},
     },
 };
 
@@ -51,37 +52,98 @@ pub fn phone_shell(store: AppStore) -> View {
         .bg(theme::bg)
         .text_color(theme::fg)
         .child(phone_top_header(store))
-        .child(phone_source_nav_strip(store))
         .child(phone_main_viewport(store))
         .child(phone_mini_player(store))
         .child(phone_bottom_tabs(store))
+        .child(phone_bottom_safe_inset(store))
+}
+
+fn phone_refresh_button(store: AppStore) -> impl IntoElement {
+    let loading = store.browse_loading;
+
+    button()
+        .test_id("phone-refresh-btn")
+        .accessibility_label(move || Some(store.t("common.refresh")))
+        .disabled(move || loading.get())
+        .on_press(move || match store.route.get_untracked() {
+            Route::Browse { page, title } => store.refresh_browse(&page, &title),
+            _ => store.refresh_home(),
+        })
+        .min_w(px(44.0))
+        .min_h(px(44.0))
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .bg(colors::TRANSPARENT)
+        .hover(|s| s.bg(theme::hover))
+        .active(|s| s.bg(theme::press).scale(motion::press_scale))
+        .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
+        .disabled_style(|s| s.opacity(0.6))
+        .child(
+            when(
+                move || loading.get(),
+                move || loading_spinner(18.0, theme::muted_fg),
+            )
+            .otherwise(move || icon_reactive(Icon::Refresh, 18.0, theme::fg)),
+        )
 }
 
 fn phone_top_header(store: AppStore) -> View {
+    let is_secondary = computed(move || store.route.with(AppStore::is_phone_secondary_route));
+    let is_root_settings = computed(move || store.route.get() == Route::Settings);
+    let is_plugins_detail =
+        computed(move || store.route.get() == Route::SettingsDetail(SettingsSection::Plugins));
+    let show_root_refresh = computed(move || {
+        store.route.with(|r| {
+            matches!(r, Route::Home) || matches!(r, Route::Browse { page, .. } if page.is_empty())
+        })
+    });
+    let show_l2_refresh = computed(move || {
+        store.route.with(|r| {
+            matches!(r, Route::Radio | Route::Podcasts)
+                || matches!(r, Route::Browse { page, .. } if !page.is_empty())
+        })
+    });
+    let route_title = computed(move || resolve_phone_route_title(store));
+
     view()
         .test_id("phone-header")
         .w_full()
         .flex_shrink_0()
-        .pt(move || px(safe_area().top.0 + 6.0))
-        .pb_2()
-        .px_3()
-        .flex_row()
-        .items_center()
-        .justify_between()
-        .gap_2()
-        .glass_bar_surface()
+        .pt(move || px(safe_area().top.0 + 4.0))
+        .pb_1p5()
+        .pl(move || px(safe_area().left.0 + if is_secondary.get() { 8.0 } else { 16.0 }))
+        .pr(move || px(safe_area().right.0 + if is_secondary.get() { 8.0 } else { 16.0 }))
+        .min_h(px(50.0))
+        .bg(move || {
+            if store.page_scrolled.get() {
+                theme::card()
+            } else {
+                theme::bg()
+            }
+        })
         .border_b_1()
-        .border_color(theme::border)
+        .border_color(move || {
+            if store.page_scrolled.get() {
+                theme::border()
+            } else {
+                colors::TRANSPARENT
+            }
+        })
+        .transition_colors()
+        .duration(move || motion::transition_ms(160.0))
         .child(
-            view()
-                .flex_1()
-                .min_w(px(0.0))
-                .flex_row()
-                .items_center()
-                .gap_1p5()
-                .child(when(
-                    move || store.can_go_back(),
-                    move || {
+            when(is_secondary, move || {
+                // Level-2 pushed page header: `<` Back + centered dynamic route title + contextual right slot.
+                view()
+                    .w_full()
+                    .min_h(px(44.0))
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
                         icon_button(
                             Icon::ChevronLeft,
                             move || store.t("common.back"),
@@ -89,161 +151,121 @@ fn phone_top_header(store: AppStore) -> View {
                                 let _ = store.go_back();
                             },
                         )
-                        .test_id("phone-back-btn")
-                    },
-                ))
-                .child(
-                    source_pill(move || store.active_source_name(), true, move || {
-                        store.open_modal(ActiveModal::SourceSwitcher);
-                    })
-                    .min_w(px(44.0))
-                    .min_h(px(44.0))
-                    .test_id("phone-source-switcher"),
-                ),
-        )
-        .child(
-            view()
-                .flex_row()
-                .items_center()
-                .gap_0p5()
-                .flex_shrink_0()
-                .child(
-                    icon_button_tinted(
-                        Icon::Search,
-                        move || {
-                            if store.route.get() == Route::Search {
-                                theme::primary()
-                            } else {
-                                theme::fg()
-                            }
-                        },
-                        move || store.t("nav.search"),
-                        move || store.navigate(Route::Search),
+                        .min_w(px(44.0))
+                        .min_h(px(44.0))
+                        .test_id("phone-back-btn"),
                     )
-                    .test_id("phone-search-btn"),
-                )
-                .child(
-                    icon_button_tinted(
-                        Icon::Settings,
-                        move || {
-                            if matches!(store.route.get(), Route::Settings | Route::Plugins) {
-                                theme::primary()
-                            } else {
-                                theme::fg()
-                            }
-                        },
-                        move || store.t("nav.settings"),
-                        move || store.navigate(Route::Settings),
+                    .child(
+                        view()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                text(move || route_title.get())
+                                    .number_of_lines(1)
+                                    .text_size(px(17.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::fg),
+                            ),
                     )
-                    .test_id("phone-settings-btn"),
-                ),
-        )
-}
-
-/// Capability-gated horizontal quick-nav strip for Radio, Podcasts, and active
-/// source custom `info.navigation` pages when present.
-fn phone_source_nav_strip(store: AppStore) -> impl IntoElement {
-    let custom_nav = computed(move || active_custom_nav(store));
-    let show_strip = computed(move || {
-        store.active_can("stations")
-            || store.active_can("radio")
-            || store.active_can("shows")
-            || store.active_can("podcasts")
-            || custom_nav.with(|v| !v.is_empty())
-    });
-
-    when(show_strip, move || {
-        scroll()
-            .horizontal()
-            .scrollbar(false)
-            .w_full()
-            .flex_shrink_0()
-            .bg(theme::bg)
-            .border_b_1()
-            .border_color(theme::border)
-            .child(
-                view()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .px_3()
-                    .py_1p5()
-                    .child(when(
-                        move || store.active_can("stations") || store.active_can("radio"),
-                        move || {
-                            pill_button(
-                                move || store.t("nav.radio"),
-                                move || store.route.get() == Route::Radio,
-                                move || store.navigate(Route::Radio),
-                            )
-                            .min_w(px(44.0))
-                            .min_h(px(44.0))
-                        },
-                    ))
-                    .child(when(
-                        move || store.active_can("shows") || store.active_can("podcasts"),
-                        move || {
-                            pill_button(
-                                move || store.t("nav.podcasts"),
-                                move || store.route.get() == Route::Podcasts,
-                                move || store.navigate(Route::Podcasts),
-                            )
-                            .min_w(px(44.0))
-                            .min_h(px(44.0))
-                        },
-                    ))
-                    .child(when(
-                        move || store.active_can("liked"),
-                        move || {
-                            pill_button(
-                                move || store.t("nav.liked"),
-                                move || store.route.get() == Route::Liked,
-                                move || store.navigate(Route::Liked),
-                            )
-                            .min_w(px(44.0))
-                            .min_h(px(44.0))
-                        },
-                    ))
-                    .child(when(
-                        move || store.active_can("recent"),
-                        move || {
-                            pill_button(
-                                move || store.t("nav.recent"),
-                                move || store.route.get() == Route::Recent,
-                                move || store.navigate(Route::Recent),
-                            )
-                            .min_w(px(44.0))
-                            .min_h(px(44.0))
-                        },
-                    ))
-                    .child(each(
-                        custom_nav,
-                        |item: &NavItem| format!("{}:{}", item.page, item.title),
-                        move |item, _| {
-                            let page = item.with_untracked(|i| i.page.clone());
-                            let title = item.with_untracked(|i| i.title.clone());
-                            let check_page = page.clone();
-                            pill_button(
-                                move || item.with(|i| SharedString::from(i.title.clone())),
-                                move || {
-                                    matches!(
-                                        store.route.get(),
-                                        Route::Browse { page: ref p, .. } if p == &check_page
+                    .child(
+                        view()
+                            .w(px(44.0))
+                            .h(px(44.0))
+                            .flex_shrink_0()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                when(is_plugins_detail, move || {
+                                    icon_button_tinted(
+                                        Icon::Plus,
+                                        theme::primary,
+                                        move || store.t("plugins.install"),
+                                        move || store.open_modal(ActiveModal::InstallPlugin),
                                     )
-                                },
-                                move || {
-                                    store.navigate(Route::Browse {
-                                        page: page.clone(),
-                                        title: title.clone(),
-                                    });
-                                },
-                            )
-                            .min_w(px(44.0))
-                            .min_h(px(44.0))
-                        },
-                    )),
-            )
-    })
+                                    .min_w(px(44.0))
+                                    .min_h(px(44.0))
+                                    .test_id("phone-plugins-install-btn")
+                                })
+                                .otherwise(move || {
+                                    when(show_l2_refresh, move || phone_refresh_button(store))
+                                }),
+                            ),
+                    )
+            })
+            .otherwise(move || {
+                // Root tab header: clean title only on Settings; bold tab title + source switcher + contextual refresh + search on Home/Browse/Library.
+                when(is_root_settings, move || {
+                    view()
+                        .w_full()
+                        .min_h(px(44.0))
+                        .flex_row()
+                        .items_center()
+                        .pl_1()
+                        .child(
+                            text(move || store.t("settings.title"))
+                                .number_of_lines(1)
+                                .text_size(px(24.0))
+                                .font_weight(FontWeight::BOLD)
+                                .letter_spacing(px(-0.3))
+                                .text_color(theme::fg),
+                        )
+                })
+                .otherwise(move || {
+                    view()
+                        .w_full()
+                        .min_h(px(44.0))
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            text(move || route_title.get())
+                                .flex_shrink_0()
+                                .number_of_lines(1)
+                                .text_size(px(23.0))
+                                .font_weight(FontWeight::BOLD)
+                                .letter_spacing(px(-0.3))
+                                .text_color(theme::fg),
+                        )
+                        .child(
+                            view()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .flex_row()
+                                .items_center()
+                                .justify_end()
+                                .gap_0p5()
+                                .child(
+                                    source_pill(
+                                        move || store.active_source_name(),
+                                        true,
+                                        move || {
+                                            store.open_modal(ActiveModal::SourceSwitcher);
+                                        },
+                                    )
+                                    .max_w(px(140.0))
+                                    .min_w(px(44.0))
+                                    .min_h(px(44.0))
+                                    .test_id("phone-source-switcher"),
+                                )
+                                .child(when(show_root_refresh, move || phone_refresh_button(store)))
+                                .child(
+                                    icon_button_tinted(
+                                        Icon::Search,
+                                        theme::fg,
+                                        move || store.t("nav.search"),
+                                        move || store.navigate(Route::Search),
+                                    )
+                                    .min_w(px(44.0))
+                                    .min_h(px(44.0))
+                                    .test_id("phone-search-btn"),
+                                ),
+                        )
+                })
+            }),
+        )
 }
 
 fn phone_main_viewport(store: AppStore) -> View {
@@ -267,211 +289,295 @@ fn phone_mini_player(store: AppStore) -> impl IntoElement {
             })
         });
 
-        let progress_ratio = move || {
+        let is_loading = computed(move || store.playback_status.with(PlaybackStatus::is_loading));
+
+        let progress_ratio = computed(move || {
             let dur = store.duration_ms.get();
             if dur == 0 {
                 0.0_f32
             } else {
-                (store.position_ms.get() as f32 / dur as f32).clamp(0.0, 1.0)
+                let raw = (store.position_ms.get() as f32 / dur as f32).clamp(0.0, 1.0);
+                (raw * 320.0).round() / 320.0
             }
-        };
+        });
 
         view()
             .w_full()
-            .px_3()
-            .pt_1()
-            .pb_2()
+            .pl(move || px(safe_area().left.0 + 14.0))
+            .pr(move || px(safe_area().right.0 + 14.0))
+            .pt_1p5()
+            .pb(move || {
+                if store.route.with(AppStore::is_phone_secondary_route) {
+                    px(safe_area().bottom.0 + 10.0)
+                } else {
+                    px(8.0)
+                }
+            })
             .flex_shrink_0()
             .child(
-                view()
-                    .test_id("phone-mini-player-dock")
-                    .w_full()
-                    .h(px(MINI_PLAYER_HEIGHT))
-                    .rounded(px(radius::XL))
-                    .glass_surface()
-                    .overflow_hidden()
-                    .child(
-                        view()
-                            .flex_1()
-                            .w_full()
-                            .pl_2p5()
-                            .pr_1p5()
-                            .flex_row()
-                            .items_center()
-                            .justify_between()
-                            .gap_2()
-                            .child(
-                                button()
-                                    .test_id("phone-mini-player")
-                                    .accessibility_label(move || {
-                                        Some(store.t("now_playing.expand"))
-                                    })
-                                    .on_press(move || store.open_now_playing())
-                                    .flex_1()
-                                    .min_w(px(44.0))
-                                    .min_h(px(44.0))
-                                    .flex_row()
-                                    .items_center()
-                                    .gap_2p5()
-                                    .active(|s| s.opacity(0.78))
-                                    .focus_visible(|s| {
-                                        s.outline(px(2.0)).outline_color(theme::ring)
-                                    })
-                                    .child(dynamic(move || {
-                                        let seed = track_seed.get();
-                                        untracked(move || {
-                                            artwork_box(
-                                                store.current_artwork_uri,
-                                                seed,
-                                                40.0,
-                                                radius::SM,
-                                            )
-                                        })
-                                    }))
-                                    .child(
-                                        view()
-                                            .flex_1()
-                                            .min_w(px(0.0))
-                                            .gap_0p5()
-                                            .child(
-                                                text(move || {
-                                                    store.current_track.with(|t| match t {
-                                                        Some(tr) => {
-                                                            SharedString::from(tr.name.clone())
-                                                        }
-                                                        None => store.t("player.idle_title"),
-                                                    })
-                                                })
-                                                .number_of_lines(1)
-                                                .text_size(px(font_size::BODY))
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .text_color(theme::fg),
-                                            )
-                                            .child(
-                                                text(move || {
-                                                    store.current_track.with(|t| match t {
-                                                        Some(tr) => {
-                                                            SharedString::from(tr.artist_names())
-                                                        }
-                                                        None => SharedString::default(),
-                                                    })
-                                                })
-                                                .number_of_lines(1)
-                                                .text_size(px(font_size::CAPTION))
-                                                .text_color(theme::muted_fg),
-                                            ),
-                                    ),
-                            )
-                            .child(
-                                view()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap_0p5()
-                                    .flex_shrink_0()
-                                    .child(play_pause_button(
-                                        store.is_playing,
-                                        44.0,
-                                        move || {
-                                            if store.is_playing.get() {
-                                                store.t("player.pause")
-                                            } else {
-                                                store.t("player.play")
-                                            }
-                                        },
-                                        move || store.toggle_play(),
-                                    ))
-                                    .child(
-                                        icon_button(
-                                            Icon::Next,
-                                            move || store.t("player.next"),
-                                            move || store.next_track(),
+                Elevated::elevation(
+                    view()
+                        .test_id("phone-mini-player-dock")
+                        .w_full()
+                        .h(px(MINI_PLAYER_HEIGHT))
+                        .rounded(px(radius::XL))
+                        .bg(theme::card_elevated)
+                        .border_1()
+                        .border_color(theme::border)
+                        .overflow_hidden(),
+                    Elevation::Floating,
+                )
+                .child(
+                    view()
+                        .flex_1()
+                        .w_full()
+                        .pl_2()
+                        .pr_1p5()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            button()
+                                .test_id("phone-mini-player")
+                                .accessibility_label(move || Some(store.t("now_playing.expand")))
+                                .on_press(move || store.open_now_playing())
+                                .flex_1()
+                                .min_w(px(44.0))
+                                .min_h(px(44.0))
+                                .flex_row()
+                                .items_center()
+                                .gap_2p5()
+                                .active(|s| s.opacity(0.78))
+                                .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
+                                .child(dynamic(move || {
+                                    let seed = track_seed.get();
+                                    untracked(move || {
+                                        artwork_box(
+                                            store.current_artwork_uri,
+                                            seed,
+                                            42.0,
+                                            radius::CONTROL,
                                         )
-                                        .test_id("phone-next-btn"),
-                                    ),
-                            ),
-                    )
-                    .child(
+                                    })
+                                }))
+                                .child(
+                                    view()
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .gap_0p5()
+                                        .child(
+                                            text(move || {
+                                                store.current_track.with(|t| match t {
+                                                    Some(tr) => SharedString::from(tr.name.clone()),
+                                                    None => store.t("player.idle_title"),
+                                                })
+                                            })
+                                            .number_of_lines(1)
+                                            .text_size(px(font_size::BODY))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(theme::fg),
+                                        )
+                                        .child(
+                                            view()
+                                                .w_full()
+                                                .min_w(px(0.0))
+                                                .flex_row()
+                                                .items_center()
+                                                .gap_1p5()
+                                                .child(when(is_loading, move || {
+                                                    loading_spinner(11.0, theme::muted_fg)
+                                                }))
+                                                .child(
+                                                    text(move || {
+                                                        match store.playback_status.get() {
+                                                            PlaybackStatus::Loading => {
+                                                                store.t("player.buffering")
+                                                            }
+                                                            PlaybackStatus::Error(msg) => {
+                                                                SharedString::from(msg)
+                                                            }
+                                                            _ => {
+                                                                store.current_track.with(
+                                                                    |t| match t {
+                                                                        Some(tr) => {
+                                                                            SharedString::from(
+                                                                                tr.artist_names(),
+                                                                            )
+                                                                        }
+                                                                        None => {
+                                                                            SharedString::default()
+                                                                        }
+                                                                    },
+                                                                )
+                                                            }
+                                                        }
+                                                    })
+                                                    .flex_1()
+                                                    .min_w(px(0.0))
+                                                    .number_of_lines(1)
+                                                    .text_size(px(font_size::CAPTION))
+                                                    .text_color(move || {
+                                                        if matches!(
+                                                            store.playback_status.get(),
+                                                            PlaybackStatus::Error(_)
+                                                        ) {
+                                                            theme::danger()
+                                                        } else {
+                                                            theme::muted_fg()
+                                                        }
+                                                    }),
+                                                ),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            view()
+                                .flex_row()
+                                .items_center()
+                                .gap_0p5()
+                                .flex_shrink_0()
+                                .child(play_pause_button_buffering(
+                                    store.is_playing,
+                                    is_loading,
+                                    44.0,
+                                    move || {
+                                        if is_loading.get() {
+                                            store.t("player.buffering")
+                                        } else if store.is_playing.get() {
+                                            store.t("player.pause")
+                                        } else {
+                                            store.t("player.play")
+                                        }
+                                    },
+                                    move || store.toggle_play(),
+                                ))
+                                .child(
+                                    icon_button(
+                                        Icon::Next,
+                                        move || store.t("player.next"),
+                                        move || store.next_track(),
+                                    )
+                                    .test_id("phone-next-btn"),
+                                ),
+                        ),
+                )
+                .child(
+                    view().w_full().px_3().pb(px(2.0)).child(
                         view()
                             .w_full()
                             .h(px(2.0))
+                            .rounded_full()
+                            .overflow_hidden()
                             .bg(theme::track_rail)
                             .child(
                                 view()
                                     .h_full()
-                                    .w(move || relative(progress_ratio()))
+                                    .w(move || relative(progress_ratio.get()))
+                                    .rounded_full()
                                     .bg(theme::primary),
                             ),
                     ),
+                ),
             )
     })
 }
 
-fn phone_bottom_tabs(store: AppStore) -> View {
-    view()
-        .test_id("phone-tab-bar")
-        .w_full()
-        .flex_shrink_0()
-        .flex_row()
-        .items_center()
-        .justify_around()
-        .pt_1p5()
-        .pb(move || px(safe_area().bottom.0 + 6.0))
-        .px_2()
-        .glass_bar_surface()
-        .border_t_1()
-        .border_color(theme::border)
-        .child(phone_tab_item(
-            store,
-            Icon::Home,
-            "nav.home",
-            "tab-home",
-            |r| matches!(r, Route::Home),
-            || Route::Home,
-        ))
-        .child(phone_tab_item(
-            store,
-            Icon::Compass,
-            "nav.browse",
-            "tab-browse",
-            |r| {
-                matches!(
-                    r,
-                    Route::Browse { .. } | Route::Radio | Route::Podcasts | Route::ShowDetail { .. }
-                )
-            },
-            || Route::Browse {
-                page: String::new(),
-                title: String::new(),
-            },
-        ))
-        .child(phone_tab_item(
-            store,
-            Icon::Library,
-            "nav.library",
-            "tab-library",
-            |r| {
-                matches!(
-                    r,
-                    Route::Library
-                        | Route::Liked
-                        | Route::Playlists
-                        | Route::PlaylistDetail { .. }
-                        | Route::AlbumDetail { .. }
-                        | Route::ArtistDetail { .. }
-                        | Route::Recent
-                        | Route::Local
-                )
-            },
-            || Route::Library,
-        ))
-        .child(phone_tab_item(
-            store,
-            Icon::Settings,
-            "nav.settings",
-            "tab-settings",
-            |r| matches!(r, Route::Settings | Route::Plugins),
-            || Route::Settings,
-        ))
+fn phone_bottom_tabs(store: AppStore) -> impl IntoElement {
+    when(
+        move || !store.route.with(AppStore::is_phone_secondary_route),
+        move || {
+            view()
+                .test_id("phone-tab-bar")
+                .w_full()
+                .flex_shrink_0()
+                .flex_row()
+                .items_center()
+                .justify_around()
+                .pt_1p5()
+                .pb(move || px(safe_area().bottom.0 + 4.0))
+                .pl(move || px(safe_area().left.0 + 8.0))
+                .pr(move || px(safe_area().right.0 + 8.0))
+                .bg(theme::card)
+                .border_t_1()
+                .border_color(theme::border)
+                .child(phone_tab_item(
+                    store,
+                    Icon::Home,
+                    "nav.home",
+                    "tab-home",
+                    |r| matches!(r, Route::Home),
+                    || Route::Home,
+                ))
+                .child(phone_tab_item(
+                    store,
+                    Icon::Compass,
+                    "nav.browse",
+                    "tab-browse",
+                    |r| {
+                        matches!(
+                            r,
+                            Route::Browse { .. }
+                                | Route::Radio
+                                | Route::Podcasts
+                                | Route::ShowDetail { .. }
+                        )
+                    },
+                    || Route::Browse {
+                        page: String::new(),
+                        title: String::new(),
+                    },
+                ))
+                .child(phone_tab_item(
+                    store,
+                    Icon::Library,
+                    "nav.library",
+                    "tab-library",
+                    |r| {
+                        matches!(
+                            r,
+                            Route::Library
+                                | Route::Liked
+                                | Route::Playlists
+                                | Route::PlaylistDetail { .. }
+                                | Route::AlbumDetail { .. }
+                                | Route::ArtistDetail { .. }
+                                | Route::Recent
+                                | Route::Local
+                        )
+                    },
+                    || Route::Library,
+                ))
+                .child(phone_tab_item(
+                    store,
+                    Icon::Settings,
+                    "nav.settings",
+                    "tab-settings",
+                    |r| {
+                        matches!(
+                            r,
+                            Route::Settings | Route::SettingsDetail(_) | Route::Plugins
+                        )
+                    },
+                    || Route::Settings,
+                ))
+        },
+    )
+}
+
+fn phone_bottom_safe_inset(store: AppStore) -> impl IntoElement {
+    let needs_spacer = computed(move || {
+        store.route.with(AppStore::is_phone_secondary_route)
+            && store.current_track.with(Option::is_none)
+    });
+
+    when(needs_spacer, move || {
+        view()
+            .w_full()
+            .h(move || safe_area().bottom)
+            .flex_shrink_0()
+            .bg(theme::bg)
+    })
 }
 
 fn phone_tab_item(
@@ -488,7 +594,7 @@ fn phone_tab_item(
         .test_id(test_id)
         .selected(active)
         .accessibility_label(move || Some(store.t(label_key)))
-        .on_press(move || store.navigate(make_route()))
+        .on_press(move || store.switch_tab(make_route()))
         .flex_1()
         .min_w(px(44.0))
         .min_h(px(48.0))
@@ -500,7 +606,7 @@ fn phone_tab_item(
         .bg(colors::TRANSPARENT)
         .active(|s| s.bg(theme::hover).scale(motion::press_scale))
         .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
-        .child(icon_reactive(glyph, 20.0, move || {
+        .child(icon_reactive(glyph, 21.0, move || {
             if active.get() {
                 theme::primary()
             } else {
@@ -510,7 +616,8 @@ fn phone_tab_item(
         .child(
             text(move || store.t(label_key))
                 .number_of_lines(1)
-                .text_size(px(font_size::MICRO))
+                .text_size(px(10.5))
+                .font_weight(FontWeight::MEDIUM)
                 .style_when(active, |s| s.font_weight(FontWeight::SEMIBOLD))
                 .text_color(move || {
                     if active.get() {
@@ -522,32 +629,35 @@ fn phone_tab_item(
         )
 }
 
-fn active_custom_nav(store: AppStore) -> Vec<NavItem> {
-    store
-        .active_source_entry()
-        .map(|e| {
-            e.info
-                .navigation
-                .into_iter()
-                .filter(|item| {
-                    !item.page.is_empty()
-                        && !item.title.is_empty()
-                        && !matches!(
-                            item.builtin.as_str(),
-                            "home"
-                                | "browse"
-                                | "radio"
-                                | "stations"
-                                | "podcasts"
-                                | "shows"
-                                | "liked"
-                                | "recent"
-                                | "local"
-                                | "library"
-                                | "search"
-                        )
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default()
+fn resolve_phone_route_title(store: AppStore) -> SharedString {
+    match store.route.get() {
+        Route::Browse { ref title, .. } if !title.is_empty() => SharedString::from(title.clone()),
+        Route::PlaylistDetail { .. } => store
+            .active_playlist
+            .with(|p| p.as_ref().map(|pl| SharedString::from(pl.name.clone())))
+            .unwrap_or_else(|| store.t("nav.playlists")),
+        Route::AlbumDetail { .. } => store
+            .active_album
+            .with(|a| {
+                a.as_ref()
+                    .map(|al| SharedString::from(al.album.name.clone()))
+            })
+            .unwrap_or_else(|| store.t("nav.albums")),
+        Route::ArtistDetail { .. } => store
+            .active_artist
+            .with(|a| {
+                a.as_ref()
+                    .map(|ar| SharedString::from(ar.artist.name.clone()))
+            })
+            .unwrap_or_else(|| store.t("nav.artists")),
+        Route::ShowDetail { .. } => store
+            .active_show
+            .with(|s| {
+                s.as_ref()
+                    .map(|sh| SharedString::from(sh.show.name.clone()))
+            })
+            .unwrap_or_else(|| store.t("nav.podcasts")),
+        Route::SettingsDetail(section) => store.t(section.title_key()),
+        other => store.t(other.title_key()),
+    }
 }

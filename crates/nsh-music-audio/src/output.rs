@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -38,10 +38,12 @@ pub trait AudioOutput: Send {
 
 /// Headless / software-paced audio output for tests, CI environments, and systems without
 /// hardware audio devices.
+///
+/// Blocks on a [`Condvar`] when paused so idle/paused playback consumes 0% CPU.
 pub struct NullOutput {
     tick_interval: Duration,
     running: Arc<AtomicBool>,
-    paused: Arc<AtomicBool>,
+    pause_state: Arc<(Mutex<bool>, Condvar)>,
     stop_flag: Arc<AtomicBool>,
     frames_rendered: Arc<AtomicU64>,
     last_rms_bits: Arc<AtomicU32>,
@@ -65,7 +67,7 @@ impl NullOutput {
         Self {
             tick_interval: tick_interval.max(Duration::from_millis(1)),
             running: Arc::new(AtomicBool::new(false)),
-            paused: Arc::new(AtomicBool::new(false)),
+            pause_state: Arc::new((Mutex::new(false), Condvar::new())),
             stop_flag: Arc::new(AtomicBool::new(false)),
             frames_rendered: Arc::new(AtomicU64::new(0)),
             last_rms_bits: Arc::new(AtomicU32::new(0)),
@@ -93,18 +95,19 @@ impl AudioOutput for NullOutput {
         self.stop()?;
 
         let running = Arc::clone(&self.running);
-        let paused = Arc::clone(&self.paused);
+        let pause_state = Arc::clone(&self.pause_state);
         let stop_flag = Arc::clone(&self.stop_flag);
         let frames_counter = Arc::clone(&self.frames_rendered);
         let last_rms_bits = Arc::clone(&self.last_rms_bits);
         let tick = self.tick_interval;
 
         stop_flag.store(false, Ordering::SeqCst);
-        paused.store(false, Ordering::SeqCst);
+        if let Ok(mut paused) = pause_state.0.lock() {
+            *paused = false;
+        }
         running.store(true, Ordering::SeqCst);
 
-        let frames_per_tick =
-            ((spec.sample_rate as u64 * 10) / 1000).clamp(64, 4096) as usize;
+        let frames_per_tick = ((spec.sample_rate as u64 * 10) / 1000).clamp(64, 4096) as usize;
         let samples_per_tick = frames_per_tick * (spec.channels as usize).max(1);
 
         let handle = thread::Builder::new()
@@ -112,14 +115,24 @@ impl AudioOutput for NullOutput {
             .spawn(move || {
                 let mut buf = vec![0.0f32; samples_per_tick];
                 while !stop_flag.load(Ordering::Relaxed) {
-                    if !paused.load(Ordering::Relaxed) {
-                        buf.fill(0.0);
-                        render(&mut buf);
-                        frames_counter.fetch_add(frames_per_tick as u64, Ordering::Relaxed);
-                        let sum_sq: f32 = buf.iter().map(|s| s * s).sum();
-                        let rms = (sum_sq / (buf.len().max(1) as f32)).sqrt();
-                        last_rms_bits.store(rms.to_bits(), Ordering::Relaxed);
+                    // Block cleanly on Condvar while paused (0% CPU).
+                    if let Ok(mut paused) = pause_state.0.lock() {
+                        while *paused && !stop_flag.load(Ordering::Relaxed) {
+                            match pause_state.1.wait(paused) {
+                                Ok(next) => paused = next,
+                                Err(_) => break,
+                            }
+                        }
                     }
+                    if stop_flag.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    buf.fill(0.0);
+                    render(&mut buf);
+                    frames_counter.fetch_add(frames_per_tick as u64, Ordering::Relaxed);
+                    let sum_sq: f32 = buf.iter().map(|s| s * s).sum();
+                    let rms = (sum_sq / (buf.len().max(1) as f32)).sqrt();
+                    last_rms_bits.store(rms.to_bits(), Ordering::Relaxed);
                     thread::sleep(tick);
                 }
                 running.store(false, Ordering::SeqCst);
@@ -131,18 +144,27 @@ impl AudioOutput for NullOutput {
     }
 
     fn pause(&mut self) -> AudioResult<()> {
-        self.paused.store(true, Ordering::SeqCst);
+        if let Ok(mut paused) = self.pause_state.0.lock() {
+            *paused = true;
+        }
         Ok(())
     }
 
     fn resume(&mut self) -> AudioResult<()> {
-        self.paused.store(false, Ordering::SeqCst);
+        if let Ok(mut paused) = self.pause_state.0.lock() {
+            *paused = false;
+            self.pause_state.1.notify_all();
+        }
         Ok(())
     }
 
     fn stop(&mut self) -> AudioResult<()> {
         self.stop_flag.store(true, Ordering::SeqCst);
         self.running.store(false, Ordering::SeqCst);
+        if let Ok(mut paused) = self.pause_state.0.lock() {
+            *paused = false;
+            self.pause_state.1.notify_all();
+        }
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -150,7 +172,8 @@ impl AudioOutput for NullOutput {
     }
 
     fn is_running(&self) -> bool {
-        self.running.load(Ordering::Relaxed) && !self.paused.load(Ordering::Relaxed)
+        let paused = self.pause_state.0.lock().map(|p| *p).unwrap_or(false);
+        self.running.load(Ordering::Relaxed) && !paused
     }
 
     fn backend_name(&self) -> &'static str {
@@ -166,9 +189,9 @@ impl Drop for NullOutput {
 
 #[cfg(not(any(target_arch = "wasm32", target_env = "ohos")))]
 mod cpal_impl {
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{self, Sender};
-    use std::sync::Arc;
     use std::thread::{self, JoinHandle};
 
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -412,7 +435,7 @@ mod cpal_impl {
                 None,
             ),
             SampleFormat::I16 => {
-                let mut scratch = Vec::<f32>::new();
+                let mut scratch = Vec::<f32>::with_capacity(4096);
                 device.build_output_stream(
                     &stream_config,
                     move |data: &mut [i16], _| {
@@ -427,7 +450,7 @@ mod cpal_impl {
                 )
             }
             SampleFormat::U16 => {
-                let mut scratch = Vec::<f32>::new();
+                let mut scratch = Vec::<f32>::with_capacity(4096);
                 device.build_output_stream(
                     &stream_config,
                     move |data: &mut [u16], _| {
@@ -518,7 +541,7 @@ mod ohos_impl {
                 .latency_mode(LatencyMode::Normal)
                 .map_err(|e| AudioError::Output(format!("OHAudio latency_mode failed: {e}")))?;
 
-            let mut scratch = Vec::<f32>::new();
+            let mut scratch = Vec::<f32>::with_capacity(4096);
             builder
                 .write_data_callback(move |bytes: &mut [u8]| {
                     let sample_count = bytes.len() / 4;
@@ -528,8 +551,10 @@ mod ohos_impl {
                     scratch.resize(sample_count, 0.0);
                     scratch.fill(0.0);
                     render(&mut scratch);
-                    for (dst, &sample) in bytes.chunks_exact_mut(4).zip(scratch.iter()) {
-                        dst.copy_from_slice(&sample.clamp(-1.0, 1.0).to_le_bytes());
+                    for (dst, &sample) in
+                        bytes.as_chunks_mut::<4>().0.iter_mut().zip(scratch.iter())
+                    {
+                        *dst = sample.clamp(-1.0, 1.0).to_le_bytes();
                     }
                     AudioDataCallbackResult::Valid
                 })

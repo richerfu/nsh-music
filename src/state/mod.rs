@@ -2,9 +2,10 @@
 
 pub mod artwork;
 pub mod store;
+pub mod web_cookies;
 
 pub use artwork::{ArtworkLoader, ResolvedArtwork};
 pub use store::{
     ActiveModal, AppStore, NowPlayingMode, NowPlayingPanel, NowPlayingStageStyle, Route,
-    SourceEntry, provide_store, use_store,
+    SettingsSection, SourceEntry, provide_store, use_store,
 };

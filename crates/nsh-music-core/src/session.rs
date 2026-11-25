@@ -104,8 +104,8 @@ impl PlaybackSession {
         if had_demo {
             let current_id = self.current_track().map(|t| t.id.clone());
             self.queue.retain(|t| !is_demo_track(t));
-            self.current_index = current_id
-                .and_then(|cid| self.queue.iter().position(|t| t.id == cid));
+            self.current_index =
+                current_id.and_then(|cid| self.queue.iter().position(|t| t.id == cid));
             if self.current_index.is_none() {
                 self.position_ms = 0;
             }
@@ -269,7 +269,10 @@ mod tests {
     fn temp_session_path(name: &str) -> PathBuf {
         let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir()
-            .join(format!("nsh-music-core-session-test-{}-{seq}", std::process::id()))
+            .join(format!(
+                "nsh-music-core-session-test-{}-{seq}",
+                std::process::id()
+            ))
             .join(name)
     }
 

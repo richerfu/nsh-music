@@ -1,12 +1,80 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::RwLock;
 
 use nsh_music_core::model::{NavItem, PlaybackMode, SettingDef, SettingOption, SourceInfo};
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
-use crate::headers::{HeaderRequestKind, HeaderRule};
+use crate::headers::{HeaderRequestKind, HeaderRule, glob_match};
+
+/// Baseline `mygo-music` plugin API compatibility version supported by this host.
+pub const MYGO_COMPAT_BASELINE_VERSION: &str = "0.2.0";
+
+static HOST_VERSION_OVERRIDE: RwLock<Option<String>> = RwLock::new(None);
+
+/// Overrides the reported host app version for `minAppVersion` checks (pass `Some("")` for
+/// dev builds where all plugins load, or `None` to restore the default effective host version).
+pub fn set_host_app_version(version: Option<String>) {
+    if let Ok(mut guard) = HOST_VERSION_OVERRIDE.write() {
+        *guard = version;
+    }
+}
+
+/// Returns the effective host version used for `minAppVersion` checks:
+/// uses any explicit override from [`set_host_app_version`], otherwise the maximum of
+/// `env!("CARGO_PKG_VERSION")` and [`MYGO_COMPAT_BASELINE_VERSION`].
+pub fn effective_host_version() -> String {
+    if let Ok(guard) = HOST_VERSION_OVERRIDE.read()
+        && let Some(v) = guard.as_ref()
+    {
+        return v.clone();
+    }
+    let pkg = env!("CARGO_PKG_VERSION");
+    if is_semver_newer(pkg, MYGO_COMPAT_BASELINE_VERSION) {
+        pkg.to_owned()
+    } else {
+        MYGO_COMPAT_BASELINE_VERSION.to_owned()
+    }
+}
+
+/// Parses a numeric version string such as `"0.1.8"` or `"v1.2.3"` into integer components.
+/// Rejects strings with non-numeric labels (e.g. `"1.2.3-beta"`), matching `mygo-music`'s `versionNumbers`.
+pub fn parse_version_numbers(tag: &str) -> Option<Vec<u64>> {
+    let trimmed = tag.trim().strip_prefix('v').unwrap_or(tag.trim());
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut nums = Vec::new();
+    for part in trimmed.split('.') {
+        if part.is_empty() {
+            return None;
+        }
+        let n = part.parse::<u64>().ok()?;
+        nums.push(n);
+    }
+    Some(nums)
+}
+
+/// Returns `true` if `candidate` is strictly newer than `current` according to numeric semver parts.
+pub fn is_semver_newer(candidate: &str, current: &str) -> bool {
+    let Some(a) = parse_version_numbers(candidate) else {
+        return false;
+    };
+    let Some(b) = parse_version_numbers(current) else {
+        return false;
+    };
+    let len = a.len().max(b.len());
+    for i in 0..len {
+        let x = *a.get(i).unwrap_or(&0);
+        let y = *b.get(i).unwrap_or(&0);
+        if x != y {
+            return x > y;
+        }
+    }
+    false
+}
 
 /// Errors produced while loading or validating a plugin manifest.
 #[derive(Debug, Error)]
@@ -21,6 +89,12 @@ pub enum ManifestError {
     Parse(#[from] serde_json::Error),
     #[error("invalid plugin manifest: {0}")]
     Validation(String),
+    #[error("{plugin} needs NSH Music {required} or later (current: {current})")]
+    NeedsNewerApp {
+        plugin: String,
+        required: String,
+        current: String,
+    },
 }
 
 /// Permission declarations in `plugin.json`.
@@ -30,9 +104,56 @@ pub struct PluginPermissions {
     /// Allowed network hosts/domains (e.g., `["*.bilibili.com", "api.music.163.com"]`).
     #[serde(default, alias = "hosts", alias = "domains")]
     pub network: Vec<String>,
-    /// External binaries the plugin may invoke via `host.spawn` (e.g., `["ffmpeg"]`).
-    #[serde(default, alias = "commands", alias = "binaries")]
+    /// External binaries the plugin may invoke via `host.spawn` (e.g., `["ffmpeg"]` or `true` for `"*"`).
+    #[serde(
+        default,
+        alias = "commands",
+        alias = "binaries",
+        deserialize_with = "deserialize_programs"
+    )]
     pub process: Vec<String>,
+}
+
+fn deserialize_programs<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let val = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(val) = val else {
+        return Ok(Vec::new());
+    };
+    match val {
+        serde_json::Value::Bool(true) => Ok(vec!["*".to_owned()]),
+        serde_json::Value::Bool(false) => Ok(Vec::new()),
+        serde_json::Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                let Some(s) = item.as_str() else {
+                    return Err(serde::de::Error::custom(
+                        "process is a list of programs, or true for any",
+                    ));
+                };
+                out.push(s.to_owned());
+            }
+            Ok(out)
+        }
+        _ => Err(serde::de::Error::custom(
+            "process is a list of programs, or true for any",
+        )),
+    }
+}
+
+impl PluginPermissions {
+    /// Returns `true` if `process` permits starting any program (`"*"`).
+    pub fn allows_any_process(&self) -> bool {
+        self.process.iter().any(|p| p == "*")
+    }
+
+    /// Reports whether `command` is permitted by `permissions.process`, matching `mygo-music`'s
+    /// `Programs.Allows(dir, command)` semantics.
+    pub fn allows_process(&self, plugin_dir: &Path, command: &str) -> bool {
+        patterns_allow_process(&self.process, plugin_dir, command, cfg!(windows))
+    }
 }
 
 /// Parsed `plugin.json` manifest compatible with `mygo-music` and `nsh-music` extensions.
@@ -78,7 +199,11 @@ pub struct PluginManifest {
     #[serde(default)]
     pub permissions: PluginPermissions,
     /// Minimum compatible host version (semver string, optional).
-    #[serde(alias = "minAppVersion", alias = "min_app_version", alias = "min_host_version")]
+    #[serde(
+        alias = "minAppVersion",
+        alias = "min_app_version",
+        alias = "min_host_version"
+    )]
     pub min_host_version: String,
 }
 
@@ -339,17 +464,51 @@ impl PluginManifest {
     /// Returns all declared process/CLI commands (deduplicated).
     pub fn all_process_commands(&self) -> Vec<String> {
         let mut out = Vec::new();
-        for cmd in self
-            .commands
-            .iter()
-            .chain(self.permissions.process.iter())
-        {
+        for cmd in self.commands.iter().chain(self.permissions.process.iter()) {
             let c = cmd.trim();
             if !c.is_empty() && !out.iter().any(|x| x == c) {
                 out.push(c.to_owned());
             }
         }
         out
+    }
+
+    /// Reports whether `command` is permitted by this manifest's declared process permissions
+    /// (`permissions.process` and legacy `commands`), matching `mygo-music`'s `Programs.Allows`.
+    pub fn allows_process(&self, plugin_dir: &Path, command: &str) -> bool {
+        let patterns = self.all_process_commands();
+        patterns_allow_process(&patterns, plugin_dir, command, cfg!(windows))
+    }
+
+    /// Validates `minAppVersion` / `minHostVersion` against `host_version`.
+    /// Skips comparison when `host_version` is empty (dev builds), while still rejecting malformed
+    /// `minAppVersion` strings.
+    pub fn check_min_app_version(&self, host_version: &str) -> Result<(), ManifestError> {
+        let required = self.min_host_version.trim();
+        if required.is_empty() {
+            return Ok(());
+        }
+        if parse_version_numbers(required).is_none() {
+            return Err(ManifestError::Validation(format!(
+                "minAppVersion isn't a version such as 0.1.8: {required:?}"
+            )));
+        }
+        let host = host_version.trim();
+        if host.is_empty() {
+            return Ok(());
+        }
+        if parse_version_numbers(host).is_some() && is_semver_newer(required, host) {
+            return Err(ManifestError::NeedsNewerApp {
+                plugin: if self.name.is_empty() {
+                    self.id.clone()
+                } else {
+                    self.name.clone()
+                },
+                required: required.to_owned(),
+                current: host.to_owned(),
+            });
+        }
+        Ok(())
     }
 
     /// Resolves the plugin entry script path safely inside `plugin_dir`.
@@ -369,9 +528,12 @@ impl PluginManifest {
         for rel in &candidates {
             let rel_path = Path::new(rel);
             if rel_path.is_absolute()
-                || rel_path
-                    .components()
-                    .any(|c| matches!(c, Component::ParentDir | Component::RootDir | Component::Prefix(_)))
+                || rel_path.components().any(|c| {
+                    matches!(
+                        c,
+                        Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                    )
+                })
             {
                 return Err(ManifestError::Validation(format!(
                     "manifest entry `{rel}` escapes plugin directory"
@@ -435,12 +597,150 @@ impl PluginManifest {
 }
 
 /// Checks whether a plugin ID is safe for filesystem storage and routing.
+/// Matches `mygo-music`'s `^[A-Za-z0-9][A-Za-z0-9_.-]*$` rule and rejects reserved `"local"`.
 pub fn is_valid_plugin_id(id: &str) -> bool {
-    if id.is_empty() || id == "." || id == ".." || id.contains("..") {
+    if id.is_empty() || id == "local" || id == "." || id == ".." || id.contains("..") {
         return false;
     }
-    id.bytes()
+    let bytes = id.as_bytes();
+    if !bytes[0].is_ascii_alphanumeric() {
+        return false;
+    }
+    bytes
+        .iter()
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+fn patterns_allow_process(
+    patterns: &[String],
+    plugin_dir: &Path,
+    command: &str,
+    is_windows: bool,
+) -> bool {
+    let cmd_trimmed = command.trim();
+    if cmd_trimmed.is_empty() {
+        return false;
+    }
+    let bare = !cmd_trimmed.contains('/') && !cmd_trimmed.contains('\\');
+    let cleaned_command = if bare {
+        cmd_trimmed.to_owned()
+    } else {
+        let raw_path = Path::new(cmd_trimmed);
+        let full = if raw_path.is_absolute() || starts_with_windows_drive(cmd_trimmed) {
+            cmd_trimmed.to_owned()
+        } else {
+            join_normalized_path(plugin_dir, cmd_trimmed)
+        };
+        clean_path_for_match(&full)
+    };
+
+    for raw_pattern in patterns {
+        let pat = raw_pattern.trim();
+        if pat.is_empty() {
+            continue;
+        }
+        if pat == "*" {
+            return true;
+        }
+        let pat_bare = !pat.contains('/') && !pat.contains('\\');
+        if pat_bare != bare {
+            continue;
+        }
+
+        let mut pattern_cmp = if bare {
+            pat.to_owned()
+        } else {
+            let full = if Path::new(pat).is_absolute() || starts_with_windows_drive(pat) {
+                pat.to_owned()
+            } else {
+                join_normalized_path(plugin_dir, pat)
+            };
+            clean_path_for_match(&full)
+        };
+        let mut name_cmp = cleaned_command.clone();
+
+        if is_windows {
+            pattern_cmp = pattern_cmp.to_ascii_lowercase();
+            name_cmp = name_cmp.to_ascii_lowercase();
+            if bare
+                && Path::new(&pattern_cmp).extension().is_none()
+                && let Some(stripped) = name_cmp.strip_suffix(".exe")
+            {
+                name_cmp = stripped.to_owned();
+            }
+        }
+
+        if path_segments_glob_match(&pattern_cmp, &name_cmp) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn starts_with_windows_drive(p: &str) -> bool {
+    let b = p.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'/' | b'\\')
+}
+
+fn join_normalized_path(base: &Path, rel: &str) -> String {
+    let base_s = base.to_string_lossy().replace('\\', "/");
+    let rel_s = rel.replace('\\', "/");
+    if base_s.is_empty() {
+        rel_s
+    } else {
+        format!(
+            "{}/{}",
+            base_s.trim_end_matches('/'),
+            rel_s.trim_start_matches('/')
+        )
+    }
+}
+
+fn clean_path_for_match(raw: &str) -> String {
+    let slash = raw.replace('\\', "/");
+    let is_abs = slash.starts_with('/');
+    let mut stack: Vec<&str> = Vec::new();
+    for seg in slash.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                if let Some(&last) = stack.last() {
+                    if last != ".." && !last.ends_with(':') {
+                        stack.pop();
+                    } else if !is_abs {
+                        stack.push("..");
+                    }
+                } else if !is_abs {
+                    stack.push("..");
+                }
+            }
+            s => stack.push(s),
+        }
+    }
+    if is_abs {
+        format!("/{}", stack.join("/"))
+    } else if stack.is_empty() {
+        ".".to_owned()
+    } else {
+        stack.join("/")
+    }
+}
+
+/// Segment-scoped glob matching (`*` and `?` never cross `/`), matching Go's `filepath.Match`.
+fn path_segments_glob_match(pattern: &str, name: &str) -> bool {
+    if pattern.starts_with('/') != name.starts_with('/') {
+        return false;
+    }
+    let p_segs: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
+    let n_segs: Vec<&str> = name.split('/').filter(|s| !s.is_empty()).collect();
+    if p_segs.len() != n_segs.len() {
+        return false;
+    }
+    p_segs
+        .into_iter()
+        .zip(n_segs)
+        .all(|(ps, ns)| glob_match(ps, ns))
 }
 
 /// Loaded `locales/<lang>.json` translation tables for a plugin.
@@ -497,22 +797,26 @@ impl PluginLocales {
         keys
     }
 
-    /// Translates `key` for `locale`, falling back through `<lang>`, `en`, `en-us`, `zh-cn`, then any loaded bundle.
+    /// Translates `key` for `locale`, falling back to `en` / `en-us` for non-English locales.
+    /// When `locale` is English (or no matching English bundle exists), returns `None` rather than
+    /// falling back to a non-English bundle (e.g. `zh-CN.json`), preserving English phrase keys
+    /// used by `mygo-music` plugins such as `youtube-music` and `bilibili`.
     pub fn translate(&self, locale: &str, key: &str) -> Option<&str> {
         if self.bundles.is_empty() {
             return None;
         }
         // 1. Exact locale match (`zh-cn`), then base language (`zh`), then same-language regional variant (`zh-*`).
         let norm = normalize_locale_tag(locale);
+        let base = norm.split_once('-').map_or(norm.as_str(), |(l, _)| l);
         if !norm.is_empty() {
             if let Some(val) = self.bundles.get(&norm).and_then(|m| m.get(key)) {
                 return Some(val.as_str());
             }
-            let base = norm.split_once('-').map_or(norm.as_str(), |(l, _)| l);
             if base != norm
-                && let Some(val) = self.bundles.get(base).and_then(|m| m.get(key)) {
-                    return Some(val.as_str());
-                }
+                && let Some(val) = self.bundles.get(base).and_then(|m| m.get(key))
+            {
+                return Some(val.as_str());
+            }
             let prefix = format!("{base}-");
             let mut matching_tags: Vec<&String> = self
                 .bundles
@@ -527,19 +831,28 @@ impl PluginLocales {
             }
         }
 
-        // 2. Standard fallback chain: `en` -> `en-us` -> `zh-cn` -> `zh`.
-        for fallback in ["en", "en-us", "zh-cn", "zh"] {
-            if let Some(val) = self.bundles.get(fallback).and_then(|m| m.get(key)) {
-                return Some(val.as_str());
+        // 2. Universal English fallback (`en` -> `en-us`) when the requested locale isn't English.
+        if base != "en" {
+            for fallback in ["en", "en-us"] {
+                if let Some(val) = self.bundles.get(fallback).and_then(|m| m.get(key)) {
+                    return Some(val.as_str());
+                }
             }
         }
 
-        // 3. Last resort: first bundle containing the key in deterministic order.
-        let mut tags: Vec<&String> = self.bundles.keys().collect();
-        tags.sort();
-        for tag in tags {
-            if let Some(val) = self.bundles[tag].get(key) {
-                return Some(val.as_str());
+        // 3. Only fall back to arbitrary bundles when no locale was specified at all.
+        if norm.is_empty() {
+            for fallback in ["zh-cn", "zh"] {
+                if let Some(val) = self.bundles.get(fallback).and_then(|m| m.get(key)) {
+                    return Some(val.as_str());
+                }
+            }
+            let mut tags: Vec<&String> = self.bundles.keys().collect();
+            tags.sort();
+            for tag in tags {
+                if let Some(val) = self.bundles[tag].get(key) {
+                    return Some(val.as_str());
+                }
             }
         }
         None
@@ -552,10 +865,7 @@ impl PluginLocales {
         key: &str,
         params: &HashMap<String, String>,
     ) -> String {
-        let mut text = self
-            .translate(locale, key)
-            .unwrap_or(key)
-            .to_owned();
+        let mut text = self.translate(locale, key).unwrap_or(key).to_owned();
         for (k, v) in params {
             text = text.replace(&format!("{{{{{k}}}}}"), v);
             text = text.replace(&format!("{{{k}}}"), v);
@@ -700,12 +1010,110 @@ mod tests {
             locales.translate("zh-CN", "only.en"),
             Some("English Fallback")
         );
-        assert_eq!(locales.translate("ja-JP", "plugin.name"), Some("Bili Music"));
+        assert_eq!(
+            locales.translate("ja-JP", "plugin.name"),
+            Some("Bili Music")
+        );
 
         let params = HashMap::from([("user".to_owned(), "NSH".to_owned())]);
         assert_eq!(
             locales.translate_with_params("zh-CN", "hello", &params),
             "你好，NSH"
         );
+    }
+
+    #[test]
+    fn zh_only_locales_preserve_english_phrase_keys_in_english_mode() {
+        let mut locales = PluginLocales::default();
+        locales.insert_bundle(
+            "zh-CN",
+            HashMap::from([
+                ("Charts".to_owned(), "排行榜".to_owned()),
+                ("New Releases".to_owned(), "新发行".to_owned()),
+            ]),
+        );
+
+        assert_eq!(locales.resolve_text("zh-CN", "Charts"), "排行榜");
+        assert_eq!(locales.resolve_text("zh-CN", "New Releases"), "新发行");
+        assert_eq!(locales.resolve_text("en", "Charts"), "Charts");
+        assert_eq!(
+            locales.resolve_text("en-US", "New Releases"),
+            "New Releases"
+        );
+    }
+
+    #[test]
+    fn process_permissions_support_bool_and_mygo_allows_semantics() {
+        let m_true = PluginManifest::parse_json(r#"{"id":"p-all","permissions":{"process":true}}"#)
+            .expect("process: true parses");
+        assert!(m_true.permissions.allows_any_process());
+        assert_eq!(m_true.permissions.process, vec!["*"]);
+        assert!(m_true.allows_process(Path::new("/plugins/p-all"), "anything"));
+        assert!(m_true.allows_process(Path::new("/plugins/p-all"), "/usr/bin/foo"));
+
+        let m_false =
+            PluginManifest::parse_json(r#"{"id":"p-none","permissions":{"process":false}}"#)
+                .expect("process: false parses");
+        assert!(m_false.permissions.process.is_empty());
+        assert!(!m_false.allows_process(Path::new("/plugins/p-none"), "ffmpeg"));
+
+        let m_scoped = PluginManifest::parse_json(
+            r#"{"id":"p-scoped","permissions":{"process":["ffmpeg","bin/helper-*","/opt/homebrew/bin/yt-dlp"]}}"#,
+        )
+        .expect("scoped process list parses");
+        let pdir = Path::new("/plugins/p-scoped");
+        // Bare name matches bare pattern ONLY (not arbitrary path with same basename).
+        assert!(m_scoped.allows_process(pdir, "ffmpeg"));
+        assert!(!m_scoped.allows_process(pdir, "/tmp/evil/ffmpeg"));
+        // Relative path resolves against plugin_dir and matches single-segment glob.
+        assert!(m_scoped.allows_process(pdir, "bin/helper-arm64"));
+        assert!(m_scoped.allows_process(pdir, "/plugins/p-scoped/bin/helper-v2"));
+        assert!(!m_scoped.allows_process(pdir, "bin/sub/helper-v2"));
+        assert!(!m_scoped.allows_process(pdir, "helper-v2"));
+        // Absolute path matches absolute pattern.
+        assert!(m_scoped.allows_process(pdir, "/opt/homebrew/bin/yt-dlp"));
+        assert!(!m_scoped.allows_process(pdir, "yt-dlp"));
+
+        // Windows case-insensitive + bare `.exe` matching.
+        assert!(patterns_allow_process(
+            &["ffmpeg".to_owned()],
+            pdir,
+            "FFMPEG.EXE",
+            true
+        ));
+        assert!(!patterns_allow_process(
+            &["ffmpeg.bat".to_owned()],
+            pdir,
+            "ffmpeg.exe",
+            true
+        ));
+    }
+
+    #[test]
+    fn validates_plugin_id_and_min_app_version() {
+        assert!(!is_valid_plugin_id("local"));
+        assert!(!is_valid_plugin_id("-starts-with-dash"));
+        assert!(!is_valid_plugin_id(".hidden"));
+        assert!(!is_valid_plugin_id("a..b"));
+        assert!(is_valid_plugin_id("youtube-music"));
+        assert!(is_valid_plugin_id("MyPlugin_1.0"));
+
+        let m = PluginManifest::parse_json(
+            r#"{"id":"ytm","name":"YouTube Music","minAppVersion":"0.1.8"}"#,
+        )
+        .unwrap();
+        // Empty host version (dev build) skips version check.
+        assert!(m.check_min_app_version("").is_ok());
+        assert!(m.check_min_app_version("0.1.8").is_ok());
+        assert!(m.check_min_app_version("0.2.0").is_ok());
+        let err = m
+            .check_min_app_version("0.1.0")
+            .expect_err("older host fails");
+        assert!(matches!(err, ManifestError::NeedsNewerApp { .. }));
+        assert!(err.to_string().contains("needs NSH Music 0.1.8"));
+
+        let bad =
+            PluginManifest::parse_json(r#"{"id":"bad","minAppVersion":"0.1.8-beta"}"#).unwrap();
+        assert!(bad.check_min_app_version("").is_err());
     }
 }

@@ -11,9 +11,10 @@ pub mod track_row;
 
 pub use controls::{
     artwork_box, compat_badge, compat_badge_text, empty_state, empty_state_with_actions,
-    ghost_button, heart_button, icon_button, icon_button_sized, icon_button_tinted, pill_button,
-    play_pause_button, primary_button, section_header, shimmer_block, skeleton_card, source_pill,
-    styled_input, styled_select, styled_slider, styled_switch,
+    ghost_button, heart_button, icon_button, icon_button_sized, icon_button_tinted,
+    loading_spinner, pill_button, play_pause_button, play_pause_button_buffering, primary_button,
+    section_header, shimmer_block, shimmer_block_on_dark, skeleton_card, source_pill, styled_input,
+    styled_select, styled_slider, styled_switch,
 };
 pub use icons::{Icon, icon, icon_reactive};
 pub use media_card::{MediaCard, media_card};
@@ -29,7 +30,9 @@ pub use overlays::{
 };
 pub use scrubber::{Scrubber, scrubber};
 pub use theme::{
-    DeviceForm, Elevated, Elevation, artwork_stage_bg, artwork_tint, artwork_wash, colors,
-    default_artwork_accent, detect_device_form, font_size, format_bytes, radius, space,
+    DeviceForm, Elevated, Elevation, artwork_backdrop_colors, artwork_fog_colors,
+    artwork_np_accent, artwork_stage_bg, artwork_tint, artwork_wash, colors,
+    default_artwork_accent, detect_device_form, font_size, format_bytes, lossless_gold, mix_color,
+    radius, raw_accent_from_rgb, space,
 };
 pub use track_row::{TrackRow, format_duration_ms, mini_equalizer, track_row};

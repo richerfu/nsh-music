@@ -1,0 +1,106 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" fill="none">
+  <defs>
+    <!-- Exact macOS Big Sur / Sequoia continuous squircle inside 100..924 (824x824 body) -->
+    <clipPath id="squircle-clip">
+      <path d="M 512 100 C 758 100 819 100 871.5 152.5 C 924 205 924 266 924 512 C 924 758 924 819 871.5 871.5 C 819 924 758 924 512 924 C 266 924 205 924 152.5 871.5 C 100 819 100 758 100 512 C 100 266 100 205 152.5 152.5 C 205 100 266 100 512 100 Z"/>
+    </clipPath>
+
+    <!-- Rich coral-red gradient aligned with theme.json primary accent (#ff5a52 -> #d92d20) -->
+    <linearGradient id="bg-grad" x1="150" y1="100" x2="874" y2="924" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ff6961"/>
+      <stop offset="46%" stop-color="#f24741"/>
+      <stop offset="100%" stop-color="#cf241c"/>
+    </linearGradient>
+
+    <!-- Soft luminous upper highlight for tactile Apple Music depth -->
+    <radialGradient id="top-glow" cx="512" cy="240" r="540" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ffb1a6" stop-opacity="0.34"/>
+      <stop offset="55%" stop-color="#ff6e66" stop-opacity="0.06"/>
+      <stop offset="100%" stop-color="#8a1110" stop-opacity="0.18"/>
+    </radialGradient>
+
+    <!-- Subtle top glass rim along squircle contour -->
+    <linearGradient id="rim-grad" x1="512" y1="100" x2="512" y2="924" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.34"/>
+      <stop offset="28%" stop-color="#ffffff" stop-opacity="0.08"/>
+      <stop offset="78%" stop-color="#000000" stop-opacity="0.0"/>
+      <stop offset="100%" stop-color="#000000" stop-opacity="0.18"/>
+    </linearGradient>
+
+    <!-- Vinyl disc sheen -->
+    <linearGradient id="disc-sheen" x1="250" y1="250" x2="774" y2="774" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.22"/>
+      <stop offset="48%" stop-color="#ffffff" stop-opacity="0.06"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0.15"/>
+    </linearGradient>
+
+    <!-- Pure white glyph with subtle silk gradient -->
+    <linearGradient id="note-grad" x1="512" y1="286" x2="512" y2="720" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#fff4f3"/>
+    </linearGradient>
+
+    <!-- Dock drop shadow (stays comfortably inside the 100px transparent margin) -->
+    <filter id="dock-shadow" x="40" y="56" width="944" height="944" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="18" stdDeviation="22" flood-color="#1a0505" flood-opacity="0.28"/>
+    </filter>
+
+    <!-- Crisp soft elevation shadow beneath the white music emblem -->
+    <filter id="note-shadow" x="260" y="250" width="510" height="510" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="16" stdDeviation="16" flood-color="#7d0f0b" flood-opacity="0.34"/>
+    </filter>
+  </defs>
+
+  <!-- Main squircle container with dock shadow -->
+  <g filter="url(#dock-shadow)">
+    <g clip-path="url(#squircle-clip)">
+      <rect x="100" y="100" width="824" height="824" fill="url(#bg-grad)"/>
+      <rect x="100" y="100" width="824" height="824" fill="url(#top-glow)"/>
+
+      <!-- Subtle audiophile vinyl grooves -->
+      <circle cx="512" cy="512" r="296" fill="url(#disc-sheen)"/>
+      <circle cx="512" cy="512" r="296" stroke="#ffffff" stroke-opacity="0.22" stroke-width="4"/>
+      <circle cx="512" cy="512" r="246" stroke="#ffffff" stroke-opacity="0.14" stroke-width="3"/>
+      <circle cx="512" cy="512" r="198" stroke="#ffffff" stroke-opacity="0.12" stroke-width="3"/>
+      <circle cx="512" cy="512" r="148" stroke="#ffffff" stroke-opacity="0.10" stroke-width="2.5"/>
+
+      <!-- Diagonal specular light arc across upper-left & lower-right of vinyl -->
+      <path d="M 326 326 A 262 262 0 0 1 512 250" stroke="#ffffff" stroke-opacity="0.26" stroke-width="8" stroke-linecap="round"/>
+      <path d="M 698 698 A 262 262 0 0 1 512 774" stroke="#ffffff" stroke-opacity="0.18" stroke-width="7" stroke-linecap="round"/>
+
+      <!-- Bold crisp white beamed eighth-note emblem (optically centered on vinyl) -->
+      <g filter="url(#note-shadow)" transform="translate(8, 0)">
+        <!-- Stems + slanted top beam as one seamless rounded vector silhouette -->
+        <path
+          fill="url(#note-grad)"
+          d="M 436 364
+             C 436 346 449 330 467 326
+             L 653 288
+             C 674 284 694 300 694 322
+             L 694 606
+             C 694 618 684 628 672 628
+             L 654 628
+             C 642 628 632 618 632 606
+             L 632 406
+             L 498 434
+             L 498 650
+             C 498 662 488 672 476 672
+             L 458 672
+             C 446 672 436 662 436 650
+             Z"
+        />
+        <!-- Left notehead (tangent smoothly flush with stem right edge x=498) -->
+        <ellipse cx="421" cy="656" rx="80" ry="59" transform="rotate(-17 421 656)" fill="url(#note-grad)"/>
+        <!-- Right notehead (tangent smoothly flush with stem right edge x=694) -->
+        <ellipse cx="617" cy="614" rx="80" ry="59" transform="rotate(-17 617 614)" fill="url(#note-grad)"/>
+      </g>
+    </g>
+
+    <!-- Crisp inner squircle rim -->
+    <path
+      d="M 512 103 C 756 103 816.5 103 868.5 155 C 921 207.5 921 268 921 512 C 921 756 921 816.5 868.5 868.5 C 816.5 921 756 921 512 921 C 268 921 207.5 921 155 868.5 C 103 816.5 103 756 103 512 C 103 268 103 207.5 155 155 C 207.5 103 268 103 512 103 Z"
+      stroke="url(#rim-grad)"
+      stroke-width="6"
+    />
+  </g>
+</svg>

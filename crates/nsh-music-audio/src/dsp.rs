@@ -3,6 +3,7 @@ use std::f32::consts::{FRAC_PI_2, PI};
 /// Number of perceptual frequency bands exported for UI visualizers and retro stages.
 pub const SPECTRUM_BANDS: usize = 16;
 const FFT_SIZE: usize = 512;
+const FFT_STAGES: usize = 9; // log2(512)
 
 /// Configuration for the audio DSP processor chain.
 #[derive(Debug, Clone, Copy)]
@@ -74,6 +75,16 @@ pub fn mix_crossfade(outgoing: &[f32], incoming: &[f32], out: &mut [f32], progre
         let a = outgoing.get(i).copied().unwrap_or(0.0);
         let b = incoming.get(i).copied().unwrap_or(0.0);
         *dst = a * out_gain + b * in_gain;
+    }
+}
+
+/// Zero-allocation in-place equal-power crossfade blending `outgoing` into `incoming_and_out`.
+pub fn mix_crossfade_in_place(outgoing: &[f32], incoming_and_out: &mut [f32], progress: f32) {
+    let t = progress.clamp(0.0, 1.0);
+    let out_gain = (t * FRAC_PI_2).cos();
+    let in_gain = (t * FRAC_PI_2).sin();
+    for (dst, &a) in incoming_and_out.iter_mut().zip(outgoing.iter()) {
+        *dst = a * out_gain + *dst * in_gain;
     }
 }
 
@@ -205,10 +216,16 @@ impl SoftLimiter {
 
 /// Lightweight 16-band real-time spectrum analyzer using a 512-point Hann-windowed
 /// radix-2 FFT mapped across logarithmic perceptual frequency bands.
+///
+/// Zero heap allocations occur during audio processing; FFT work buffers and
+/// stage twiddle factors are precomputed inline.
 #[derive(Debug, Clone)]
 pub struct SpectrumAnalyzer {
     sample_rate: u32,
     ring: [f32; FFT_SIZE],
+    fft_re: [f32; FFT_SIZE],
+    fft_im: [f32; FFT_SIZE],
+    stage_twiddles: [(f32, f32); FFT_STAGES],
     write_pos: usize,
     samples_since_fft: usize,
     window: [f32; FFT_SIZE],
@@ -224,10 +241,19 @@ impl SpectrumAnalyzer {
             let phase = (2.0 * PI * i as f32) / (FFT_SIZE as f32);
             *slot = 0.5 * (1.0 - phase.cos());
         }
+        let mut stage_twiddles = [(1.0f32, 0.0f32); FFT_STAGES];
+        for (stage, slot) in stage_twiddles.iter_mut().enumerate() {
+            let len = 1usize << (stage + 1);
+            let angle = -2.0 * PI / len as f32;
+            *slot = (angle.cos(), angle.sin());
+        }
         let band_ranges = compute_band_ranges(sample_rate);
         Self {
             sample_rate,
             ring: [0.0; FFT_SIZE],
+            fft_re: [0.0; FFT_SIZE],
+            fft_im: [0.0; FFT_SIZE],
+            stage_twiddles,
             write_pos: 0,
             samples_since_fft: 0,
             window,
@@ -258,15 +284,44 @@ impl SpectrumAnalyzer {
     /// Feeds interleaved PCM samples into the analyzer and updates the 16-band spectrum
     /// whenever a hop of `FFT_SIZE / 2` mono frames completes.
     pub fn push_interleaved(&mut self, samples: &[f32], channels: u16) {
-        let ch = (channels as usize).max(1);
-        for frame in samples.chunks(ch) {
-            let mono = frame.iter().copied().sum::<f32>() / frame.len() as f32;
-            self.ring[self.write_pos] = mono;
-            self.write_pos = (self.write_pos + 1) % FFT_SIZE;
-            self.samples_since_fft += 1;
-            if self.samples_since_fft >= FFT_SIZE / 2 {
-                self.samples_since_fft = 0;
-                self.compute_fft_bands();
+        const MASK: usize = FFT_SIZE - 1;
+        match channels {
+            0 | 1 => {
+                for &mono in samples {
+                    self.ring[self.write_pos] = mono;
+                    self.write_pos = (self.write_pos + 1) & MASK;
+                    self.samples_since_fft += 1;
+                    if self.samples_since_fft >= FFT_SIZE / 2 {
+                        self.samples_since_fft = 0;
+                        self.compute_fft_bands();
+                    }
+                }
+            }
+            2 => {
+                for frame in samples.as_chunks::<2>().0 {
+                    let mono = 0.5 * (frame[0] + frame[1]);
+                    self.ring[self.write_pos] = mono;
+                    self.write_pos = (self.write_pos + 1) & MASK;
+                    self.samples_since_fft += 1;
+                    if self.samples_since_fft >= FFT_SIZE / 2 {
+                        self.samples_since_fft = 0;
+                        self.compute_fft_bands();
+                    }
+                }
+            }
+            ch => {
+                let ch_usize = ch as usize;
+                let inv_ch = 1.0 / ch as f32;
+                for frame in samples.chunks_exact(ch_usize) {
+                    let mono = frame.iter().copied().sum::<f32>() * inv_ch;
+                    self.ring[self.write_pos] = mono;
+                    self.write_pos = (self.write_pos + 1) & MASK;
+                    self.samples_since_fft += 1;
+                    if self.samples_since_fft >= FFT_SIZE / 2 {
+                        self.samples_since_fft = 0;
+                        self.compute_fft_bands();
+                    }
+                }
             }
         }
     }
@@ -283,21 +338,25 @@ impl SpectrumAnalyzer {
     }
 
     fn compute_fft_bands(&mut self) {
-        let mut re = [0.0f32; FFT_SIZE];
-        let mut im = [0.0f32; FFT_SIZE];
+        const MASK: usize = FFT_SIZE - 1;
+        let wp = self.write_pos;
         for i in 0..FFT_SIZE {
-            let idx = (self.write_pos + i) % FFT_SIZE;
-            re[i] = self.ring[idx] * self.window[i];
+            let idx = (wp + i) & MASK;
+            self.fft_re[i] = self.ring[idx] * self.window[i];
+            self.fft_im[i] = 0.0;
         }
-        fft_radix2_in_place(&mut re, &mut im);
+        fft_radix2_in_place(&mut self.fft_re, &mut self.fft_im, &self.stage_twiddles);
 
         let scale = 2.0 / (FFT_SIZE as f32);
+        let scale_sq = scale * scale;
         for (band_idx, &(bin_start, bin_end)) in self.band_ranges.iter().enumerate() {
             let mut sum_sq = 0.0f32;
-            let count = (bin_end.saturating_sub(bin_start)).max(1);
-            for k in bin_start..bin_end.min(FFT_SIZE / 2) {
-                let mag = (re[k] * re[k] + im[k] * im[k]).sqrt() * scale;
-                sum_sq += mag * mag;
+            let end = bin_end.min(FFT_SIZE / 2);
+            let count = end.saturating_sub(bin_start).max(1);
+            for k in bin_start..end {
+                let re_k = self.fft_re[k];
+                let im_k = self.fft_im[k];
+                sum_sq += (re_k * re_k + im_k * im_k) * scale_sq;
             }
             let rms = (sum_sq / count as f32).sqrt();
             // Convert RMS magnitude to perceptual normalized 0.0..=1.0 range (-60 dB .. 0 dB)
@@ -324,20 +383,24 @@ fn compute_band_ranges(sample_rate: u32) -> [(usize, usize); SPECTRUM_BANDS] {
     for (i, slot) in ranges.iter_mut().enumerate() {
         let f_lo = min_freq * ratio.powi(i as i32);
         let f_hi = min_freq * ratio.powi((i + 1) as i32);
-        let lo = ((f_lo / bin_hz).floor() as usize).max(prev_end).min(max_bin - 1);
-        let hi = ((f_hi / bin_hz).ceil() as usize)
-            .max(lo + 1)
-            .min(max_bin);
+        let lo = ((f_lo / bin_hz).floor() as usize)
+            .max(prev_end)
+            .min(max_bin - 1);
+        let hi = ((f_hi / bin_hz).ceil() as usize).max(lo + 1).min(max_bin);
         *slot = (lo, hi);
         prev_end = hi.min(max_bin - 1);
     }
     ranges
 }
 
-/// In-place iterative radix-2 Cooley-Tukey FFT (`re.len() == im.len() == power of two`).
-fn fft_radix2_in_place(re: &mut [f32], im: &mut [f32]) {
-    let n = re.len();
-    debug_assert!(n.is_power_of_two() && im.len() == n);
+/// In-place iterative radix-2 Cooley-Tukey FFT (`re.len() == im.len() == FFT_SIZE`)
+/// using precomputed stage twiddle factors (zero trig calls per FFT).
+fn fft_radix2_in_place(
+    re: &mut [f32; FFT_SIZE],
+    im: &mut [f32; FFT_SIZE],
+    stage_twiddles: &[(f32, f32); FFT_STAGES],
+) {
+    let n = FFT_SIZE;
 
     // Bit-reversal permutation
     let mut j = 0usize;
@@ -354,13 +417,10 @@ fn fft_radix2_in_place(re: &mut [f32], im: &mut [f32]) {
         }
     }
 
-    // Butterfly stages
-    let mut len = 2usize;
-    while len <= n {
+    // Butterfly stages using precomputed cos/sin twiddles
+    for (stage, &(w_len_re, w_len_im)) in stage_twiddles.iter().enumerate() {
+        let len = 1usize << (stage + 1);
         let half = len >> 1;
-        let angle = -2.0 * PI / len as f32;
-        let w_len_re = angle.cos();
-        let w_len_im = angle.sin();
         let mut start = 0usize;
         while start < n {
             let mut w_re = 1.0f32;
@@ -384,7 +444,6 @@ fn fft_radix2_in_place(re: &mut [f32], im: &mut [f32]) {
             }
             start += len;
         }
-        len <<= 1;
     }
 }
 
@@ -404,8 +463,8 @@ pub struct DspProcessor {
 impl DspProcessor {
     pub fn new(config: DspConfig) -> Self {
         let target_gain = Self::compute_target_gain(&config);
-        let ramp_frames = ((config.ramp_ms.max(1.0) / 1000.0) * config.sample_rate.max(8_000) as f32)
-            .max(1.0);
+        let ramp_frames =
+            ((config.ramp_ms.max(1.0) / 1000.0) * config.sample_rate.max(8_000) as f32).max(1.0);
         Self {
             current_gain: target_gain,
             target_gain,
@@ -420,9 +479,8 @@ impl DspProcessor {
     pub fn configure_stream(&mut self, sample_rate: u32, channels: u16) {
         self.config.sample_rate = sample_rate.max(8_000);
         self.config.channels = channels.max(1);
-        let ramp_frames = ((self.config.ramp_ms.max(1.0) / 1000.0)
-            * self.config.sample_rate as f32)
-            .max(1.0);
+        let ramp_frames =
+            ((self.config.ramp_ms.max(1.0) / 1000.0) * self.config.sample_rate as f32).max(1.0);
         self.ramp_step_per_frame = 1.0 / ramp_frames;
         self.spectrum.set_sample_rate(self.config.sample_rate);
     }
@@ -478,24 +536,37 @@ impl DspProcessor {
 
     /// Processes interleaved `f32` PCM samples in-place, updating the 16-band spectrum.
     pub fn process_interleaved(&mut self, samples: &mut [f32]) {
-        let ch = (self.config.channels as usize).max(1);
-        for frame in samples.chunks_mut(ch) {
-            // Smooth linear ramp toward target gain to avoid clicks/zipper noise.
-            let diff = self.target_gain - self.current_gain;
-            if diff.abs() <= self.ramp_step_per_frame {
-                self.current_gain = self.target_gain;
+        if (self.target_gain - self.current_gain).abs() <= f32::EPSILON && !self.fade.is_active() {
+            let total_gain = self.current_gain * self.fade.current_gain();
+            if total_gain <= 0.000_001 {
+                samples.fill(0.0);
             } else {
-                self.current_gain += self.ramp_step_per_frame.copysign(diff);
+                let limiter = self.limiter;
+                for sample in samples.iter_mut() {
+                    *sample = limiter.process_sample(*sample * total_gain);
+                }
             }
+        } else {
+            let ch = (self.config.channels as usize).max(1);
+            for frame in samples.chunks_mut(ch) {
+                // Smooth linear ramp toward target gain to avoid clicks/zipper noise.
+                let diff = self.target_gain - self.current_gain;
+                if diff.abs() <= self.ramp_step_per_frame {
+                    self.current_gain = self.target_gain;
+                } else {
+                    self.current_gain += self.ramp_step_per_frame.copysign(diff);
+                }
 
-            let fade_gain = self.fade.next_frame_gain();
-            let total_gain = self.current_gain * fade_gain;
+                let fade_gain = self.fade.next_frame_gain();
+                let total_gain = self.current_gain * fade_gain;
 
-            for sample in frame.iter_mut() {
-                *sample = self.limiter.process_sample(*sample * total_gain);
+                for sample in frame.iter_mut() {
+                    *sample = self.limiter.process_sample(*sample * total_gain);
+                }
             }
         }
-        self.spectrum.push_interleaved(samples, self.config.channels);
+        self.spectrum
+            .push_interleaved(samples, self.config.channels);
     }
 
     fn compute_target_gain(config: &DspConfig) -> f32 {
