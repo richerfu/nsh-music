@@ -87,6 +87,8 @@ pub fn build_no_redirect_client(connect_timeout: Duration) -> AudioResult<Client
     Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(connect_timeout)
+        .pool_idle_timeout(Some(Duration::from_secs(30)))
+        .tcp_keepalive(Some(Duration::from_secs(30)))
         .tcp_nodelay(true)
         .build()
         .map_err(|e| AudioError::Http(format!("failed to build HTTP client: {e}")))
@@ -100,6 +102,8 @@ pub fn build_loopback_no_redirect_client(connect_timeout: Duration) -> AudioResu
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .connect_timeout(connect_timeout)
+        .pool_idle_timeout(Some(Duration::from_secs(30)))
+        .tcp_keepalive(Some(Duration::from_secs(30)))
         .tcp_nodelay(true)
         .build()
         .map_err(|e| AudioError::Http(format!("failed to build loopback HTTP client: {e}")))
@@ -147,12 +151,35 @@ pub async fn send_with_preserved_headers(
             header_map.insert(RANGE, hv);
         }
 
-        let response = client
+        let idempotent = matches!(current_method, Method::GET | Method::HEAD);
+        let response = match client
             .request(current_method.clone(), current_url.clone())
-            .headers(header_map)
+            .headers(header_map.clone())
             .send()
             .await
-            .map_err(|e| AudioError::Http(format!("request to {current_url} failed: {e}")))?;
+        {
+            Ok(resp) => resp,
+            Err(err)
+                if idempotent
+                    && !err.is_timeout()
+                    && (err.is_connect() || err.is_request() || err.is_body()) =>
+            {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                client
+                    .request(current_method.clone(), current_url.clone())
+                    .headers(header_map)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        AudioError::Http(format!("request to {current_url} failed: {e}"))
+                    })?
+            }
+            Err(err) => {
+                return Err(AudioError::Http(format!(
+                    "request to {current_url} failed: {err}"
+                )));
+            }
+        };
 
         let status = response.status();
         if status.is_redirection() {
@@ -1562,5 +1589,55 @@ mod tests {
         drop(stream);
         srv.await.expect("srv");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_send_with_preserved_headers_retries_once_on_transient_get_drop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let srv_hits = Arc::clone(&hits);
+
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let attempt = srv_hits.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = socket.read(&mut buf).await;
+                    if attempt == 0 {
+                        // Drop socket immediately without sending a response to simulate
+                        // a stale pooled connection / transient transport reset.
+                        drop(socket);
+                        return;
+                    }
+                    let body = b"RECOVERED-AFTER-RETRY";
+                    let hdr = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: audio/mp4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(hdr.as_bytes()).await;
+                    let _ = socket.write_all(body).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        let client = build_loopback_no_redirect_client(Duration::from_secs(5)).expect("client");
+        let url = format!("http://{addr}/retry-me");
+        let resp =
+            send_with_preserved_headers(&client, Method::GET, &url, &[], None, MAX_REDIRECTS)
+                .await
+                .expect("GET should recover on single transient retry");
+        assert_eq!(resp.status, reqwest::StatusCode::OK);
+        let body = resp.response.bytes().await.expect("bytes");
+        assert_eq!(body.as_ref(), b"RECOVERED-AFTER-RETRY");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+        srv.abort();
     }
 }

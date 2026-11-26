@@ -807,9 +807,45 @@ fn spawn_http_relay(spec: HttpRelaySpec) -> AudioResult<VirtualProcessHandle> {
     spawn_http_relay_inner(spec, eager_preflight)
 }
 
+const EAGER_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(8);
+const HLS_SEGMENT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(15);
+const RETRY_BACKOFF_MS: [u64; 2] = [250, 600];
+
+fn is_retryable_http_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+/// Sleeps for `delay` unless `kill_notify` fires first. Returns `true` if killed.
+async fn sleep_or_killed(delay: Duration, kill_notify: &Notify) -> bool {
+    tokio::select! {
+        _ = kill_notify.notified() => true,
+        _ = tokio::time::sleep(delay) => false,
+    }
+}
+
+/// Writes `bytes` to `socket`, aborting immediately if `kill_notify` fires.
+/// Returns `true` if all bytes were written cleanly.
+async fn write_all_or_killed(socket: &mut TcpStream, bytes: &[u8], kill_notify: &Notify) -> bool {
+    if bytes.is_empty() {
+        return true;
+    }
+    tokio::select! {
+        _ = kill_notify.notified() => false,
+        res = socket.write_all(bytes) => res.is_ok(),
+    }
+}
+
 fn spawn_http_relay_inner(
     spec: HttpRelaySpec,
     eager_preflight: bool,
+) -> AudioResult<VirtualProcessHandle> {
+    spawn_http_relay_with_timeout(spec, eager_preflight, EAGER_PREFLIGHT_TIMEOUT)
+}
+
+fn spawn_http_relay_with_timeout(
+    spec: HttpRelaySpec,
+    eager_preflight: bool,
+    preflight_timeout: Duration,
 ) -> AudioResult<VirtualProcessHandle> {
     let bind_addr = format!("{}:{}", spec.listen_host, spec.listen_port);
     let rt = io_runtime_handle();
@@ -897,7 +933,24 @@ fn spawn_http_relay_inner(
                     task_handle.finish(0);
                     return;
                 }
-                res = open_and_classify_initial_upstream(&client, &spec, &kill_notify, true) => res,
+                res = tokio::time::timeout(
+                    preflight_timeout,
+                    open_and_classify_initial_upstream(&client, &spec, &kill_notify, true),
+                ) => match res {
+                    Ok(inner) => inner,
+                    Err(_) => {
+                        let label = if preflight_timeout.as_secs() > 0
+                            && preflight_timeout.subsec_nanos() == 0
+                        {
+                            format!("{}s", preflight_timeout.as_secs())
+                        } else {
+                            format!("{}ms", preflight_timeout.as_millis())
+                        };
+                        Err(AudioError::Http(format!(
+                            "upstream preflight timed out after {label}"
+                        )))
+                    }
+                },
             };
             match preflight_res {
                 Ok(prefetched) => {
@@ -1172,7 +1225,7 @@ async fn handle_relay_connection(
         }
         bytes_sent += first.len() as u64;
     }
-    let mut retries_left = if spec.reconnect { 3u8 } else { 0u8 };
+    let mut retries_left = 3u8;
 
     loop {
         tokio::select! {
@@ -1182,14 +1235,15 @@ async fn handle_relay_connection(
             chunk_res = upstream.response.chunk() => {
                 match chunk_res {
                     Ok(Some(chunk)) => {
-                        if socket.write_all(&chunk).await.is_err() {
+                        if !write_all_or_killed(&mut socket, &chunk, &kill_notify).await {
                             break;
                         }
                         bytes_sent += chunk.len() as u64;
                     }
                     Ok(None) => {
                         // In `-request_size` chunked mode, seamlessly fetch the next Range chunk
-                        // until the full upstream `total_size` has been relayed.
+                        // until the full upstream `total_size` has been relayed, retrying transient
+                        // transport errors, HTTP 429, and HTTP 5xx up to 3 attempts.
                         if chunked_range_mode
                             && let (Some(req_sz), Some(total)) = (chunked_req_size, chunked_total_size)
                             && bytes_sent < total
@@ -1199,40 +1253,88 @@ async fn handle_relay_connection(
                                 .saturating_sub(1)
                                 .min(total.saturating_sub(1));
                             let next_range = format!("bytes={bytes_sent}-{next_end}");
-                            match send_with_preserved_headers(
-                                client,
-                                Method::GET,
-                                &spec.input_url,
-                                &spec.headers,
-                                Some(&next_range),
-                                MAX_REDIRECTS,
-                            )
-                            .await
-                            {
-                                Ok(next_resp)
-                                    if next_resp.status == reqwest::StatusCode::PARTIAL_CONTENT =>
-                                {
-                                    upstream = next_resp;
-                                    continue;
+                            let mut fetched_next: Option<RedirectedResponse> = None;
+                            let mut killed = false;
+                            let mut last_msg: Option<String> = None;
+
+                            for attempt in 0..3usize {
+                                let next_res = tokio::select! {
+                                    _ = kill_notify.notified() => {
+                                        killed = true;
+                                        break;
+                                    }
+                                    res = send_with_preserved_headers(
+                                        client,
+                                        Method::GET,
+                                        &spec.input_url,
+                                        &spec.headers,
+                                        Some(&next_range),
+                                        MAX_REDIRECTS,
+                                    ) => res,
+                                };
+                                match next_res {
+                                    Ok(next_resp)
+                                        if next_resp.status == reqwest::StatusCode::PARTIAL_CONTENT =>
+                                    {
+                                        fetched_next = Some(next_resp);
+                                        break;
+                                    }
+                                    Ok(next_resp) => {
+                                        let retryable = is_retryable_http_status(next_resp.status);
+                                        last_msg = Some(format!(
+                                            "VirtualFfmpegShim next chunk HTTP {} at offset {bytes_sent}\n",
+                                            next_resp.status
+                                        ));
+                                        if !retryable || attempt + 1 >= 3 {
+                                            break;
+                                        }
+                                    }
+                                    Err(err) => {
+                                        let retryable = !matches!(err, AudioError::InvalidInput(_));
+                                        last_msg = Some(format!(
+                                            "VirtualFfmpegShim next chunk error at offset {bytes_sent}: {err}\n"
+                                        ));
+                                        if !retryable || attempt + 1 >= 3 {
+                                            break;
+                                        }
+                                    }
                                 }
-                                Ok(next_resp) => {
-                                    handle.append_stderr(&format!(
-                                        "VirtualFfmpegShim next chunk HTTP {} at offset {bytes_sent}\n",
-                                        next_resp.status
-                                    ));
+                                let backoff_ms = RETRY_BACKOFF_MS
+                                    .get(attempt)
+                                    .copied()
+                                    .unwrap_or(600);
+                                if sleep_or_killed(Duration::from_millis(backoff_ms), &kill_notify).await {
+                                    killed = true;
+                                    break;
                                 }
-                                Err(err) => {
-                                    handle.append_stderr(&format!(
-                                        "VirtualFfmpegShim next chunk error at offset {bytes_sent}: {err}\n"
-                                    ));
-                                }
+                            }
+
+                            if killed {
+                                break;
+                            }
+                            if let Some(next_resp) = fetched_next {
+                                upstream = next_resp;
+                                continue;
+                            }
+                            if let Some(msg) = last_msg {
+                                handle.append_stderr(&msg);
                             }
                         }
                         break;
                     }
                     Err(err) => {
-                        if retries_left > 0 && bytes_sent > 0 && client_range.is_none() {
+                        let mut reconnected_ok = false;
+                        let mut killed = false;
+                        while retries_left > 0
+                            && bytes_sent > 0
+                            && client_range.is_none()
+                            && (spec.reconnect || chunked_range_mode || upstream.accepts_ranges)
+                        {
                             retries_left -= 1;
+                            if sleep_or_killed(Duration::from_millis(250), &kill_notify).await {
+                                killed = true;
+                                break;
+                            }
                             let resume_range = match (chunked_req_size, chunked_total_size) {
                                 (Some(req_sz), Some(total)) if bytes_sent < total => {
                                     let next_end = bytes_sent
@@ -1243,19 +1345,41 @@ async fn handle_relay_connection(
                                 }
                                 _ => format!("bytes={bytes_sent}-"),
                             };
-                            if let Ok(reconnected) = send_with_preserved_headers(
-                                client,
-                                Method::GET,
-                                &spec.input_url,
-                                &spec.headers,
-                                Some(&resume_range),
-                                MAX_REDIRECTS,
-                            )
-                            .await
-                            {
-                                upstream = reconnected;
-                                continue;
+                            let reconn_res = tokio::select! {
+                                _ = kill_notify.notified() => {
+                                    killed = true;
+                                    break;
+                                }
+                                res = send_with_preserved_headers(
+                                    client,
+                                    Method::GET,
+                                    &spec.input_url,
+                                    &spec.headers,
+                                    Some(&resume_range),
+                                    MAX_REDIRECTS,
+                                ) => res,
+                            };
+                            match reconn_res {
+                                Ok(reconnected)
+                                    if reconnected.status == reqwest::StatusCode::PARTIAL_CONTENT =>
+                                {
+                                    upstream = reconnected;
+                                    reconnected_ok = true;
+                                    break;
+                                }
+                                Ok(reconnected)
+                                    if !is_retryable_http_status(reconnected.status) =>
+                                {
+                                    break;
+                                }
+                                _ => {}
                             }
+                        }
+                        if killed {
+                            break;
+                        }
+                        if reconnected_ok {
+                            continue;
                         }
                         return Err(AudioError::Http(format!("upstream stream read error: {err}")));
                     }
@@ -1869,49 +1993,109 @@ fn detect_hls_stream_kind(has_init_segment: bool, probe: &[u8]) -> HlsStreamKind
     HlsStreamKind::RawPassthrough("application/octet-stream")
 }
 
-async fn fetch_hls_segment_bytes(
+enum SegmentFetchFailure {
+    Killed,
+    Retryable(AudioError),
+    Fatal(AudioError),
+}
+
+async fn fetch_hls_segment_bytes_once(
     client: &reqwest::Client,
     headers: &[(String, String)],
     segment: &HlsSegment,
     kill_notify: &Notify,
-) -> AudioResult<Vec<u8>> {
+) -> Result<Vec<u8>, SegmentFetchFailure> {
     let range_hdr = segment
         .byte_range
         .map(|(start, end)| format!("bytes={start}-{end}"));
-    let mut resp = send_with_preserved_headers(
-        client,
-        Method::GET,
-        &segment.url,
-        headers,
-        range_hdr.as_deref(),
-        MAX_REDIRECTS,
-    )
-    .await?;
-    if !resp.status.is_success() {
-        return Err(AudioError::Http(format!(
-            "HLS segment HTTP {} for {}",
-            resp.status, resp.final_url
-        )));
+
+    let attempt_fut = async {
+        let mut resp = match send_with_preserved_headers(
+            client,
+            Method::GET,
+            &segment.url,
+            headers,
+            range_hdr.as_deref(),
+            MAX_REDIRECTS,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(err @ AudioError::InvalidInput(_)) => return Err(SegmentFetchFailure::Fatal(err)),
+            Err(err) => return Err(SegmentFetchFailure::Retryable(err)),
+        };
+
+        if !resp.status.is_success() {
+            let err = AudioError::Http(format!(
+                "HLS segment HTTP {} for {}",
+                resp.status,
+                sanitize_relay_url(resp.final_url.as_str())
+            ));
+            return if is_retryable_http_status(resp.status) {
+                Err(SegmentFetchFailure::Retryable(err))
+            } else {
+                Err(SegmentFetchFailure::Fatal(err))
+            };
+        }
+
+        let mut data = Vec::new();
+        loop {
+            match resp.response.chunk().await {
+                Ok(Some(c)) => data.extend_from_slice(&c),
+                Ok(None) => return Ok(data),
+                Err(err) => {
+                    return Err(SegmentFetchFailure::Retryable(AudioError::Http(format!(
+                        "HLS segment read error for {}: {err}",
+                        sanitize_relay_url(resp.final_url.as_str())
+                    ))));
+                }
+            }
+        }
+    };
+
+    tokio::select! {
+        _ = kill_notify.notified() => Err(SegmentFetchFailure::Killed),
+        res = tokio::time::timeout(HLS_SEGMENT_ATTEMPT_TIMEOUT, attempt_fut) => match res {
+            Ok(inner) => inner,
+            Err(_) => Err(SegmentFetchFailure::Retryable(AudioError::Http(format!(
+                "HLS segment timed out after {}s for {}",
+                HLS_SEGMENT_ATTEMPT_TIMEOUT.as_secs(),
+                sanitize_relay_url(&segment.url)
+            )))),
+        },
     }
-    let mut data = Vec::new();
-    loop {
-        tokio::select! {
-            _ = kill_notify.notified() => break,
-            chunk = resp.response.chunk() => {
-                match chunk {
-                    Ok(Some(c)) => data.extend_from_slice(&c),
-                    Ok(None) => break,
-                    Err(err) => {
-                        return Err(AudioError::Http(format!(
-                            "HLS segment read error for {}: {err}",
-                            resp.final_url
-                        )));
+}
+
+async fn fetch_hls_segment_bytes_with_retry(
+    client: &reqwest::Client,
+    headers: &[(String, String)],
+    segment: &HlsSegment,
+    kill_notify: &Notify,
+    max_attempts: usize,
+) -> AudioResult<Vec<u8>> {
+    let attempts = max_attempts.max(1);
+    let mut last_err: Option<AudioError> = None;
+
+    for attempt in 0..attempts {
+        match fetch_hls_segment_bytes_once(client, headers, segment, kill_notify).await {
+            Ok(data) => return Ok(data),
+            Err(SegmentFetchFailure::Killed) => {
+                return Err(AudioError::Other("HLS relay killed".into()));
+            }
+            Err(SegmentFetchFailure::Fatal(err)) => return Err(err),
+            Err(SegmentFetchFailure::Retryable(err)) => {
+                last_err = Some(err);
+                if attempt + 1 < attempts {
+                    let backoff_ms = RETRY_BACKOFF_MS.get(attempt).copied().unwrap_or(600);
+                    if sleep_or_killed(Duration::from_millis(backoff_ms), kill_notify).await {
+                        return Err(AudioError::Other("HLS relay killed".into()));
                     }
                 }
             }
         }
     }
-    Ok(data)
+
+    Err(last_err.unwrap_or_else(|| AudioError::Http("HLS segment fetch failed".into())))
 }
 
 async fn handle_hls_relay_from_text(
@@ -1967,7 +2151,10 @@ async fn handle_hls_relay_from_text(
     }
 
     let init_bytes = if let Some(ref init_seg) = media.init_segment {
-        Some(fetch_hls_segment_bytes(client, &spec.headers, init_seg, &kill_notify).await?)
+        Some(
+            fetch_hls_segment_bytes_with_retry(client, &spec.headers, init_seg, &kill_notify, 3)
+                .await?,
+        )
     } else {
         None
     };
@@ -1975,7 +2162,9 @@ async fn handle_hls_relay_from_text(
     let (first_seg_bytes, remaining_start) = if init_bytes.is_some() {
         (None, 0usize)
     } else if let Some(first_seg) = media.segments.first() {
-        let bytes = fetch_hls_segment_bytes(client, &spec.headers, first_seg, &kill_notify).await?;
+        let bytes =
+            fetch_hls_segment_bytes_with_retry(client, &spec.headers, first_seg, &kill_notify, 3)
+                .await?;
         (Some(bytes), 1usize)
     } else {
         (None, 0usize)
@@ -2010,13 +2199,16 @@ async fn handle_hls_relay_from_text(
     // Unwrapped HLS streams have unknown total length: NEVER emit Content-Length or Accept-Ranges.
     let resp_header =
         format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nConnection: close\r\n\r\n");
-    socket.write_all(resp_header.as_bytes()).await?;
+    if !write_all_or_killed(&mut socket, resp_header.as_bytes(), &kill_notify).await {
+        let _ = socket.shutdown().await;
+        return Ok(());
+    }
 
     let mut bytes_sent = 0u64;
     if let Some(init) = init_bytes
         && !init.is_empty()
     {
-        if socket.write_all(&init).await.is_err() {
+        if !write_all_or_killed(&mut socket, &init, &kill_notify).await {
             let _ = socket.shutdown().await;
             return Ok(());
         }
@@ -2025,7 +2217,7 @@ async fn handle_hls_relay_from_text(
 
     if kind == HlsStreamKind::MpegTs {
         if !initial_demuxed.is_empty() {
-            if socket.write_all(&initial_demuxed).await.is_err() {
+            if !write_all_or_killed(&mut socket, &initial_demuxed, &kill_notify).await {
                 let _ = socket.shutdown().await;
                 return Ok(());
             }
@@ -2038,7 +2230,7 @@ async fn handle_hls_relay_from_text(
             &first
         };
         if !payload.is_empty() {
-            if socket.write_all(payload).await.is_err() {
+            if !write_all_or_killed(&mut socket, payload, &kill_notify).await {
                 let _ = socket.shutdown().await;
                 return Ok(());
             }
@@ -2046,113 +2238,44 @@ async fn handle_hls_relay_from_text(
         }
     }
 
+    let strip_id3 = matches!(kind, HlsStreamKind::RawAdts { strip_id3: true });
     let mut demux_scratch = Vec::new();
     for seg in &media.segments[remaining_start..] {
         if !handle.is_running() {
             break;
         }
-        let range_hdr = seg
-            .byte_range
-            .map(|(start, end)| format!("bytes={start}-{end}"));
-        let resp_res = tokio::select! {
-            _ = kill_notify.notified() => break,
-            res = send_with_preserved_headers(
-                client,
-                Method::GET,
-                &seg.url,
-                &spec.headers,
-                range_hdr.as_deref(),
-                MAX_REDIRECTS,
-            ) => res,
-        };
-        let mut resp = match resp_res {
-            Ok(r) if r.status.is_success() => r,
-            Ok(r) => {
-                handle.append_stderr(&format!(
-                    "VirtualFfmpegShim HLS segment HTTP {} for {}\n",
-                    r.status, r.final_url
-                ));
-                break;
-            }
-            Err(err) => {
-                handle.append_stderr(&format!("VirtualFfmpegShim HLS segment error: {err}\n"));
-                break;
-            }
-        };
-
-        let strip_id3_this_seg = matches!(kind, HlsStreamKind::RawAdts { strip_id3: true });
-        let mut id3_stripped = !strip_id3_this_seg;
-        let mut seg_prefix_buf: Vec<u8> = Vec::new();
-        loop {
-            tokio::select! {
-                _ = kill_notify.notified() => {
-                    let _ = socket.shutdown().await;
-                    return Ok(());
-                }
-                chunk_res = resp.response.chunk() => {
-                    match chunk_res {
-                        Ok(Some(chunk)) => {
-                            if chunk.is_empty() {
-                                continue;
-                            }
-                            if let Some(demuxer) = ts_demuxer.as_mut() {
-                                demux_scratch.clear();
-                                demuxer.feed(&chunk, &mut demux_scratch);
-                                if !demux_scratch.is_empty() {
-                                    if socket.write_all(&demux_scratch).await.is_err() {
-                                        let _ = socket.shutdown().await;
-                                        return Ok(());
-                                    }
-                                    bytes_sent += demux_scratch.len() as u64;
-                                }
-                            } else if !id3_stripped {
-                                seg_prefix_buf.extend_from_slice(&chunk);
-                                // Wait until we have enough bytes to determine and skip any leading ID3v2 tag.
-                                if seg_prefix_buf.len() < 10 {
-                                    continue;
-                                }
-                                if let Some(tag_len) = id3v2_tag_len(&seg_prefix_buf)
-                                    && seg_prefix_buf.len() < tag_len
-                                {
-                                    continue;
-                                }
-                                let remainder = strip_leading_id3v2(&seg_prefix_buf);
-                                id3_stripped = true;
-                                if !remainder.is_empty() {
-                                    if socket.write_all(remainder).await.is_err() {
-                                        let _ = socket.shutdown().await;
-                                        return Ok(());
-                                    }
-                                    bytes_sent += remainder.len() as u64;
-                                }
-                                seg_prefix_buf.clear();
-                            } else {
-                                if socket.write_all(&chunk).await.is_err() {
-                                    let _ = socket.shutdown().await;
-                                    return Ok(());
-                                }
-                                bytes_sent += chunk.len() as u64;
-                            }
-                        }
-                        Ok(None) => {
-                            if !id3_stripped && !seg_prefix_buf.is_empty() {
-                                let remainder = strip_leading_id3v2(&seg_prefix_buf);
-                                if !remainder.is_empty() {
-                                    let _ = socket.write_all(remainder).await;
-                                    bytes_sent += remainder.len() as u64;
-                                }
-                            }
-                            break;
-                        }
-                        Err(err) => {
-                            handle.append_stderr(&format!(
-                                "VirtualFfmpegShim HLS chunk read error: {err}\n"
-                            ));
-                            break;
-                        }
+        let seg_bytes =
+            match fetch_hls_segment_bytes_with_retry(client, &spec.headers, seg, &kill_notify, 3)
+                .await
+            {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    if handle.is_running() {
+                        handle.append_stderr(&format!(
+                            "VirtualFfmpegShim HLS segment error: {err}\n"
+                        ));
                     }
+                    break;
                 }
+            };
+        if seg_bytes.is_empty() {
+            continue;
+        }
+        let payload: &[u8] = if let Some(demuxer) = ts_demuxer.as_mut() {
+            demux_scratch.clear();
+            demuxer.feed(&seg_bytes, &mut demux_scratch);
+            &demux_scratch
+        } else if strip_id3 {
+            strip_leading_id3v2(&seg_bytes)
+        } else {
+            &seg_bytes
+        };
+        if !payload.is_empty() {
+            if !write_all_or_killed(&mut socket, payload, &kill_notify).await {
+                let _ = socket.shutdown().await;
+                return Ok(());
             }
+            bytes_sent += payload.len() as u64;
         }
     }
 
@@ -2902,5 +3025,343 @@ mod tests {
             "https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/93/index.m3u8",
             "expected lowest-bandwidth AAC-LC muxed variant (itag=93) ahead of HE-AAC (itag=91/92)"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_virtual_ffmpeg_hls_middle_segment_503_retries_and_succeeds() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut adts_unit = Vec::new();
+        for _ in 0..4 {
+            adts_unit.extend_from_slice(VALID_ADTS_AAC_FRAME);
+        }
+        let mut ts_seg = Vec::new();
+        ts_seg.extend_from_slice(&make_ts_pat(0x0100));
+        ts_seg.extend_from_slice(&make_ts_pmt(0x0100, 0x0101, 0x0F));
+        ts_seg.extend_from_slice(&make_ts_audio_pes_packets(0x0101, &adts_unit));
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind hls 503");
+        let addr = listener.local_addr().expect("hls 503 addr");
+        let ts_seg_arc = Arc::new(ts_seg);
+        let seg1_hits = Arc::new(AtomicUsize::new(0));
+        let srv_seg1_hits = Arc::clone(&seg1_hits);
+
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let seg_bytes = Arc::clone(&ts_seg_arc);
+                let hits = Arc::clone(&srv_seg1_hits);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    match path {
+                        "/audio.m3u8" => {
+                            let body = concat!(
+                                "#EXTM3U\n",
+                                "#EXT-X-VERSION:3\n",
+                                "#EXT-X-TARGETDURATION:2\n",
+                                "#EXTINF:2.0,\n",
+                                "seg0.ts\n",
+                                "#EXTINF:2.0,\n",
+                                "seg1.ts\n",
+                                "#EXTINF:2.0,\n",
+                                "seg2.ts\n",
+                                "#EXT-X-ENDLIST\n",
+                            );
+                            let hdr = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = socket.write_all(hdr.as_bytes()).await;
+                            let _ = socket.write_all(body.as_bytes()).await;
+                        }
+                        "/seg1.ts" => {
+                            let prev = hits.fetch_add(1, Ordering::SeqCst);
+                            if prev == 0 {
+                                let body = b"Unavailable";
+                                let hdr = format!(
+                                    "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    body.len()
+                                );
+                                let _ = socket.write_all(hdr.as_bytes()).await;
+                                let _ = socket.write_all(body).await;
+                            } else {
+                                let hdr = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    seg_bytes.len()
+                                );
+                                let _ = socket.write_all(hdr.as_bytes()).await;
+                                let _ = socket.write_all(&seg_bytes).await;
+                            }
+                        }
+                        "/seg0.ts" | "/seg2.ts" => {
+                            let hdr = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                seg_bytes.len()
+                            );
+                            let _ = socket.write_all(hdr.as_bytes()).await;
+                            let _ = socket.write_all(&seg_bytes).await;
+                        }
+                        _ => {
+                            let _ = socket
+                                .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                                .await;
+                        }
+                    }
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        let free_port = {
+            let tmp = std::net::TcpListener::bind("127.0.0.1:0").expect("bind free port");
+            tmp.local_addr().expect("addr").port()
+        };
+        let relay_url = format!("http://127.0.0.1:{free_port}/");
+        let playlist_url = format!("http://{addr}/audio.m3u8");
+
+        let proc = VirtualFfmpegShim::spawn_str(&[
+            "-i",
+            &playlist_url,
+            "-vn",
+            "-f",
+            "mp3",
+            "-listen",
+            "1",
+            &relay_url,
+        ])
+        .expect("spawn hls 503 relay");
+
+        let local_client =
+            build_loopback_no_redirect_client(Duration::from_secs(5)).expect("loopback client");
+        let resp = local_client
+            .get(&relay_url)
+            .send()
+            .await
+            .expect("GET hls relay");
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body = resp.bytes().await.expect("read body");
+
+        let mut expected = Vec::new();
+        for _ in 0..3 {
+            expected.extend_from_slice(&adts_unit);
+        }
+        assert_eq!(
+            body.as_ref(),
+            expected.as_slice(),
+            "HLS relay must recover full audio payload across all 3 segments after transient 503"
+        );
+        assert_eq!(
+            seg1_hits.load(Ordering::SeqCst),
+            2,
+            "middle segment should have failed once with 503 and succeeded on retry #2"
+        );
+
+        proc.kill();
+        let _ = proc.wait();
+        srv.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_virtual_ffmpeg_chunked_range_second_chunk_503_retries_and_succeeds() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let payload: Vec<u8> = (0..30_000).map(|i| ((i * 37) % 251) as u8).collect();
+        let srv_payload = Arc::new(payload.clone());
+        let chunk2_hits = Arc::new(AtomicUsize::new(0));
+        let srv_chunk2_hits = Arc::clone(&chunk2_hits);
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind chunked");
+        let addr = listener.local_addr().expect("chunked addr");
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let data = Arc::clone(&srv_payload);
+                let hits = Arc::clone(&srv_chunk2_hits);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let range_hdr = req
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.trim()
+                                .eq_ignore_ascii_case("Range")
+                                .then(|| v.trim().to_owned())
+                        })
+                        .expect("expected Range header from -request_size");
+                    let (start_s, end_s) = range_hdr
+                        .strip_prefix("bytes=")
+                        .and_then(|s| s.split_once('-'))
+                        .expect("parse bytes=start-end");
+                    let start: usize = start_s.parse().expect("parse start");
+                    let end: usize = end_s
+                        .parse::<usize>()
+                        .expect("parse end")
+                        .min(data.len() - 1);
+
+                    if start == 10_000 && hits.fetch_add(1, Ordering::SeqCst) == 0 {
+                        let body = b"Busy";
+                        let hdr = format!(
+                            "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = socket.write_all(hdr.as_bytes()).await;
+                        let _ = socket.write_all(body).await;
+                        let _ = socket.shutdown().await;
+                        return;
+                    }
+
+                    let slice = &data[start..=end];
+                    let hdr = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Type: audio/mp4\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                        slice.len(),
+                        data.len()
+                    );
+                    let _ = socket.write_all(hdr.as_bytes()).await;
+                    let _ = socket.write_all(slice).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        let free_port = {
+            let tmp = std::net::TcpListener::bind("127.0.0.1:0").expect("bind free port");
+            tmp.local_addr().expect("addr").port()
+        };
+        let relay_url = format!("http://127.0.0.1:{free_port}/");
+        let spec = HttpRelaySpec {
+            input_url: format!("http://{addr}/videoplayback"),
+            headers: vec![("User-Agent".to_owned(), "nsh-chunk-retry/1.0".to_owned())],
+            reconnect: true,
+            request_size: Some(10_000),
+            format: Some("mp3".to_owned()),
+            audio_codec: Some("libmp3lame".to_owned()),
+            disable_video: true,
+            listen: true,
+            listen_host: "127.0.0.1".to_owned(),
+            listen_port: free_port,
+            output_url: relay_url.clone(),
+        };
+
+        let proc = spawn_http_relay_inner(spec, true).expect("spawn chunked relay");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !proc.error_output().contains("Input #0")
+            && proc.is_running()
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        assert!(
+            proc.error_output().contains("Input #0"),
+            "expected Input #0 after chunk 0 preflight, got: {}",
+            proc.error_output()
+        );
+
+        let local_client =
+            build_loopback_no_redirect_client(Duration::from_secs(5)).expect("loopback client");
+        let resp = local_client
+            .get(&relay_url)
+            .send()
+            .await
+            .expect("GET chunked relay");
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let received = resp.bytes().await.expect("read body");
+        assert_eq!(
+            received.as_ref(),
+            payload.as_slice(),
+            "chunked Range relay must recover all 30_000 bytes after chunk 2 HTTP 503"
+        );
+        assert_eq!(
+            chunk2_hits.load(Ordering::SeqCst),
+            2,
+            "chunk 2 should fail once with 503 and succeed on retry #2"
+        );
+
+        proc.kill();
+        let _ = proc.wait();
+        srv.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_virtual_ffmpeg_eager_preflight_times_out_on_hung_upstream() {
+        assert_eq!(
+            EAGER_PREFLIGHT_TIMEOUT,
+            Duration::from_secs(8),
+            "production eager preflight timeout must remain capped at 8s"
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind hung");
+        let addr = listener.local_addr().expect("hung addr");
+        let srv = tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let _ = socket.read(&mut buf).await;
+                // Deliberately hold socket open without writing response headers.
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+
+        let free_port = {
+            let tmp = std::net::TcpListener::bind("127.0.0.1:0").expect("bind free port");
+            tmp.local_addr().expect("addr").port()
+        };
+        let spec = HttpRelaySpec {
+            input_url: format!("http://{addr}/hung-stream"),
+            headers: vec![("User-Agent".to_owned(), "nsh-timeout/1.0".to_owned())],
+            reconnect: true,
+            request_size: Some(10_485_760),
+            format: Some("mp3".to_owned()),
+            audio_codec: Some("libmp3lame".to_owned()),
+            disable_video: true,
+            listen: true,
+            listen_host: "127.0.0.1".to_owned(),
+            listen_port: free_port,
+            output_url: format!("http://127.0.0.1:{free_port}/"),
+        };
+
+        let started = std::time::Instant::now();
+        let proc = spawn_http_relay_with_timeout(spec, true, Duration::from_millis(400))
+            .expect("spawn eager preflight timeout relay");
+        let (exit, err_out, running) = tokio::task::spawn_blocking(move || {
+            let exit = proc.wait();
+            let err_out = proc.error_output();
+            (exit, err_out, proc.is_running())
+        })
+        .await
+        .expect("join wait");
+        let elapsed = started.elapsed();
+
+        assert_eq!(exit, 1, "hung eager preflight must exit with code 1");
+        assert!(!running, "process must stop after preflight timeout");
+        assert!(
+            !err_out.contains("Input #0"),
+            "hung eager preflight must NOT emit 'Input #0', got: {err_out}"
+        );
+        assert!(
+            err_out.contains("timed out"),
+            "stderr should mention timeout, got: {err_out}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "eager preflight must fail promptly within bounded timeout, took {elapsed:?}"
+        );
+
+        srv.abort();
     }
 }

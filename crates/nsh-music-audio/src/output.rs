@@ -243,15 +243,20 @@ impl Drop for NullOutput {
 }
 
 #[cfg(not(any(target_arch = "wasm32", target_env = "ohos")))]
+#[path = "output_monitor.rs"]
+mod output_monitor;
+
+#[cfg(not(any(target_arch = "wasm32", target_env = "ohos")))]
 mod cpal_impl {
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::mpsc::{self, Sender};
+    use std::sync::mpsc::{self, RecvTimeoutError, Sender};
     use std::sync::{Arc, Mutex};
     use std::thread::{self, JoinHandle};
 
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use cpal::{SampleFormat, Stream, StreamConfig, SupportedStreamConfig};
 
+    use super::output_monitor::OutputMonitor;
     use super::{AudioOutput, AudioOutputEvent, OutputConfig, OutputEventCallback, RenderCallback};
     use crate::{AudioError, AudioResult};
 
@@ -297,24 +302,53 @@ mod cpal_impl {
                 .name("nsh-audio-cpal".into())
                 .spawn(move || {
                     let mut active_stream: Option<Stream> = None;
-                    while let Ok(cmd) = rx.recv() {
+                    let mut monitor: Option<OutputMonitor> = None;
+                    loop {
+                        let poll_interval = monitor
+                            .as_ref()
+                            .and_then(|m| m.poll_interval(thread_running.load(Ordering::Relaxed)));
+                        let cmd = if let Some(interval) = poll_interval {
+                            match rx.recv_timeout(interval) {
+                                Ok(cmd) => cmd,
+                                Err(RecvTimeoutError::Timeout) => {
+                                    if let Some(ref mut m) = monitor {
+                                        m.poll_tick();
+                                    }
+                                    continue;
+                                }
+                                Err(RecvTimeoutError::Disconnected) => break,
+                            }
+                        } else {
+                            match rx.recv() {
+                                Ok(cmd) => cmd,
+                                Err(_) => break,
+                            }
+                        };
+
                         match cmd {
                             CpalCmd::Start {
                                 spec,
                                 render,
                                 reply,
                             } => {
+                                drop(monitor.take());
                                 active_stream = None;
                                 thread_running.store(false, Ordering::SeqCst);
                                 match build_cpal_stream(spec, render, Arc::clone(&thread_event_cb))
                                 {
-                                    Ok((stream, negotiated)) => {
+                                    Ok((stream, negotiated, device_name)) => {
+                                        let new_monitor = OutputMonitor::start(
+                                            Arc::clone(&thread_event_cb),
+                                            device_name,
+                                        );
                                         if let Err(err) = stream.play() {
+                                            drop(new_monitor);
                                             let _ = reply.send(Err(AudioError::Output(format!(
                                                 "cpal stream.play() failed: {err}"
                                             ))));
                                         } else {
                                             active_stream = Some(stream);
+                                            monitor = Some(new_monitor);
                                             thread_running.store(true, Ordering::SeqCst);
                                             let _ = reply.send(Ok(negotiated));
                                         }
@@ -334,6 +368,9 @@ mod cpal_impl {
                                 };
                                 if res.is_ok() {
                                     thread_running.store(false, Ordering::SeqCst);
+                                    if let Some(ref mut m) = monitor {
+                                        m.set_active(false);
+                                    }
                                 }
                                 let _ = reply.send(res);
                             }
@@ -347,21 +384,28 @@ mod cpal_impl {
                                 };
                                 if res.is_ok() {
                                     thread_running.store(true, Ordering::SeqCst);
+                                    if let Some(ref mut m) = monitor {
+                                        m.set_active(true);
+                                    }
                                 }
                                 let _ = reply.send(res);
                             }
                             CpalCmd::Stop(reply) => {
+                                drop(monitor.take());
                                 active_stream = None;
                                 thread_running.store(false, Ordering::SeqCst);
                                 let _ = reply.send(Ok(()));
                             }
                             CpalCmd::Shutdown => {
+                                drop(monitor.take());
                                 drop(active_stream.take());
                                 thread_running.store(false, Ordering::SeqCst);
                                 break;
                             }
                         }
                     }
+                    drop(monitor.take());
+                    drop(active_stream.take());
                 })
                 .map_err(|e| {
                     AudioError::Output(format!("failed to spawn cpal control thread: {e}"))
@@ -475,11 +519,12 @@ mod cpal_impl {
         requested: OutputConfig,
         mut render: RenderCallback,
         event_cb: Arc<Mutex<Option<OutputEventCallback>>>,
-    ) -> AudioResult<(Stream, OutputConfig)> {
+    ) -> AudioResult<(Stream, OutputConfig, Option<String>)> {
         let host = cpal::default_host();
         let device = host
             .default_output_device()
             .ok_or_else(|| AudioError::Output("no default audio output device".into()))?;
+        let device_name = device.name().ok();
         let supported = select_best_config(&device, requested)?;
         let sample_format = supported.sample_format();
         let stream_config: StreamConfig = supported.into();
@@ -547,7 +592,7 @@ mod cpal_impl {
         }
         .map_err(|e| AudioError::Output(format!("failed to build cpal stream: {e}")))?;
 
-        Ok((stream, negotiated))
+        Ok((stream, negotiated, device_name))
     }
 }
 
