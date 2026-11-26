@@ -72,14 +72,17 @@ pub use ffmpeg_backend::{FfmpegDecoder, ReadSeek};
 pub use output::CpalOutput;
 #[cfg(target_env = "ohos")]
 pub use output::OhosAudioOutput;
-pub use output::{AudioOutput, NullOutput, OutputConfig, RenderCallback, default_audio_output};
+pub use output::{
+    AudioOutput, AudioOutputEvent, NullOutput, OutputConfig, OutputEventCallback,
+    OutputEventEmitter, RenderCallback, default_audio_output,
+};
 pub use player::{
     AudioEngine, AudioEngineConfig, PlaybackSnapshot, PlaybackStatus, RadioRefillCallback,
     StateChangeCallback, StreamResolver,
 };
 pub use remote::{
     DefaultPlatformRemoteDriver, NowPlayingMetadata, PlatformRemoteDriver, RemoteBackend,
-    RemoteCommand, RemoteCommandHandler, RemoteController,
+    RemoteCommand, RemoteCommandHandler, RemoteController, RemoteLoopMode, RemotePlaybackStatus,
 };
 pub use virtual_ffmpeg::{
     FfmpegInvocation, HttpRelaySpec, VirtualFfmpegShim, VirtualProcessHandle, is_ffmpeg_command,
@@ -873,6 +876,211 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn test_output_device_disconnected_pauses_and_never_auto_resumes() {
+        let dir = unique_temp_dir("device-disconnect");
+        let null_out = NullOutput::with_tick_interval(Duration::from_millis(2));
+        let emitter = null_out.event_emitter();
+
+        let engine = AudioEngine::with_output(
+            AudioEngineConfig {
+                cache: StreamCacheConfig {
+                    cache_dir: dir.clone(),
+                    max_bytes: 2 * 1024 * 1024,
+                    ..StreamCacheConfig::default()
+                },
+                prefetch_next: false,
+                ..AudioEngineConfig::default()
+            },
+            Box::new(null_out),
+        )
+        .expect("create engine");
+
+        engine.play_track(make_demo_track("bt-1", "Wireless Track", 30_000));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && engine.snapshot().status != PlaybackStatus::Playing {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(engine.snapshot().status, PlaybackStatus::Playing);
+
+        // Bluetooth / headset disconnect must pause playback and update RemoteController.
+        emitter.emit(AudioOutputEvent::DeviceDisconnected);
+        let pause_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < pause_deadline && engine.snapshot().status != PlaybackStatus::Paused
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(engine.snapshot().status, PlaybackStatus::Paused);
+        assert_eq!(
+            engine.remote_controller().metadata().status,
+            RemotePlaybackStatus::Paused
+        );
+
+        // A subsequent SystemResume must NEVER auto-resume after DeviceDisconnected.
+        emitter.emit(AudioOutputEvent::SystemResume);
+        std::thread::sleep(Duration::from_millis(80));
+        assert_eq!(engine.snapshot().status, PlaybackStatus::Paused);
+        assert_eq!(
+            engine.remote_controller().metadata().status,
+            RemotePlaybackStatus::Paused
+        );
+
+        engine.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_output_system_interrupt_auto_resume_and_explicit_user_override() {
+        let dir = unique_temp_dir("system-interrupt");
+        let null_out = NullOutput::with_tick_interval(Duration::from_millis(2));
+        let emitter = null_out.event_emitter();
+
+        let engine = AudioEngine::with_output(
+            AudioEngineConfig {
+                cache: StreamCacheConfig {
+                    cache_dir: dir.clone(),
+                    max_bytes: 2 * 1024 * 1024,
+                    ..StreamCacheConfig::default()
+                },
+                prefetch_next: false,
+                ..AudioEngineConfig::default()
+            },
+            Box::new(null_out),
+        )
+        .expect("create engine");
+
+        engine.play_track(make_demo_track("int-1", "Interrupt Track", 30_000));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && engine.snapshot().status != PlaybackStatus::Playing {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(engine.snapshot().status, PlaybackStatus::Playing);
+
+        // Transient SystemPause -> pauses, then SystemResume -> auto-resumes.
+        emitter.emit(AudioOutputEvent::SystemPause);
+        let p_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < p_deadline && engine.snapshot().status != PlaybackStatus::Paused {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(engine.snapshot().status, PlaybackStatus::Paused);
+
+        emitter.emit(AudioOutputEvent::SystemResume);
+        let r_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < r_deadline && engine.snapshot().status != PlaybackStatus::Playing {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(engine.snapshot().status, PlaybackStatus::Playing);
+
+        // If user explicitly pauses while interrupted, SystemResume must NOT auto-resume.
+        emitter.emit(AudioOutputEvent::SystemPause);
+        let p2_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < p2_deadline && engine.snapshot().status != PlaybackStatus::Paused {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(engine.snapshot().status, PlaybackStatus::Paused);
+
+        engine.pause();
+        std::thread::sleep(Duration::from_millis(40));
+        emitter.emit(AudioOutputEvent::SystemResume);
+        std::thread::sleep(Duration::from_millis(80));
+        assert_eq!(
+            engine.snapshot().status,
+            PlaybackStatus::Paused,
+            "explicit Pause during interrupt must prevent SystemResume auto-resume"
+        );
+
+        // Resume, interrupt again, then explicit Stop must also prevent SystemResume.
+        engine.play();
+        let r2_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < r2_deadline && engine.snapshot().status != PlaybackStatus::Playing {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(engine.snapshot().status, PlaybackStatus::Playing);
+
+        emitter.emit(AudioOutputEvent::SystemPause);
+        let p3_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < p3_deadline && engine.snapshot().status != PlaybackStatus::Paused {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        engine.stop();
+        let stop_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < stop_deadline && engine.snapshot().status != PlaybackStatus::Stopped
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        emitter.emit(AudioOutputEvent::SystemResume);
+        std::thread::sleep(Duration::from_millis(80));
+        assert_eq!(engine.snapshot().status, PlaybackStatus::Stopped);
+
+        engine.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_output_duck_and_unduck_scale_effective_volume_without_mutating_snapshot() {
+        let dir = unique_temp_dir("duck-unduck");
+        let null_out = NullOutput::with_tick_interval(Duration::from_millis(2));
+        let emitter = null_out.event_emitter();
+
+        let engine = AudioEngine::with_output(
+            AudioEngineConfig {
+                cache: StreamCacheConfig {
+                    cache_dir: dir.clone(),
+                    max_bytes: 2 * 1024 * 1024,
+                    ..StreamCacheConfig::default()
+                },
+                initial_volume: 0.80,
+                prefetch_next: false,
+                ..AudioEngineConfig::default()
+            },
+            Box::new(null_out),
+        )
+        .expect("create engine");
+
+        engine.play_track(make_demo_track("duck-1", "Duck Track", 30_000));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && engine.snapshot().status != PlaybackStatus::Playing {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(engine.snapshot().status, PlaybackStatus::Playing);
+        assert!((engine.snapshot().volume - 0.80).abs() < 1e-4);
+        assert!((engine.effective_volume_for_test() - 0.80).abs() < 1e-4);
+
+        // Duck -> effective volume drops to 25% (0.20), while user snapshot.volume stays 0.80.
+        emitter.emit(AudioOutputEvent::Duck);
+        let duck_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < duck_deadline
+            && (engine.effective_volume_for_test() - 0.20).abs() > 0.01
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!((engine.effective_volume_for_test() - 0.20).abs() < 1e-4);
+        assert!((engine.snapshot().volume - 0.80).abs() < 1e-4);
+
+        // Changing user volume while ducked keeps ducking ratio active (0.60 -> 0.15).
+        engine.set_volume(0.60);
+        let vol_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < vol_deadline && (engine.snapshot().volume - 0.60).abs() > 0.01 {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!((engine.snapshot().volume - 0.60).abs() < 1e-4);
+        assert!((engine.effective_volume_for_test() - 0.15).abs() < 1e-4);
+
+        // Unduck -> restores full user volume (0.60).
+        emitter.emit(AudioOutputEvent::Unduck);
+        let unduck_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < unduck_deadline
+            && (engine.effective_volume_for_test() - 0.60).abs() > 0.01
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!((engine.effective_volume_for_test() - 0.60).abs() < 1e-4);
+        assert!((engine.snapshot().volume - 0.60).abs() < 1e-4);
+
+        engine.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Live end-to-end YouTube Music (`0dGXCvLIffY` / `难解`) verification across all three
     /// real stream types returned by InnerTube `VISIONOS`:
     /// 1. `itag=251` (`audio/webm; codecs="opus"`)
@@ -1121,33 +1329,74 @@ mod tests {
             );
 
             if let Some(target_ms) = test_seek_ms {
-                let landed = dec
-                    .seek(target_ms)
-                    .unwrap_or_else(|e| panic!("[live-ytm] {label} seek({target_ms}) failed: {e}"));
-                let mut post_seek = Vec::new();
-                let mut post_peak = 0.0f32;
-                while post_seek.len() < 8192 {
-                    let start = post_seek.len();
-                    let n = dec.read_pcm(&mut post_seek).unwrap_or_else(|e| {
-                        panic!("[live-ytm] {label} post-seek read_pcm failed: {e}")
+                let landed_fwd = dec.seek(target_ms).unwrap_or_else(|e| {
+                    panic!("[live-ytm] {label} forward seek({target_ms}) failed: {e}")
+                });
+                let mut post_fwd = Vec::new();
+                let mut post_fwd_peak = 0.0f32;
+                while post_fwd.len() < 8192 {
+                    let start = post_fwd.len();
+                    let n = dec.read_pcm(&mut post_fwd).unwrap_or_else(|e| {
+                        panic!("[live-ytm] {label} post-forward-seek read_pcm failed: {e}")
                     });
                     if n == 0 {
                         break;
                     }
-                    for &s in &post_seek[start..] {
-                        post_peak = post_peak.max(s.abs());
+                    for &s in &post_fwd[start..] {
+                        post_fwd_peak = post_fwd_peak.max(s.abs());
                     }
                 }
                 eprintln!(
-                    "[live-ytm] {label}: seek({target_ms}) -> landed={landed}ms, post_seek_samples={}, post_peak={:.4}",
-                    post_seek.len(),
-                    post_peak
+                    "[live-ytm] {label}: fwd seek({target_ms}) -> landed={landed_fwd}ms, post_samples={}, post_peak={:.4}",
+                    post_fwd.len(),
+                    post_fwd_peak
                 );
                 assert!(
-                    post_seek.len() >= 4096,
-                    "{label}: post-seek decode too short"
+                    post_fwd.len() >= 4096,
+                    "{label}: post-forward-seek decode too short"
                 );
-                assert!(post_peak > 0.001, "{label}: post-seek audio silent");
+                assert!(
+                    post_fwd_peak > 0.001,
+                    "{label}: post-forward-seek audio silent"
+                );
+
+                // Now verify backward seek (`15_000ms` -> `3_000ms`) lands cleanly `< 8_000ms`
+                // and emits audible non-zero PCM across WebM/Opus, DASH fMP4/AAC, and HLS!
+                let back_target_ms = 3_000u64;
+                let landed_back = dec.seek(back_target_ms).unwrap_or_else(|e| {
+                    panic!("[live-ytm] {label} backward seek({back_target_ms}) failed: {e}")
+                });
+                let mut post_back = Vec::new();
+                let mut post_back_peak = 0.0f32;
+                while post_back.len() < 16_384 {
+                    let start = post_back.len();
+                    let n = dec.read_pcm(&mut post_back).unwrap_or_else(|e| {
+                        panic!("[live-ytm] {label} post-backward-seek read_pcm failed: {e}")
+                    });
+                    if n == 0 {
+                        break;
+                    }
+                    for &s in &post_back[start..] {
+                        post_back_peak = post_back_peak.max(s.abs());
+                    }
+                }
+                eprintln!(
+                    "[live-ytm] {label}: back seek({back_target_ms}) -> landed={landed_back}ms, post_samples={}, post_peak={:.4}",
+                    post_back.len(),
+                    post_back_peak
+                );
+                assert!(
+                    landed_back < 8_000,
+                    "{label}: expected backward seek({back_target_ms}) to land < 8000ms, got {landed_back}ms"
+                );
+                assert!(
+                    post_back.len() >= 4096,
+                    "{label}: post-backward-seek decode too short"
+                );
+                assert!(
+                    post_back_peak > 0.001,
+                    "{label}: post-backward-seek audio silent"
+                );
             }
 
             proc.kill();
@@ -1155,7 +1404,8 @@ mod tests {
         };
 
         // Decode ~2.5s of stereo PCM per stream to get past the quiet 0.5s intro fade-in
-        // of `0dGXCvLIffY` and verify strong audible signal across all three formats.
+        // of `0dGXCvLIffY` and verify strong audible signal + forward & backward seek
+        // across all three formats (`itag=251`, `itag=140`, and `hlsManifestUrl`).
         run_case(
             "itag=251 WebM/Opus",
             &url_251,
@@ -1170,7 +1420,13 @@ mod tests {
             220_500,
             Some(15_000),
         );
-        run_case("hlsManifestUrl (.m3u8)", &url_hls, None, 220_500, None);
+        run_case(
+            "hlsManifestUrl (.m3u8)",
+            &url_hls,
+            None,
+            220_500,
+            Some(15_000),
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

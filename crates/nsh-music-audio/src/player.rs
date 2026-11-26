@@ -13,8 +13,8 @@ use crate::decoder::{
     AudioDecoder, AudioSpec, DecoderPreference, infer_extension_hint, open_decoder,
 };
 use crate::dsp::{DspConfig, DspProcessor, SPECTRUM_BANDS, mix_crossfade_in_place};
-use crate::output::{AudioOutput, OutputConfig, default_audio_output};
-use crate::remote::{RemoteCommand, RemoteController};
+use crate::output::{AudioOutput, AudioOutputEvent, OutputConfig, default_audio_output};
+use crate::remote::{RemoteCommand, RemoteController, RemoteLoopMode, RemotePlaybackStatus};
 use crate::{AudioError, AudioResult};
 
 /// Fixed power-of-two capacity for the pre-allocated PCM ring buffer (~1.36s stereo @ 48kHz).
@@ -167,6 +167,7 @@ enum EngineCommand {
     ClearQueue,
     SetStreamResolver(Option<StreamResolver>),
     SetRadioRefill(Option<RadioRefillCallback>),
+    OutputEvent(AudioOutputEvent),
     Shutdown,
 }
 
@@ -374,11 +375,15 @@ impl AudioAtomics {
     }
 }
 
+type PrefetchTarget = (String, Vec<(String, String)>);
+
 struct EngineSignals {
     state_tx: watch::Sender<PlaybackSnapshot>,
     spectrum_tx: watch::Sender<[f32; SPECTRUM_BANDS]>,
     state_callbacks: Mutex<Vec<StateChangeCallback>>,
     atomics: Arc<AudioAtomics>,
+    #[cfg(test)]
+    prefetched_targets: Arc<Mutex<Vec<PrefetchTarget>>>,
 }
 
 struct AudioEngineInner {
@@ -436,7 +441,7 @@ impl AudioEngine {
     /// (e.g., [`NullOutput`](crate::output::NullOutput) for deterministic tests).
     pub fn with_output(
         config: AudioEngineConfig,
-        output: Box<dyn AudioOutput>,
+        mut output: Box<dyn AudioOutput>,
     ) -> AudioResult<Self> {
         let cache = AudioCache::new(config.cache.clone())?;
         let remote = RemoteController::new();
@@ -452,6 +457,10 @@ impl AudioEngine {
         };
 
         let (cmd_tx, cmd_rx) = mpsc::channel::<EngineCommand>();
+        let event_tx = cmd_tx.clone();
+        output.set_event_callback(Some(Arc::new(move |ev| {
+            let _ = event_tx.send(EngineCommand::OutputEvent(ev));
+        })));
         let (state_tx, _) = watch::channel(initial_snapshot.clone());
         let (spectrum_tx, _) = watch::channel([0.0f32; SPECTRUM_BANDS]);
         let atomics = Arc::new(AudioAtomics::new(&config));
@@ -460,6 +469,8 @@ impl AudioEngine {
             spectrum_tx,
             state_callbacks: Mutex::new(Vec::new()),
             atomics: Arc::clone(&atomics),
+            #[cfg(test)]
+            prefetched_targets: Arc::new(Mutex::new(Vec::new())),
         });
 
         let inner = Arc::new(AudioEngineInner {
@@ -512,6 +523,14 @@ impl AudioEngine {
                 }
                 RemoteCommand::SetVolume(pct) => {
                     engine.set_volume((pct.min(100) as f32) / 100.0);
+                }
+                RemoteCommand::SetLoopMode(mode) => {
+                    let (repeat, shuffle) = mode.to_repeat_shuffle();
+                    engine.set_repeat(repeat);
+                    engine.set_shuffle(shuffle);
+                }
+                RemoteCommand::ToggleFavorite => {
+                    // Handled by AppStore remote command listener.
                 }
             }
         }));
@@ -736,6 +755,34 @@ impl AudioEngine {
             let _ = self.inner.cmd_tx.send(EngineCommand::Shutdown);
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn effective_volume_for_test(&self) -> f32 {
+        f32::from_bits(
+            self.inner
+                .signals
+                .atomics
+                .volume_bits
+                .load(Ordering::Acquire),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prefetched_targets_for_test(&self) -> Vec<PrefetchTarget> {
+        self.inner
+            .signals
+            .prefetched_targets
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_prefetched_targets_for_test(&self) {
+        if let Ok(mut guard) = self.inner.signals.prefetched_targets.lock() {
+            guard.clear();
+        }
+    }
 }
 
 struct EngineActor {
@@ -763,8 +810,12 @@ struct EngineActor {
     crossfade_tail: Vec<f32>,
     crossfade_pos: usize,
     last_position_publish: Instant,
+    last_remote_pos_sync: Instant,
     last_published_spectrum: [f32; SPECTRUM_BANDS],
     last_prefetched_id: Option<String>,
+    paused_by_interrupt: bool,
+    pending_pause_after_load: bool,
+    ducked: bool,
 }
 
 impl EngineActor {
@@ -803,8 +854,20 @@ impl EngineActor {
             crossfade_tail: Vec::new(),
             crossfade_pos: 0,
             last_position_publish: Instant::now(),
+            last_remote_pos_sync: Instant::now(),
             last_published_spectrum: [0.0; SPECTRUM_BANDS],
             last_prefetched_id: None,
+            paused_by_interrupt: false,
+            pending_pause_after_load: false,
+            ducked: false,
+        }
+    }
+
+    fn effective_volume(&self) -> f32 {
+        if self.ducked {
+            self.snapshot.volume * 0.25
+        } else {
+            self.snapshot.volume
         }
     }
 
@@ -888,6 +951,8 @@ impl EngineActor {
                 track,
                 explicit_stream,
             } => {
+                self.paused_by_interrupt = false;
+                self.pending_pause_after_load = false;
                 self.snapshot.queue = vec![track];
                 self.snapshot.current_index = Some(0);
                 self.rebuild_shuffle_order(Some(0));
@@ -897,6 +962,8 @@ impl EngineActor {
                 tracks,
                 start_index,
             } => {
+                self.paused_by_interrupt = false;
+                self.pending_pause_after_load = false;
                 if tracks.is_empty() {
                     self.stop_internal();
                     self.snapshot.queue.clear();
@@ -912,6 +979,8 @@ impl EngineActor {
                 }
             }
             EngineCommand::Play => {
+                self.paused_by_interrupt = false;
+                self.pending_pause_after_load = false;
                 if self.snapshot.status.is_paused() && self.decoder.is_some() {
                     self.resume_internal();
                 } else if self.decoder.is_none() {
@@ -925,11 +994,15 @@ impl EngineActor {
                 }
             }
             EngineCommand::Pause => {
+                self.paused_by_interrupt = false;
+                self.pending_pause_after_load = false;
                 if self.snapshot.status.is_playing() {
                     self.pause_internal();
                 }
             }
             EngineCommand::TogglePlay => {
+                self.paused_by_interrupt = false;
+                self.pending_pause_after_load = false;
                 if self.snapshot.status.is_playing() {
                     self.pause_internal();
                 } else if self.snapshot.status.is_paused() && self.decoder.is_some() {
@@ -943,6 +1016,8 @@ impl EngineActor {
                 }
             }
             EngineCommand::Stop => {
+                self.paused_by_interrupt = false;
+                self.pending_pause_after_load = false;
                 self.stop_internal();
                 self.publish_snapshot();
             }
@@ -950,14 +1025,18 @@ impl EngineActor {
                 self.seek_internal(target_ms);
             }
             EngineCommand::Next => {
+                self.paused_by_interrupt = false;
+                self.pending_pause_after_load = false;
                 self.advance_next(true);
             }
             EngineCommand::Prev => {
+                self.paused_by_interrupt = false;
+                self.pending_pause_after_load = false;
                 self.advance_prev();
             }
             EngineCommand::SetVolume(vol) => {
                 self.snapshot.volume = vol.clamp(0.0, 1.0);
-                self.atomics.set_volume(self.snapshot.volume);
+                self.atomics.set_volume(self.effective_volume());
                 self.publish_snapshot();
             }
             EngineCommand::SetMuted(muted) => {
@@ -976,16 +1055,31 @@ impl EngineActor {
                     self.snapshot.shuffle = enabled;
                     self.rebuild_shuffle_order(self.snapshot.current_index);
                     self.publish_snapshot();
+                    self.remote
+                        .update_loop_mode(RemoteLoopMode::from_repeat_shuffle(
+                            self.snapshot.repeat,
+                            self.snapshot.shuffle,
+                        ));
                 }
             }
             EngineCommand::ToggleShuffle => {
                 self.snapshot.shuffle = !self.snapshot.shuffle;
                 self.rebuild_shuffle_order(self.snapshot.current_index);
                 self.publish_snapshot();
+                self.remote
+                    .update_loop_mode(RemoteLoopMode::from_repeat_shuffle(
+                        self.snapshot.repeat,
+                        self.snapshot.shuffle,
+                    ));
             }
             EngineCommand::SetRepeat(mode) => {
                 self.snapshot.repeat = mode;
                 self.publish_snapshot();
+                self.remote
+                    .update_loop_mode(RemoteLoopMode::from_repeat_shuffle(
+                        self.snapshot.repeat,
+                        self.snapshot.shuffle,
+                    ));
             }
             EngineCommand::CycleRepeat => {
                 self.snapshot.repeat = match self.snapshot.repeat {
@@ -994,6 +1088,11 @@ impl EngineActor {
                     RepeatMode::One => RepeatMode::Off,
                 };
                 self.publish_snapshot();
+                self.remote
+                    .update_loop_mode(RemoteLoopMode::from_repeat_shuffle(
+                        self.snapshot.repeat,
+                        self.snapshot.shuffle,
+                    ));
             }
             EngineCommand::SetQuality(quality) => {
                 self.snapshot.quality = quality;
@@ -1012,6 +1111,9 @@ impl EngineActor {
                 self.snapshot.queue.push(track);
                 self.rebuild_shuffle_order(self.snapshot.current_index);
                 self.publish_snapshot();
+                if self.snapshot.current_track.is_some() {
+                    self.sync_remote_metadata();
+                }
             }
             EngineCommand::EnqueueNext(track) => {
                 let insert_at = self
@@ -1022,6 +1124,9 @@ impl EngineActor {
                 self.snapshot.queue.insert(insert_at, track);
                 self.rebuild_shuffle_order(self.snapshot.current_index);
                 self.publish_snapshot();
+                if self.snapshot.current_track.is_some() {
+                    self.sync_remote_metadata();
+                }
             }
             EngineCommand::RemoveFromQueue(index) => {
                 if index < self.snapshot.queue.len() {
@@ -1047,6 +1152,9 @@ impl EngineActor {
                     }
                     self.rebuild_shuffle_order(self.snapshot.current_index);
                     self.publish_snapshot();
+                    if self.snapshot.current_track.is_some() {
+                        self.sync_remote_metadata();
+                    }
                 }
             }
             EngineCommand::MoveQueueItem { from, to } => {
@@ -1084,6 +1192,45 @@ impl EngineActor {
             EngineCommand::SetRadioRefill(cb) => {
                 self.radio_refill = cb;
             }
+            EngineCommand::OutputEvent(ev) => match ev {
+                AudioOutputEvent::DeviceDisconnected => {
+                    self.paused_by_interrupt = false;
+                    if self.snapshot.status.is_playing() {
+                        self.pause_internal();
+                    } else if self.snapshot.status.is_loading() {
+                        self.pending_pause_after_load = true;
+                    }
+                }
+                AudioOutputEvent::SystemPause => {
+                    if self.snapshot.status.is_playing() {
+                        self.paused_by_interrupt = true;
+                        self.pause_internal();
+                    } else if self.snapshot.status.is_loading() {
+                        self.paused_by_interrupt = true;
+                        self.pending_pause_after_load = true;
+                    }
+                }
+                AudioOutputEvent::SystemResume => {
+                    if self.paused_by_interrupt
+                        && self.snapshot.status.is_paused()
+                        && self.decoder.is_some()
+                    {
+                        self.paused_by_interrupt = false;
+                        self.resume_internal();
+                    } else if self.paused_by_interrupt && self.snapshot.status.is_loading() {
+                        self.paused_by_interrupt = false;
+                        self.pending_pause_after_load = false;
+                    }
+                }
+                AudioOutputEvent::Duck => {
+                    self.ducked = true;
+                    self.atomics.set_volume(self.effective_volume());
+                }
+                AudioOutputEvent::Unduck => {
+                    self.ducked = false;
+                    self.atomics.set_volume(self.effective_volume());
+                }
+            },
             EngineCommand::Shutdown => {
                 self.stop_internal();
                 return true;
@@ -1113,7 +1260,7 @@ impl EngineActor {
         let initial_dsp_cfg = DspConfig {
             sample_rate: desired.sample_rate,
             channels: desired.channels,
-            volume: self.snapshot.volume,
+            volume: self.effective_volume(),
             muted: self.snapshot.muted,
             replay_gain_enabled: self.snapshot.replay_gain_enabled,
             ..DspConfig::default()
@@ -1246,6 +1393,9 @@ impl EngineActor {
         self.snapshot.is_lossless = false;
         self.snapshot.stream_format.clear();
         self.publish_snapshot();
+        // Publish Buffering state to OS media controls immediately before blocking
+        // stream resolution so notification bar / Control Center updates right away.
+        self.sync_remote_metadata();
 
         let resolved = match explicit_stream {
             Some(stream) => Ok(stream),
@@ -1274,6 +1424,12 @@ impl EngineActor {
                 self.atomics.playing.store(false, Ordering::Release);
                 self.clear_ring_and_timeline(0);
                 self.publish_snapshot();
+                self.remote.update_playback_full(
+                    RemotePlaybackStatus::Stopped,
+                    0,
+                    self.snapshot.duration_ms,
+                    0,
+                );
                 return;
             }
         };
@@ -1315,6 +1471,12 @@ impl EngineActor {
                 self.atomics.playing.store(false, Ordering::Release);
                 self.clear_ring_and_timeline(0);
                 self.publish_snapshot();
+                self.remote.update_playback_full(
+                    RemotePlaybackStatus::Stopped,
+                    0,
+                    self.snapshot.duration_ms,
+                    0,
+                );
                 return;
             }
         };
@@ -1327,6 +1489,12 @@ impl EngineActor {
             self.decoder = None;
             self.snapshot.status = PlaybackStatus::Error(err.to_string());
             self.publish_snapshot();
+            self.remote.update_playback_full(
+                RemotePlaybackStatus::Stopped,
+                0,
+                self.snapshot.duration_ms,
+                0,
+            );
             return;
         }
 
@@ -1344,7 +1512,6 @@ impl EngineActor {
         self.snapshot.is_lossless = is_lossless;
         self.snapshot.stream_format = stream_format;
         self.snapshot.decoder_backend = decoder.backend_name().to_owned();
-        self.snapshot.status = PlaybackStatus::Playing;
         self.decoder = Some(decoder);
 
         self.atomics.playing.store(false, Ordering::Release);
@@ -1358,6 +1525,21 @@ impl EngineActor {
             },
             self.snapshot.replay_gain_enabled,
         );
+
+        if self.pending_pause_after_load {
+            self.pending_pause_after_load = false;
+            if let Err(err) = self.output.pause() {
+                log::warn!("audio output pause failed after deferred interrupt: {err}");
+            }
+            self.snapshot.status = PlaybackStatus::Paused;
+            self.publish_snapshot();
+            self.sync_remote_metadata();
+            self.maybe_prefetch_next();
+            self.maybe_refill_radio();
+            return;
+        }
+
+        self.snapshot.status = PlaybackStatus::Playing;
         self.atomics.trigger_fade_in(12);
 
         // Prime ring buffer immediately before enabling playback so first callback never underruns.
@@ -1382,24 +1564,30 @@ impl EngineActor {
         let _ = self.output.pause();
         self.snapshot.status = PlaybackStatus::Paused;
         self.publish_snapshot();
-        self.remote.update_playback_state(
-            false,
+        self.remote.update_playback_full(
+            RemotePlaybackStatus::Paused,
             self.snapshot.position_ms,
             self.snapshot.duration_ms,
+            self.snapshot.buffered_ms,
         );
+        self.last_remote_pos_sync = Instant::now();
     }
 
     fn resume_internal(&mut self) {
         self.atomics.trigger_fade_in(10);
         self.atomics.playing.store(true, Ordering::Release);
-        let _ = self.output.resume();
+        if let Err(err) = self.output.resume() {
+            log::warn!("audio output resume failed: {err}");
+        }
         self.snapshot.status = PlaybackStatus::Playing;
         self.publish_snapshot();
-        self.remote.update_playback_state(
-            true,
+        self.remote.update_playback_full(
+            RemotePlaybackStatus::Playing,
             self.snapshot.position_ms,
             self.snapshot.duration_ms,
+            self.snapshot.buffered_ms,
         );
+        self.last_remote_pos_sync = Instant::now();
     }
 
     fn stop_internal(&mut self) {
@@ -1439,6 +1627,7 @@ impl EngineActor {
 
         match decoder.seek(clamped) {
             Ok(landed_ms) => {
+                log::info!("seeked to {clamped}ms -> landed {landed_ms}ms");
                 self.crossfade_tail.clear();
                 self.crossfade_pos = 0;
                 self.clear_ring_and_timeline(landed_ms);
@@ -1446,11 +1635,13 @@ impl EngineActor {
                 self.snapshot.position_ms = landed_ms;
                 self.fill_decoder_buffer();
                 self.publish_snapshot();
-                self.remote.update_playback_state(
-                    self.snapshot.status.is_playing(),
+                self.remote.update_playback_full(
+                    self.remote_playback_status(),
                     landed_ms,
                     self.snapshot.duration_ms,
+                    self.snapshot.buffered_ms,
                 );
+                self.last_remote_pos_sync = Instant::now();
             }
             Err(err) => {
                 log::warn!("seek to {clamped}ms failed: {err}");
@@ -1492,6 +1683,18 @@ impl EngineActor {
                 self.snapshot.position_ms = clamped;
                 self.publish_snapshot();
             }
+        }
+
+        if self.snapshot.status == PlaybackStatus::Playing
+            && self.last_remote_pos_sync.elapsed() >= Duration::from_secs(5)
+        {
+            self.remote.update_playback_full(
+                RemotePlaybackStatus::Playing,
+                self.snapshot.position_ms,
+                self.snapshot.duration_ms,
+                self.snapshot.buffered_ms,
+            );
+            self.last_remote_pos_sync = Instant::now();
         }
     }
 
@@ -1760,30 +1963,45 @@ impl EngineActor {
         let Some(next_track) = self.snapshot.queue.get(next_idx).cloned() else {
             return;
         };
-        if self.last_prefetched_id.as_deref() == Some(next_track.id.as_str()) {
+        if is_local_track_for_prefetch(&next_track) {
             return;
         }
-        self.last_prefetched_id = Some(next_track.id.clone());
+        let prefetch_key = if !next_track.id.is_empty() {
+            next_track.id.as_str()
+        } else {
+            next_track.url.as_str()
+        };
+        if prefetch_key.is_empty() || self.last_prefetched_id.as_deref() == Some(prefetch_key) {
+            return;
+        }
+        self.last_prefetched_id = Some(prefetch_key.to_owned());
 
-        let url_and_headers =
-            if next_track.url.starts_with("http://") || next_track.url.starts_with("https://") {
-                Some((next_track.url.clone(), Vec::new()))
-            } else if let Some(ref resolver) = self.stream_resolver {
-                resolver(&next_track, self.snapshot.quality)
-                    .ok()
-                    .filter(|s| s.url.starts_with("http://") || s.url.starts_with("https://"))
-                    .map(|s| {
-                        (
-                            s.url,
-                            s.headers.into_iter().collect::<Vec<(String, String)>>(),
-                        )
-                    })
-            } else {
-                None
-            };
+        let cache = self.cache.clone();
+        let quality = self.snapshot.quality;
+        #[cfg(test)]
+        let prefetch_log = Arc::clone(&self.signals.prefetched_targets);
 
-        if let Some((url, headers)) = url_and_headers {
-            drop(self.cache.prefetch(url, headers, Some(512 * 1024)));
+        if let Some(resolver) = self.stream_resolver.clone() {
+            if next_track.id.is_empty() {
+                return;
+            }
+            crate::cache::io_runtime_handle().spawn_blocking(move || {
+                if let Some((url, headers)) =
+                    resolve_prefetch_target(Some(&resolver), &next_track, quality)
+                {
+                    #[cfg(test)]
+                    if let Ok(mut log) = prefetch_log.lock() {
+                        log.push((url.clone(), headers.clone()));
+                    }
+                    drop(cache.prefetch(url, headers, Some(512 * 1024)));
+                }
+            });
+        } else if let Some((url, headers)) = resolve_prefetch_target(None, &next_track, quality) {
+            #[cfg(test)]
+            if let Ok(mut log) = prefetch_log.lock() {
+                log.push((url.clone(), headers.clone()));
+            }
+            drop(cache.prefetch(url, headers, Some(512 * 1024)));
         }
     }
 
@@ -1811,24 +2029,42 @@ impl EngineActor {
         self.snapshot.queue.extend(fresh);
         self.rebuild_shuffle_order(self.snapshot.current_index);
         self.publish_snapshot();
+        if self.snapshot.current_track.is_some() {
+            self.sync_remote_metadata();
+        }
         true
     }
 
-    fn sync_remote_metadata(&self) {
+    fn remote_playback_status(&self) -> RemotePlaybackStatus {
+        match self.snapshot.status {
+            PlaybackStatus::Loading => RemotePlaybackStatus::Buffering,
+            PlaybackStatus::Playing => RemotePlaybackStatus::Playing,
+            PlaybackStatus::Paused => RemotePlaybackStatus::Paused,
+            PlaybackStatus::Stopped | PlaybackStatus::Error(_) => RemotePlaybackStatus::Stopped,
+        }
+    }
+
+    fn sync_remote_metadata(&mut self) {
         let Some(ref track) = self.snapshot.current_track else {
             self.remote.clear();
             return;
         };
         let can_next = self.next_queue_index(true).is_some() || self.radio_refill.is_some();
         let can_prev = !self.snapshot.queue.is_empty();
-        self.remote.set_track(
+        let status = self.remote_playback_status();
+        let loop_mode =
+            RemoteLoopMode::from_repeat_shuffle(self.snapshot.repeat, self.snapshot.shuffle);
+        self.remote.set_track_state(
             track,
-            self.snapshot.status.is_playing(),
+            status,
             self.snapshot.position_ms,
             self.snapshot.duration_ms,
+            self.snapshot.buffered_ms,
             can_next,
             can_prev,
+            loop_mode,
         );
+        self.last_remote_pos_sync = Instant::now();
     }
 
     fn publish_snapshot(&self) {
@@ -2103,6 +2339,60 @@ fn sanitize_url_for_log(raw: &str) -> String {
     "<local-path>".to_owned()
 }
 
+fn is_local_track_for_prefetch(track: &Track) -> bool {
+    track.source == "local" || track.url.starts_with("file://") || track.url.starts_with('/')
+}
+
+fn is_http_url(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
+}
+
+fn collect_stream_headers(
+    headers: &std::collections::HashMap<String, String>,
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::with_capacity(headers.len());
+    for (k, v) in headers {
+        if let Some(existing) = out.iter_mut().find(|(ek, _)| ek.eq_ignore_ascii_case(k)) {
+            *existing = (k.clone(), v.clone());
+        } else {
+            out.push((k.clone(), v.clone()));
+        }
+    }
+    out
+}
+
+/// Resolves the HTTP(S) prefetch target `(url, headers)` for the next queued track.
+///
+/// - Skips local tracks (`source == "local"`, `file://`, or `/...`).
+/// - When `stream_resolver` is `Some`, calls it first (when `next_track.id` is non-empty)
+///   and never falls back to `next_track.url` on error or empty/non-HTTP results (avoiding
+///   prefetching HTML watch pages like YouTube Music's `track.url`).
+/// - Only uses `next_track.url` directly when `stream_resolver` is `None`.
+fn resolve_prefetch_target(
+    stream_resolver: Option<&StreamResolver>,
+    next_track: &Track,
+    quality: Quality,
+) -> Option<PrefetchTarget> {
+    if is_local_track_for_prefetch(next_track) {
+        return None;
+    }
+    if let Some(resolver) = stream_resolver {
+        if next_track.id.is_empty() {
+            return None;
+        }
+        let info = resolver(next_track, quality).ok()?;
+        if !is_http_url(&info.url) {
+            return None;
+        }
+        return Some((info.url, collect_stream_headers(&info.headers)));
+    }
+    if is_http_url(&next_track.url) {
+        Some((next_track.url.clone(), Vec::new()))
+    } else {
+        None
+    }
+}
+
 fn resolve_track_stream_with_resolver(
     stream_resolver: Option<&StreamResolver>,
     track: &Track,
@@ -2227,5 +2517,518 @@ mod tests {
             sanitize_url_for_log("http://127.0.0.1:24567/stream?key=abc"),
             "http://127.0.0.1:24567"
         );
+    }
+
+    #[test]
+    fn test_engine_remote_set_loop_mode_updates_snapshot_and_driver() {
+        use std::sync::Mutex;
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+        use nsh_music_core::model::RepeatMode;
+
+        use crate::cache::StreamCacheConfig;
+        use crate::output::NullOutput;
+        use crate::remote::{
+            NowPlayingMetadata, PlatformRemoteDriver, RemoteBackend, RemoteCommand, RemoteLoopMode,
+            RemotePlaybackStatus,
+        };
+
+        use super::{AudioEngine, AudioEngineConfig, PlaybackStatus};
+
+        #[derive(Default)]
+        struct RecordingDriver {
+            metadata_updates: Mutex<Vec<NowPlayingMetadata>>,
+            detail_updates: Mutex<Vec<NowPlayingMetadata>>,
+        }
+
+        impl PlatformRemoteDriver for RecordingDriver {
+            fn backend(&self) -> RemoteBackend {
+                RemoteBackend::HarmonyAvSession
+            }
+
+            fn update_metadata(&self, meta: &NowPlayingMetadata) {
+                self.metadata_updates.lock().unwrap().push(meta.clone());
+            }
+
+            fn update_playback(&self, _is_playing: bool, _position_ms: u64, _duration_ms: u64) {}
+
+            fn update_playback_detail(&self, meta: &NowPlayingMetadata) {
+                self.detail_updates.lock().unwrap().push(meta.clone());
+            }
+
+            fn clear(&self) {}
+        }
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "nsh-player-remote-loop-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+
+        let engine = AudioEngine::with_output(
+            AudioEngineConfig {
+                cache: StreamCacheConfig {
+                    cache_dir: dir.clone(),
+                    max_bytes: 1024 * 1024,
+                    ..StreamCacheConfig::default()
+                },
+                prefetch_next: false,
+                ..AudioEngineConfig::default()
+            },
+            Box::new(NullOutput::with_tick_interval(Duration::from_millis(2))),
+        )
+        .expect("create engine");
+
+        let driver = Arc::new(RecordingDriver::default());
+        engine.remote_controller().set_driver(driver.clone());
+
+        let track = Track {
+            id: "demo-loop-1".to_owned(),
+            source: "local".to_owned(),
+            name: "Loop Test".to_owned(),
+            duration: 15_000,
+            url: "demo://loop-1?duration=15000".to_owned(),
+            ..Track::default()
+        };
+        engine.play_track(track);
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if engine.snapshot().status == PlaybackStatus::Playing {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(engine.snapshot().status, PlaybackStatus::Playing);
+
+        // Verify Buffering -> Playing metadata lifecycle was pushed to the driver.
+        {
+            let metas = driver.metadata_updates.lock().unwrap();
+            assert!(
+                metas
+                    .iter()
+                    .any(|m| m.status == RemotePlaybackStatus::Buffering),
+                "expected Buffering metadata update before Playing"
+            );
+            assert!(
+                metas
+                    .iter()
+                    .any(|m| m.status == RemotePlaybackStatus::Playing),
+                "expected Playing metadata update"
+            );
+        }
+
+        // Dispatch RemoteCommand::SetLoopMode(Shuffle) -> repeat=All, shuffle=true, driver updated.
+        engine
+            .remote_controller()
+            .dispatch(RemoteCommand::SetLoopMode(RemoteLoopMode::Shuffle));
+        let loop_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < loop_deadline {
+            let s = engine.snapshot();
+            if s.repeat == RepeatMode::All && s.shuffle {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let s = engine.snapshot();
+        assert_eq!(s.repeat, RepeatMode::All);
+        assert!(s.shuffle);
+
+        let detail_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < detail_deadline {
+            if driver
+                .detail_updates
+                .lock()
+                .unwrap()
+                .last()
+                .is_some_and(|m| m.loop_mode == RemoteLoopMode::Shuffle)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            driver
+                .detail_updates
+                .lock()
+                .unwrap()
+                .last()
+                .map(|m| m.loop_mode),
+            Some(RemoteLoopMode::Shuffle)
+        );
+
+        // Dispatch RemoteCommand::SetLoopMode(Single) -> repeat=One, shuffle=false.
+        engine
+            .remote_controller()
+            .dispatch(RemoteCommand::SetLoopMode(RemoteLoopMode::Single));
+        let single_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < single_deadline {
+            let s2 = engine.snapshot();
+            if s2.repeat == RepeatMode::One && !s2.shuffle {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let s2 = engine.snapshot();
+        assert_eq!(s2.repeat, RepeatMode::One);
+        assert!(!s2.shuffle);
+        assert_eq!(
+            engine.remote_controller().metadata().loop_mode,
+            RemoteLoopMode::Single
+        );
+
+        engine.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_resolve_prefetch_target_prefers_stream_resolver_and_never_falls_back_to_watch_url() {
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use nsh_music_core::model::StreamInfo;
+
+        use super::resolve_prefetch_target;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_ref = Arc::clone(&calls);
+        let resolver: StreamResolver = Arc::new(move |track, quality| {
+            calls_ref.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(quality, Quality::High);
+            match track.id.as_str() {
+                "yt-ok" => {
+                    let mut headers = HashMap::new();
+                    headers.insert("User-Agent".to_owned(), "nsh-audio-test".to_owned());
+                    headers.insert(
+                        "Referer".to_owned(),
+                        "https://music.youtube.com/".to_owned(),
+                    );
+                    Ok(StreamInfo {
+                        url: "https://cdn.example.test/stream/yt-ok.m4a".to_owned(),
+                        headers,
+                        ..StreamInfo::default()
+                    })
+                }
+                "yt-empty" => Ok(StreamInfo {
+                    url: String::new(),
+                    ..StreamInfo::default()
+                }),
+                "yt-file" => Ok(StreamInfo {
+                    url: "file:///tmp/not-http.mp3".to_owned(),
+                    ..StreamInfo::default()
+                }),
+                _ => Err(SourceError::Message("upstream unavailable".into())),
+            }
+        });
+
+        // 1. Plugin track with webpage track.url: must resolve via stream_resolver first.
+        let yt_ok = Track {
+            id: "yt-ok".to_owned(),
+            source: "youtube-music".to_owned(),
+            name: "YouTube Track".to_owned(),
+            url: "https://music.youtube.com/watch?v=test".to_owned(),
+            ..Track::default()
+        };
+        let (url, headers) = resolve_prefetch_target(Some(&resolver), &yt_ok, Quality::High)
+            .expect("should resolve stream URL through stream_resolver");
+        assert_eq!(url, "https://cdn.example.test/stream/yt-ok.m4a");
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| k == "User-Agent" && v == "nsh-audio-test")
+        );
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| k == "Referer" && v == "https://music.youtube.com/")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // 2. Resolver failure, empty URL, or non-HTTP URL must NOT fall back to next_track.url.
+        for bad_id in ["yt-fail", "yt-empty", "yt-file"] {
+            let track = Track {
+                id: bad_id.to_owned(),
+                source: "youtube-music".to_owned(),
+                url: "https://music.youtube.com/watch?v=test".to_owned(),
+                ..Track::default()
+            };
+            assert!(
+                resolve_prefetch_target(Some(&resolver), &track, Quality::High).is_none(),
+                "must not fall back to webpage track.url for {bad_id}"
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+
+        // 3. Empty track.id with stream_resolver set must return None without calling resolver.
+        let empty_id_track = Track {
+            id: String::new(),
+            source: "youtube-music".to_owned(),
+            url: "https://music.youtube.com/watch?v=test".to_owned(),
+            ..Track::default()
+        };
+        assert!(resolve_prefetch_target(Some(&resolver), &empty_id_track, Quality::High).is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+
+        // 4. Local tracks are always skipped without invoking stream_resolver.
+        let local_cases = [
+            Track {
+                id: "loc-1".to_owned(),
+                source: "local".to_owned(),
+                url: "https://example.test/should-skip.mp3".to_owned(),
+                ..Track::default()
+            },
+            Track {
+                id: "loc-2".to_owned(),
+                source: "custom".to_owned(),
+                url: "file:///Users/music/song.flac".to_owned(),
+                ..Track::default()
+            },
+            Track {
+                id: "loc-3".to_owned(),
+                source: "custom".to_owned(),
+                url: "/Users/music/song.mp3".to_owned(),
+                ..Track::default()
+            },
+        ];
+        for track in &local_cases {
+            assert!(resolve_prefetch_target(Some(&resolver), track, Quality::High).is_none());
+            assert!(resolve_prefetch_target(None, track, Quality::High).is_none());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+
+        // 5. Only when stream_resolver is None should http(s):// track.url be used directly.
+        let direct_track = Track {
+            id: "direct-1".to_owned(),
+            source: "direct".to_owned(),
+            url: "https://cdn.example.test/direct.mp3".to_owned(),
+            ..Track::default()
+        };
+        let (direct_url, direct_headers) =
+            resolve_prefetch_target(None, &direct_track, Quality::High)
+                .expect("direct HTTP track should prefetch when stream_resolver is None");
+        assert_eq!(direct_url, "https://cdn.example.test/direct.mp3");
+        assert!(direct_headers.is_empty());
+
+        let demo_track = Track {
+            id: "demo-1".to_owned(),
+            source: "demo".to_owned(),
+            url: "demo://ambient".to_owned(),
+            ..Track::default()
+        };
+        assert!(resolve_prefetch_target(None, &demo_track, Quality::High).is_none());
+    }
+
+    #[test]
+    fn test_maybe_prefetch_next_resolves_through_stream_resolver_not_watch_url() {
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+        use nsh_music_core::model::StreamInfo;
+
+        use crate::cache::StreamCacheConfig;
+        use crate::output::NullOutput;
+
+        use super::{AudioEngine, AudioEngineConfig, PlaybackStatus};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "nsh-player-prefetch-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+
+        let engine = AudioEngine::with_output(
+            AudioEngineConfig {
+                cache: StreamCacheConfig {
+                    cache_dir: dir.clone(),
+                    max_bytes: 1024 * 1024,
+                    ..StreamCacheConfig::default()
+                },
+                prefetch_next: true,
+                ..AudioEngineConfig::default()
+            },
+            Box::new(NullOutput::with_tick_interval(Duration::from_millis(2))),
+        )
+        .expect("create engine");
+
+        let resolved_url = "https://cdn.example.test/resolved-audio-stream.m4a";
+        // Pre-seed cache so `cache.prefetch` hits disk cache immediately with zero network traffic.
+        engine
+            .cache()
+            .put_bytes(resolved_url, b"prefetched-audio-bytes")
+            .expect("seed cache entry");
+
+        let resolved_calls: Arc<Mutex<Vec<(String, Quality)>>> = Arc::new(Mutex::new(Vec::new()));
+        let resolved_calls_ref = Arc::clone(&resolved_calls);
+        engine.set_stream_resolver(Some(Arc::new(move |track, quality| {
+            resolved_calls_ref
+                .lock()
+                .unwrap()
+                .push((track.id.clone(), quality));
+            if track.url.starts_with("demo://") {
+                return Err(SourceError::Unsupported);
+            }
+            if track.id == "yt-next-ok" {
+                let mut headers = HashMap::new();
+                headers.insert("User-Agent".to_owned(), "nsh-prefetch-test".to_owned());
+                headers.insert(
+                    "Referer".to_owned(),
+                    "https://music.youtube.com/".to_owned(),
+                );
+                return Ok(StreamInfo {
+                    url: resolved_url.to_owned(),
+                    headers,
+                    ..StreamInfo::default()
+                });
+            }
+            Err(SourceError::Message("upstream 403".into()))
+        })));
+
+        let demo_track_1 = Track {
+            id: "demo-prefetch-1".to_owned(),
+            source: "demo".to_owned(),
+            name: "Demo 1".to_owned(),
+            duration: 15_000,
+            url: "demo://prefetch-1?duration=15000".to_owned(),
+            ..Track::default()
+        };
+        let yt_next_ok = Track {
+            id: "yt-next-ok".to_owned(),
+            source: "youtube-music".to_owned(),
+            name: "YouTube Next".to_owned(),
+            url: "https://music.youtube.com/watch?v=test".to_owned(),
+            ..Track::default()
+        };
+        engine.play_queue(vec![demo_track_1, yt_next_ok], 0);
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if !engine.prefetched_targets_for_test().is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let targets = engine.prefetched_targets_for_test();
+        assert_eq!(
+            targets.len(),
+            1,
+            "expected exactly one resolved prefetch target"
+        );
+        assert_eq!(
+            targets[0].0, resolved_url,
+            "must prefetch resolved stream URL instead of next_track.url"
+        );
+        assert!(
+            targets[0]
+                .1
+                .iter()
+                .any(|(k, v)| k == "User-Agent" && v == "nsh-prefetch-test")
+        );
+        assert!(
+            targets[0]
+                .1
+                .iter()
+                .any(|(k, v)| k == "Referer" && v == "https://music.youtube.com/")
+        );
+        assert!(
+            resolved_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(id, q)| id == "yt-next-ok" && *q == Quality::High)
+        );
+
+        // Next case: resolver fails for a YouTube watch-page track -> must NOT fall back to watch URL.
+        engine.clear_prefetched_targets_for_test();
+        let demo_track_2 = Track {
+            id: "demo-prefetch-2".to_owned(),
+            source: "demo".to_owned(),
+            name: "Demo 2".to_owned(),
+            duration: 15_000,
+            url: "demo://prefetch-2?duration=15000".to_owned(),
+            ..Track::default()
+        };
+        let yt_next_fail = Track {
+            id: "yt-next-fail".to_owned(),
+            source: "youtube-music".to_owned(),
+            name: "YouTube Failing".to_owned(),
+            url: "https://music.youtube.com/watch?v=test".to_owned(),
+            ..Track::default()
+        };
+        engine.play_queue(vec![demo_track_2, yt_next_fail], 0);
+
+        let fail_deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < fail_deadline {
+            if resolved_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(id, _)| id == "yt-next-fail")
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            resolved_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(id, _)| id == "yt-next-fail"),
+            "stream_resolver should have been called for yt-next-fail"
+        );
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(
+            engine.prefetched_targets_for_test().is_empty(),
+            "failing stream_resolver must NOT fall back to prefetching next_track.url"
+        );
+
+        // Next case: local next track is skipped without calling stream_resolver or prefetch.
+        let demo_track_3 = Track {
+            id: "demo-prefetch-3".to_owned(),
+            source: "demo".to_owned(),
+            name: "Demo 3".to_owned(),
+            duration: 15_000,
+            url: "demo://prefetch-3?duration=15000".to_owned(),
+            ..Track::default()
+        };
+        let local_next = Track {
+            id: "local-next-1".to_owned(),
+            source: "local".to_owned(),
+            name: "Local Next".to_owned(),
+            url: "/tmp/local-next.flac".to_owned(),
+            ..Track::default()
+        };
+        engine.play_queue(vec![demo_track_3, local_next], 0);
+        engine.set_volume(0.73);
+        let local_deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < local_deadline {
+            let snap = engine.snapshot();
+            if snap.status == PlaybackStatus::Playing && (snap.volume - 0.73).abs() < 0.001 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !resolved_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(id, _)| id == "local-next-1"),
+            "local next track must be skipped before invoking stream_resolver"
+        );
+        assert!(engine.prefetched_targets_for_test().is_empty());
+
+        engine.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

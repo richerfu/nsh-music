@@ -482,8 +482,19 @@ pub mod symphonia_impl {
         }
     }
 
+    type ProbedState = (
+        Box<dyn FormatReader>,
+        Box<dyn Decoder>,
+        u32,
+        Option<TimeBase>,
+        AudioSpec,
+    );
+
     /// Pure-Rust Symphonia audio decoder outputting interleaved `f32` PCM.
     pub struct SymphoniaDecoder {
+        shared: SharedMediaSource,
+        ext_hint: Option<String>,
+        mime_hint: Option<String>,
         format: Box<dyn FormatReader>,
         decoder: Box<dyn Decoder>,
         track_id: u32,
@@ -495,11 +506,11 @@ pub mod symphonia_impl {
     }
 
     impl SymphoniaDecoder {
-        pub fn open(
-            source: Box<dyn MediaSource>,
+        fn probe_and_init(
+            shared: &SharedMediaSource,
             extension_hint: Option<&str>,
             mime_hint: Option<&str>,
-        ) -> AudioResult<Self> {
+        ) -> AudioResult<ProbedState> {
             let mut hint = Hint::new();
             let mut has_hint = false;
             let cleaned_ext = extension_hint
@@ -523,7 +534,6 @@ pub mod symphonia_impl {
             };
             let meta_opts = MetadataOptions::default();
 
-            let shared = SharedMediaSource::new(source);
             let is_seekable = shared.is_seekable();
             let byte_len = shared.byte_len();
 
@@ -669,7 +679,22 @@ pub mod symphonia_impl {
                 codec_name: canonical_symphonia_codec_name(active_codec, used_ext_hint),
             };
 
+            Ok((format, decoder, track_id, time_base, spec))
+        }
+
+        pub fn open(
+            source: Box<dyn MediaSource>,
+            extension_hint: Option<&str>,
+            mime_hint: Option<&str>,
+        ) -> AudioResult<Self> {
+            let shared = SharedMediaSource::new(source);
+            let (format, decoder, track_id, time_base, spec) =
+                Self::probe_and_init(&shared, extension_hint, mime_hint)?;
+
             Ok(Self {
+                shared,
+                ext_hint: extension_hint.map(str::to_owned),
+                mime_hint: mime_hint.map(str::to_owned),
                 format,
                 decoder,
                 track_id,
@@ -679,6 +704,100 @@ pub mod symphonia_impl {
                 decoded_frames: 0,
                 sample_buf: None,
             })
+        }
+
+        /// Rewinds the underlying buffered stream to byte 0, re-probes a fresh demuxer &
+        /// decoder, and advances forward to `position_ms` (without re-downloading bytes
+        /// already buffered on disk).
+        fn rewind_reopen_and_seek(&mut self, position_ms: u64) -> AudioResult<u64> {
+            self.shared
+                .rewind_to_start()
+                .map_err(|e| AudioError::Seek(format!("rewind to start failed: {e}")))?;
+
+            let (format, decoder, track_id, time_base, _spec) = Self::probe_and_init(
+                &self.shared,
+                self.ext_hint.as_deref(),
+                self.mime_hint.as_deref(),
+            )
+            .map_err(|e| AudioError::Seek(format!("reopen after rewind failed: {e}")))?;
+
+            self.format = format;
+            self.decoder = decoder;
+            self.track_id = track_id;
+            self.time_base = time_base;
+            self.sample_buf = None;
+            self.position_ms = 0;
+            self.decoded_frames = 0;
+
+            if position_ms == 0 {
+                return Ok(0);
+            }
+
+            let secs = position_ms / 1000;
+            let frac = (position_ms % 1000) as f64 / 1000.0;
+            if let Ok(seeked) = self.format.seek(
+                SeekMode::Accurate,
+                SeekTo::Time {
+                    time: Time::new(secs, frac),
+                    track_id: Some(self.track_id),
+                },
+            ) {
+                self.decoder.reset();
+                let landed_ms = if let Some(tb) = self.time_base {
+                    let t = tb.calc_time(seeked.actual_ts);
+                    t.seconds.saturating_mul(1000) + (t.frac * 1000.0).round() as u64
+                } else {
+                    position_ms
+                };
+                self.position_ms = landed_ms;
+                self.decoded_frames =
+                    (landed_ms.saturating_mul(self.spec.sample_rate as u64)) / 1000;
+                return Ok(landed_ms);
+            }
+
+            // Fallback: scan packets linearly from byte 0 without decoding until we reach
+            // `position_ms` (or EOF).
+            let mut last_ms = 0u64;
+            loop {
+                match self.format.next_packet() {
+                    Ok(packet) => {
+                        if packet.track_id() != self.track_id {
+                            continue;
+                        }
+                        let pkt_ms = if let Some(tb) = self.time_base {
+                            let t = tb.calc_time(packet.ts());
+                            t.seconds.saturating_mul(1000) + (t.frac * 1000.0).round() as u64
+                        } else if self.spec.sample_rate > 0 {
+                            packet.ts().saturating_mul(1000) / self.spec.sample_rate as u64
+                        } else {
+                            last_ms
+                        };
+                        last_ms = pkt_ms;
+                        if pkt_ms >= position_ms {
+                            break;
+                        }
+                    }
+                    Err(SymphoniaError::IoError(err))
+                        if err.kind() == io::ErrorKind::UnexpectedEof =>
+                    {
+                        break;
+                    }
+                    Err(SymphoniaError::ResetRequired) => {
+                        self.decoder.reset();
+                        continue;
+                    }
+                    Err(err) => {
+                        return Err(AudioError::Seek(format!(
+                            "symphonia linear seek scan failed: {err}"
+                        )));
+                    }
+                }
+            }
+
+            self.decoder.reset();
+            self.position_ms = last_ms;
+            self.decoded_frames = (last_ms.saturating_mul(self.spec.sample_rate as u64)) / 1000;
+            Ok(last_ms)
         }
     }
 
@@ -765,29 +884,61 @@ pub mod symphonia_impl {
         }
 
         fn seek(&mut self, position_ms: u64) -> AudioResult<u64> {
+            let prev_pos = self.position_ms;
+            let is_backward = position_ms < prev_pos;
+
+            if !self.shared.is_seekable() && is_backward {
+                log::debug!(
+                    "unseekable stream backward seek ({prev_pos}ms -> {position_ms}ms); rewinding & reopening"
+                );
+                return self.rewind_reopen_and_seek(position_ms);
+            }
+
             let secs = position_ms / 1000;
             let frac = (position_ms % 1000) as f64 / 1000.0;
-            let seeked = self
-                .format
-                .seek(
-                    SeekMode::Accurate,
-                    SeekTo::Time {
-                        time: Time::new(secs, frac),
-                        track_id: Some(self.track_id),
-                    },
-                )
-                .map_err(|e| AudioError::Seek(format!("symphonia seek failed: {e}")))?;
-
-            self.decoder.reset();
-            let landed_ms = if let Some(tb) = self.time_base {
-                let t = tb.calc_time(seeked.actual_ts);
-                t.seconds.saturating_mul(1000) + (t.frac * 1000.0).round() as u64
-            } else {
-                position_ms
-            };
-            self.position_ms = landed_ms;
-            self.decoded_frames = (landed_ms.saturating_mul(self.spec.sample_rate as u64)) / 1000;
-            Ok(landed_ms)
+            match self.format.seek(
+                SeekMode::Accurate,
+                SeekTo::Time {
+                    time: Time::new(secs, frac),
+                    track_id: Some(self.track_id),
+                },
+            ) {
+                Ok(seeked) => {
+                    let landed_ms = if let Some(tb) = self.time_base {
+                        let t = tb.calc_time(seeked.actual_ts);
+                        t.seconds.saturating_mul(1000) + (t.frac * 1000.0).round() as u64
+                    } else {
+                        position_ms
+                    };
+                    let backward_ignored = is_backward
+                        && ((prev_pos.saturating_sub(position_ms) >= 1_000
+                            && landed_ms.saturating_add(750) >= prev_pos)
+                            || (prev_pos.saturating_sub(position_ms) >= 100
+                                && landed_ms >= prev_pos));
+                    if backward_ignored {
+                        log::debug!(
+                            "demuxer ignored backward seek ({prev_pos}ms -> {position_ms}ms, landed {landed_ms}ms); rewinding & reopening"
+                        );
+                        return self.rewind_reopen_and_seek(position_ms);
+                    }
+                    self.decoder.reset();
+                    self.position_ms = landed_ms;
+                    self.decoded_frames =
+                        (landed_ms.saturating_mul(self.spec.sample_rate as u64)) / 1000;
+                    Ok(landed_ms)
+                }
+                Err(err) => {
+                    log::debug!(
+                        "symphonia seek failed ({prev_pos}ms -> {position_ms}ms: {err}); attempting rewind & reopen fallback"
+                    );
+                    self.rewind_reopen_and_seek(position_ms)
+                        .map_err(|reopen_err| {
+                            AudioError::Seek(format!(
+                                "symphonia seek failed: {err} (rewind fallback: {reopen_err})"
+                            ))
+                        })
+                }
+            }
         }
 
         fn position_ms(&self) -> u64 {
@@ -1372,5 +1523,298 @@ mod tests {
             bin_err.contains("[mime=unknown, len=Some(9), head=de ad be ef 01 02 03 04]"),
             "expected diagnostic suffix with 8-byte hex head, got: {bin_err}"
         );
+    }
+
+    /// Wraps an in-memory buffer while advertising `is_seekable() == false` and
+    /// `byte_len() == None` (mirroring unknown-length `ProgressiveStream` / HLS relays),
+    /// while still supporting `SeekFrom::Start(0)` rewind on buffered bytes.
+    struct UnseekableRewindSource {
+        inner: Cursor<Vec<u8>>,
+    }
+
+    impl std::io::Read for UnseekableRewindSource {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(buf)
+        }
+    }
+
+    impl std::io::Seek for UnseekableRewindSource {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            match pos {
+                std::io::SeekFrom::Start(0) => self.inner.seek(pos),
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "unseekable stream only supports SeekFrom::Start(0) rewind",
+                )),
+            }
+        }
+    }
+
+    impl symphonia::core::io::MediaSource for UnseekableRewindSource {
+        fn is_seekable(&self) -> bool {
+            false
+        }
+
+        fn byte_len(&self) -> Option<u64> {
+            None
+        }
+    }
+
+    /// Synthesizes a multi-cluster (no `Cues`) WebM/Opus stream encoding a real audible
+    /// 440 Hz stereo sine wave spanning `duration_secs` seconds via `opus_pure::OpusEncoder`.
+    fn make_audible_webm_opus_no_cues(duration_secs: usize) -> Vec<u8> {
+        let sample_rate = 48_000usize;
+        let channels = 2usize;
+        let frame_samples = 960usize; // 20 ms at 48 kHz
+        let total_frames = duration_secs * 50; // 50 packets/sec
+
+        let mut encoder = opus_pure::OpusEncoder::new(
+            sample_rate as i32,
+            channels,
+            opus_pure::Application::Audio,
+        )
+        .expect("create OpusEncoder");
+        let mut encoded_packets: Vec<Vec<u8>> = Vec::with_capacity(total_frames);
+        let mut pcm = vec![0.0f32; frame_samples * channels];
+        let mut pkt_buf = vec![0u8; 4000];
+        let mut sample_idx = 0usize;
+
+        for _ in 0..total_frames {
+            for f in 0..frame_samples {
+                let t = sample_idx as f32 / sample_rate as f32;
+                let s = (TAU * 440.0 * t).sin() * 0.5;
+                pcm[f * channels] = s;
+                pcm[f * channels + 1] = s;
+                sample_idx += 1;
+            }
+            let n = encoder
+                .encode(&pcm, frame_samples, &mut pkt_buf)
+                .expect("encode opus frame");
+            encoded_packets.push(pkt_buf[..n].to_vec());
+        }
+
+        let opus_head = crate::opus_codec::tests::make_opus_head(2, 0, 0);
+
+        // EBML Header
+        let mut ebml_body = Vec::new();
+        ebml_body.extend_from_slice(&ebml_element(&[0x42, 0x86], &[1]));
+        ebml_body.extend_from_slice(&ebml_element(&[0x42, 0xF7], &[1]));
+        ebml_body.extend_from_slice(&ebml_element(&[0x42, 0xF2], &[4]));
+        ebml_body.extend_from_slice(&ebml_element(&[0x42, 0xF3], &[8]));
+        ebml_body.extend_from_slice(&ebml_element(&[0x42, 0x82], b"webm"));
+        ebml_body.extend_from_slice(&ebml_element(&[0x42, 0x87], &[4]));
+        ebml_body.extend_from_slice(&ebml_element(&[0x42, 0x85], &[2]));
+        let ebml_hdr = ebml_element(&[0x1A, 0x45, 0xDF, 0xA3], &ebml_body);
+
+        // Segment -> Info (TimestampScale = 1_000_000 ns = 1 ms)
+        let mut info_body = Vec::new();
+        info_body.extend_from_slice(&ebml_element(
+            &[0x2A, 0xD7, 0xB1],
+            &1_000_000u32.to_be_bytes(),
+        ));
+        let info = ebml_element(&[0x15, 0x49, 0xA9, 0x66], &info_body);
+
+        // Segment -> Tracks -> TrackEntry (A_OPUS, 48kHz, 2ch)
+        let mut audio_body = Vec::new();
+        audio_body.extend_from_slice(&ebml_element(&[0xB5], &48_000.0f32.to_be_bytes()));
+        audio_body.extend_from_slice(&ebml_element(&[0x9F], &[2]));
+        let audio = ebml_element(&[0xE1], &audio_body);
+
+        let mut track_entry_body = Vec::new();
+        track_entry_body.extend_from_slice(&ebml_element(&[0xD7], &[1]));
+        track_entry_body.extend_from_slice(&ebml_element(&[0x73, 0xC5], &[1]));
+        track_entry_body.extend_from_slice(&ebml_element(&[0x83], &[2]));
+        track_entry_body.extend_from_slice(&ebml_element(&[0x86], b"A_OPUS"));
+        track_entry_body.extend_from_slice(&ebml_element(&[0x63, 0xA2], &opus_head));
+        track_entry_body.extend_from_slice(&audio);
+        let track_entry = ebml_element(&[0xAE], &track_entry_body);
+        let tracks = ebml_element(&[0x16, 0x54, 0xAE, 0x6B], &track_entry);
+
+        let mut seg_body = Vec::new();
+        seg_body.extend_from_slice(&info);
+        seg_body.extend_from_slice(&tracks);
+
+        // Emit 1-second Clusters (50 x 20ms packets each) with NO `Cues` element.
+        for (cluster_idx, chunk) in encoded_packets.chunks(50).enumerate() {
+            let cluster_ts_ms = (cluster_idx as u32) * 1_000;
+            let mut cluster_body = Vec::new();
+            let ts_bytes = if cluster_ts_ms == 0 {
+                vec![0u8]
+            } else {
+                (cluster_ts_ms as u16).to_be_bytes().to_vec()
+            };
+            cluster_body.extend_from_slice(&ebml_element(&[0xE7], &ts_bytes));
+            for (pkt_idx, pkt) in chunk.iter().enumerate() {
+                let rel_ts = (pkt_idx as i16) * 20;
+                let mut block = Vec::with_capacity(4 + pkt.len());
+                block.push(0x81); // Track 1 VINT
+                block.extend_from_slice(&rel_ts.to_be_bytes());
+                block.push(0x80); // Keyframe
+                block.extend_from_slice(pkt);
+                cluster_body.extend_from_slice(&ebml_element(&[0xA3], &block));
+            }
+            seg_body.extend_from_slice(&ebml_element(&[0x1F, 0x43, 0xB6, 0x75], &cluster_body));
+        }
+
+        let segment = ebml_element(&[0x18, 0x53, 0x80, 0x67], &seg_body);
+        let mut webm = Vec::with_capacity(ebml_hdr.len() + segment.len());
+        webm.extend_from_slice(&ebml_hdr);
+        webm.extend_from_slice(&segment);
+        webm
+    }
+
+    fn assert_audible_pcm(dec: &mut dyn AudioDecoder, label: &str) {
+        let mut pcm = Vec::new();
+        let mut peak = 0.0f32;
+        while pcm.len() < 4096 {
+            let start = pcm.len();
+            let n = dec
+                .read_pcm(&mut pcm)
+                .unwrap_or_else(|e| panic!("{label}: read_pcm failed: {e}"));
+            if n == 0 {
+                break;
+            }
+            for &s in &pcm[start..] {
+                peak = peak.max(s.abs());
+            }
+        }
+        assert!(
+            !pcm.is_empty(),
+            "{label}: expected decoded PCM samples after seek"
+        );
+        assert!(
+            peak > 0.05,
+            "{label}: expected audible non-zero PCM signal, peak={peak}"
+        );
+    }
+
+    fn exercise_forward_and_backward_seeks(dec: &mut dyn AudioDecoder, label: &str) {
+        // Start at 0ms -> verify initial audible playback.
+        assert_audible_pcm(dec, &format!("{label} initial"));
+
+        // Forward seek -> ~2500ms
+        let t1 = dec
+            .seek(2_500)
+            .unwrap_or_else(|e| panic!("{label}: seek(2500) failed: {e}"));
+        assert!(
+            (2_000..=3_000).contains(&t1),
+            "{label}: seek(2500) landed at unexpected {t1}ms"
+        );
+        assert_audible_pcm(dec, &format!("{label} after seek(2500)"));
+
+        // Backward seek -> ~500ms
+        let t2 = dec
+            .seek(500)
+            .unwrap_or_else(|e| panic!("{label}: backward seek(500) failed: {e}"));
+        assert!(
+            (200..=900).contains(&t2),
+            "{label}: backward seek(500) landed at unexpected {t2}ms"
+        );
+        assert_audible_pcm(dec, &format!("{label} after backward seek(500)"));
+
+        // Backward seek -> 0ms
+        let t3 = dec
+            .seek(0)
+            .unwrap_or_else(|e| panic!("{label}: backward seek(0) failed: {e}"));
+        assert!(
+            t3 <= 100,
+            "{label}: backward seek(0) landed at unexpected {t3}ms"
+        );
+        assert_audible_pcm(dec, &format!("{label} after backward seek(0)"));
+
+        // Forward seek again -> ~1500ms
+        let t4 = dec
+            .seek(1_500)
+            .unwrap_or_else(|e| panic!("{label}: seek(1500) failed: {e}"));
+        assert!(
+            (1_000..=2_000).contains(&t4),
+            "{label}: seek(1500) landed at unexpected {t4}ms"
+        );
+        assert_audible_pcm(dec, &format!("{label} after seek(1500)"));
+    }
+
+    #[test]
+    fn test_backward_seek_on_unseekable_rewindable_wav_and_webm() {
+        // (a1) Unseekable WAV stream (is_seekable() == false, byte_len() == None)
+        let wav = make_wav_bytes(44_100, 2, 44_100 * 4);
+        let mut wav_dec = SymphoniaDecoder::open(
+            Box::new(UnseekableRewindSource {
+                inner: Cursor::new(wav),
+            }),
+            Some("wav"),
+            Some("audio/wav"),
+        )
+        .expect("open unseekable WAV");
+        exercise_forward_and_backward_seeks(&mut wav_dec, "unseekable-wav");
+
+        // (a2) Unseekable WebM/Opus stream (is_seekable() == false, byte_len() == None)
+        let webm = make_audible_webm_opus_no_cues(4);
+        let mut webm_dec = SymphoniaDecoder::open(
+            Box::new(UnseekableRewindSource {
+                inner: Cursor::new(webm),
+            }),
+            Some("webm"),
+            Some("audio/webm"),
+        )
+        .expect("open unseekable WebM/Opus");
+        exercise_forward_and_backward_seeks(&mut webm_dec, "unseekable-webm-opus");
+    }
+
+    #[test]
+    fn test_backward_seek_on_seekable_mkv_webm_opus_without_cues() {
+        // (b) Seekable MkvReader WebM/Opus without `Cues` spanning 4 seconds.
+        let webm = make_audible_webm_opus_no_cues(4);
+        let mut dec = SymphoniaDecoder::open(
+            Box::new(Cursor::new(webm)),
+            Some("webm"),
+            Some("audio/webm"),
+        )
+        .expect("open WebM/Opus without Cues");
+        assert_eq!(dec.spec().codec_name, "opus");
+        exercise_forward_and_backward_seeks(&mut dec, "seekable-mkv-no-cues");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_backward_seek_on_progressive_stream_without_content_length() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // (c) ProgressiveStream served over loopback HTTP WITHOUT Content-Length.
+        let wav = make_wav_bytes(44_100, 2, 44_100 * 4);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let srv_wav = wav.clone();
+
+        let srv = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buf = [0u8; 2048];
+            let _ = socket.read(&mut buf).await;
+            let hdr = "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nConnection: close\r\n\r\n";
+            let _ = socket.write_all(hdr.as_bytes()).await;
+            let _ = socket.write_all(&srv_wav).await;
+            let _ = socket.shutdown().await;
+        });
+
+        let dir =
+            std::env::temp_dir().join(format!("nsh-decoder-backseek-no-cl-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let cache = crate::AudioCache::with_dir(dir.clone(), 4 * 1024 * 1024).expect("cache");
+        let url = format!("http://{addr}/stream.wav");
+
+        let stream = cache
+            .open_progressive(&url, Vec::new())
+            .expect("open progressive");
+        assert_eq!(stream.byte_len(), None);
+        assert!(
+            !stream.is_seekable(),
+            "loopback stream without Content-Length must report is_seekable() == false"
+        );
+        let mut dec = SymphoniaDecoder::open(Box::new(stream), Some("wav"), Some("audio/wav"))
+            .expect("open SymphoniaDecoder on unseekable ProgressiveStream");
+
+        exercise_forward_and_backward_seeks(&mut dec, "progressive-no-content-length");
+
+        srv.await.expect("srv");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

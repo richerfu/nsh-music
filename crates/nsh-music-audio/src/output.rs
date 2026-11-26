@@ -21,6 +21,40 @@ impl Default for OutputConfig {
     }
 }
 
+/// Hardware or OS-level audio focus / routing events raised by [`AudioOutput`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioOutputEvent {
+    /// System audio focus requested pause/stop/mute (phone call, another media app, etc.).
+    SystemPause,
+    /// System audio focus signaled that a transient interruption ended and playback may resume.
+    SystemResume,
+    /// Active audio output device disconnected (Bluetooth headphones, wired headset, USB DAC).
+    /// Playback must pause and NEVER auto-resume.
+    DeviceDisconnected,
+    /// System requested temporary volume attenuation (navigation/notification prompt).
+    Duck,
+    /// System ended volume attenuation.
+    Unduck,
+}
+
+/// Callback invoked by an [`AudioOutput`] backend when hardware or OS audio focus events occur.
+pub type OutputEventCallback = Arc<dyn Fn(AudioOutputEvent) + Send + Sync>;
+
+/// Clonable handle allowing headless tests to emit simulated [`AudioOutputEvent`]s into
+/// a [`NullOutput`] after it has been moved into [`AudioEngine`](crate::AudioEngine).
+#[derive(Clone, Default)]
+pub struct OutputEventEmitter {
+    cb: Arc<Mutex<Option<OutputEventCallback>>>,
+}
+
+impl OutputEventEmitter {
+    pub fn emit(&self, event: AudioOutputEvent) {
+        if let Some(cb) = self.cb.lock().ok().and_then(|g| g.clone()) {
+            cb(event);
+        }
+    }
+}
+
 /// Real-time PCM callback invoked by the audio output device to fill interleaved `f32` samples.
 pub type RenderCallback = Box<dyn FnMut(&mut [f32]) + Send + 'static>;
 
@@ -34,6 +68,7 @@ pub trait AudioOutput: Send {
     fn stop(&mut self) -> AudioResult<()>;
     fn is_running(&self) -> bool;
     fn backend_name(&self) -> &'static str;
+    fn set_event_callback(&mut self, _callback: Option<OutputEventCallback>) {}
 }
 
 /// Headless / software-paced audio output for tests, CI environments, and systems without
@@ -47,6 +82,7 @@ pub struct NullOutput {
     stop_flag: Arc<AtomicBool>,
     frames_rendered: Arc<AtomicU64>,
     last_rms_bits: Arc<AtomicU32>,
+    event_cb: Arc<Mutex<Option<OutputEventCallback>>>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -71,8 +107,21 @@ impl NullOutput {
             stop_flag: Arc::new(AtomicBool::new(false)),
             frames_rendered: Arc::new(AtomicU64::new(0)),
             last_rms_bits: Arc::new(AtomicU32::new(0)),
+            event_cb: Arc::new(Mutex::new(None)),
             worker: None,
         }
+    }
+
+    /// Returns a clonable emitter handle for injecting simulated OS audio events in tests.
+    pub fn event_emitter(&self) -> OutputEventEmitter {
+        OutputEventEmitter {
+            cb: Arc::clone(&self.event_cb),
+        }
+    }
+
+    /// Emits a simulated [`AudioOutputEvent`] directly through the registered callback.
+    pub fn emit_event(&self, event: AudioOutputEvent) {
+        self.event_emitter().emit(event);
     }
 
     /// Returns an inspectable counter of total PCM frames rendered by this output.
@@ -179,6 +228,12 @@ impl AudioOutput for NullOutput {
     fn backend_name(&self) -> &'static str {
         "null"
     }
+
+    fn set_event_callback(&mut self, callback: Option<OutputEventCallback>) {
+        if let Ok(mut guard) = self.event_cb.lock() {
+            *guard = callback;
+        }
+    }
 }
 
 impl Drop for NullOutput {
@@ -189,15 +244,15 @@ impl Drop for NullOutput {
 
 #[cfg(not(any(target_arch = "wasm32", target_env = "ohos")))]
 mod cpal_impl {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{self, Sender};
+    use std::sync::{Arc, Mutex};
     use std::thread::{self, JoinHandle};
 
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use cpal::{SampleFormat, Stream, StreamConfig, SupportedStreamConfig};
 
-    use super::{AudioOutput, OutputConfig, RenderCallback};
+    use super::{AudioOutput, AudioOutputEvent, OutputConfig, OutputEventCallback, RenderCallback};
     use crate::{AudioError, AudioResult};
 
     enum CpalCmd {
@@ -220,6 +275,7 @@ mod cpal_impl {
     pub struct CpalOutput {
         tx: Sender<CpalCmd>,
         running: Arc<AtomicBool>,
+        event_cb: Arc<Mutex<Option<OutputEventCallback>>>,
         worker: Option<JoinHandle<()>>,
     }
 
@@ -234,6 +290,8 @@ mod cpal_impl {
             let (tx, rx) = mpsc::channel::<CpalCmd>();
             let running = Arc::new(AtomicBool::new(false));
             let thread_running = Arc::clone(&running);
+            let event_cb: Arc<Mutex<Option<OutputEventCallback>>> = Arc::new(Mutex::new(None));
+            let thread_event_cb = Arc::clone(&event_cb);
 
             let worker = thread::Builder::new()
                 .name("nsh-audio-cpal".into())
@@ -248,7 +306,8 @@ mod cpal_impl {
                             } => {
                                 active_stream = None;
                                 thread_running.store(false, Ordering::SeqCst);
-                                match build_cpal_stream(spec, render) {
+                                match build_cpal_stream(spec, render, Arc::clone(&thread_event_cb))
+                                {
                                     Ok((stream, negotiated)) => {
                                         if let Err(err) = stream.play() {
                                             let _ = reply.send(Err(AudioError::Output(format!(
@@ -311,6 +370,7 @@ mod cpal_impl {
             Ok(Self {
                 tx,
                 running,
+                event_cb,
                 worker: Some(worker),
             })
         }
@@ -360,6 +420,12 @@ mod cpal_impl {
         fn backend_name(&self) -> &'static str {
             "cpal"
         }
+
+        fn set_event_callback(&mut self, callback: Option<OutputEventCallback>) {
+            if let Ok(mut guard) = self.event_cb.lock() {
+                *guard = callback;
+            }
+        }
     }
 
     impl Drop for CpalOutput {
@@ -408,6 +474,7 @@ mod cpal_impl {
     fn build_cpal_stream(
         requested: OutputConfig,
         mut render: RenderCallback,
+        event_cb: Arc<Mutex<Option<OutputEventCallback>>>,
     ) -> AudioResult<(Stream, OutputConfig)> {
         let host = cpal::default_host();
         let device = host
@@ -421,8 +488,15 @@ mod cpal_impl {
             channels: stream_config.channels,
         };
 
-        let err_fn = |err| {
-            log::warn!("cpal audio output stream error: {err}");
+        let err_fn = move |err: cpal::StreamError| {
+            if matches!(err, cpal::StreamError::DeviceNotAvailable) {
+                log::info!("cpal audio output device unavailable -> DeviceDisconnected");
+                if let Some(cb) = event_cb.lock().ok().and_then(|g| g.clone()) {
+                    cb(AudioOutputEvent::DeviceDisconnected);
+                }
+            } else {
+                log::warn!("cpal audio output stream error: {err}");
+            }
         };
 
         let stream = match sample_format {
@@ -482,12 +556,15 @@ pub use cpal_impl::CpalOutput;
 
 #[cfg(target_env = "ohos")]
 mod ohos_impl {
+    use std::sync::{Arc, Mutex};
+
     use ohos_audio_binding::{
-        AudioDataCallbackResult, AudioRenderer, AudioStreamBuilder, EncodingType, LatencyMode,
-        SampleFormat, StreamUsage,
+        AudioDataCallbackResult, AudioRenderer, AudioStreamBuilder, DeviceChangeReason,
+        EncodingType, InterruptForceType, InterruptHint, InterruptMode, LatencyMode, SampleFormat,
+        StreamUsage,
     };
 
-    use super::{AudioOutput, OutputConfig, RenderCallback};
+    use super::{AudioOutput, AudioOutputEvent, OutputConfig, OutputEventCallback, RenderCallback};
     use crate::{AudioError, AudioResult};
 
     /// HarmonyOS / OpenHarmony Tier-1 audio output wrapping `ohos-audio-binding`
@@ -495,6 +572,7 @@ mod ohos_impl {
     pub struct OhosAudioOutput {
         renderer: Option<AudioRenderer>,
         running: bool,
+        event_cb: Arc<Mutex<Option<OutputEventCallback>>>,
     }
 
     impl Default for OhosAudioOutput {
@@ -508,6 +586,7 @@ mod ohos_impl {
             Self {
                 renderer: None,
                 running: false,
+                event_cb: Arc::new(Mutex::new(None)),
             }
         }
     }
@@ -540,6 +619,66 @@ mod ohos_impl {
             builder
                 .latency_mode(LatencyMode::Normal)
                 .map_err(|e| AudioError::Output(format!("OHAudio latency_mode failed: {e}")))?;
+
+            if let Err(err) = builder.interrupt_mode(InterruptMode::Share) {
+                log::warn!("OHAudio interrupt_mode(Share) failed: {err}");
+            }
+
+            let device_cb = Arc::clone(&self.event_cb);
+            if let Err(err) = builder.output_device_change_callback(move |reason| match reason {
+                DeviceChangeReason::OldDeviceUnavailable => {
+                    log::info!("OHAudio output device unavailable -> DeviceDisconnected");
+                    if let Some(cb) = device_cb.lock().ok().and_then(|g| g.clone()) {
+                        cb(AudioOutputEvent::DeviceDisconnected);
+                    }
+                }
+                other => {
+                    log::debug!("OHAudio output device changed: {other:?}");
+                }
+            }) {
+                log::warn!("OHAudio output_device_change_callback setup failed: {err}");
+            }
+
+            let interrupt_cb = Arc::clone(&self.event_cb);
+            if let Err(err) =
+                builder.interrupt_callback(move |force: InterruptForceType, hint: InterruptHint| {
+                    let event = match hint {
+                        InterruptHint::Pause | InterruptHint::Stop | InterruptHint::Mute => {
+                            log::info!("OHAudio interrupt ({force:?}, {hint:?}) -> SystemPause");
+                            Some(AudioOutputEvent::SystemPause)
+                        }
+                        InterruptHint::Resume | InterruptHint::Unmute => {
+                            log::info!("OHAudio interrupt ({force:?}, {hint:?}) -> SystemResume");
+                            Some(AudioOutputEvent::SystemResume)
+                        }
+                        InterruptHint::Duck => {
+                            log::info!("OHAudio interrupt ({force:?}) -> Duck");
+                            Some(AudioOutputEvent::Duck)
+                        }
+                        InterruptHint::Unduck => {
+                            log::info!("OHAudio interrupt ({force:?}, {hint:?}) -> Unduck");
+                            Some(AudioOutputEvent::Unduck)
+                        }
+                        InterruptHint::None => {
+                            log::debug!("OHAudio interrupt ({force:?}, None)");
+                            None
+                        }
+                    };
+                    if let Some(ev) = event
+                        && let Some(cb) = interrupt_cb.lock().ok().and_then(|g| g.clone())
+                    {
+                        cb(ev);
+                    }
+                })
+            {
+                log::warn!("OHAudio interrupt_callback setup failed: {err}");
+            }
+
+            if let Err(err) = builder.error_callback(|err| {
+                log::warn!("OHAudio renderer error: {err}");
+            }) {
+                log::warn!("OHAudio error_callback setup failed: {err}");
+            }
 
             let mut scratch = Vec::<f32>::with_capacity(4096);
             builder
@@ -620,6 +759,12 @@ mod ohos_impl {
         fn backend_name(&self) -> &'static str {
             "ohos-audio"
         }
+
+        fn set_event_callback(&mut self, callback: Option<OutputEventCallback>) {
+            if let Ok(mut guard) = self.event_cb.lock() {
+                *guard = callback;
+            }
+        }
     }
 
     impl Drop for OhosAudioOutput {
@@ -637,7 +782,7 @@ pub use ohos_impl::OhosAudioOutput;
 pub fn default_audio_output() -> Box<dyn AudioOutput> {
     #[cfg(target_env = "ohos")]
     {
-        return Box::new(OhosAudioOutput::new());
+        Box::new(OhosAudioOutput::new())
     }
 
     #[cfg(not(any(target_arch = "wasm32", target_env = "ohos")))]

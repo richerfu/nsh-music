@@ -2880,8 +2880,9 @@ mod tests {
 
     #[test]
     fn test_select_hls_master_variant_prefers_aac_lc_muxed_itag_93() {
-        let base = Url::parse("https://manifest.googlevideo.com/api/manifest/hls_variant/index.m3u8")
-            .expect("parse base url");
+        let base =
+            Url::parse("https://manifest.googlevideo.com/api/manifest/hls_variant/index.m3u8")
+                .expect("parse base url");
         let master = concat!(
             "#EXTM3U\n",
             "#EXT-X-VERSION:3\n",
