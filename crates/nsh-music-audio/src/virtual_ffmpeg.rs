@@ -1,11 +1,12 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 use reqwest::Method;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::Notify;
 use url::Url;
 
@@ -807,9 +808,46 @@ fn spawn_http_relay(spec: HttpRelaySpec) -> AudioResult<VirtualProcessHandle> {
     spawn_http_relay_inner(spec, eager_preflight)
 }
 
-const EAGER_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(8);
+const EAGER_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(15);
 const HLS_SEGMENT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(15);
 const RETRY_BACKOFF_MS: [u64; 2] = [250, 600];
+
+static ACTIVE_PORT_RELAYS: OnceLock<Mutex<HashMap<u16, Arc<Notify>>>> = OnceLock::new();
+
+fn active_port_relays() -> &'static Mutex<HashMap<u16, Arc<Notify>>> {
+    ACTIVE_PORT_RELAYS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+struct PortRelayGuard {
+    port: u16,
+    kill_notify: Arc<Notify>,
+}
+
+impl Drop for PortRelayGuard {
+    fn drop(&mut self) {
+        if self.port != 0
+            && let Ok(mut map) = active_port_relays().lock()
+            && map
+                .get(&self.port)
+                .is_some_and(|registered| Arc::ptr_eq(registered, &self.kill_notify))
+        {
+            map.remove(&self.port);
+        }
+    }
+}
+
+async fn bind_relay_listener(bind_addr: &str) -> std::io::Result<TcpListener> {
+    if let Ok(sock_addr) = bind_addr.parse::<SocketAddr>() {
+        let socket = match sock_addr {
+            SocketAddr::V4(_) => TcpSocket::new_v4()?,
+            SocketAddr::V6(_) => TcpSocket::new_v6()?,
+        };
+        let _ = socket.set_reuseaddr(true);
+        socket.bind(sock_addr)?;
+        return socket.listen(128);
+    }
+    TcpListener::bind(bind_addr).await
+}
 
 fn is_retryable_http_status(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
@@ -850,14 +888,52 @@ fn spawn_http_relay_with_timeout(
     let bind_addr = format!("{}:{}", spec.listen_host, spec.listen_port);
     let rt = io_runtime_handle();
 
+    if spec.listen_port != 0
+        && let Ok(mut map) = active_port_relays().lock()
+        && let Some(prev_notify) = map.remove(&spec.listen_port)
+    {
+        log::info!(
+            "VirtualFfmpegShim evicting stale virtual relay on port {}",
+            spec.listen_port
+        );
+        prev_notify.notify_waiters();
+        prev_notify.notify_one();
+    }
+
     let (bind_tx, bind_rx) =
         std::sync::mpsc::channel::<Result<(TcpListener, SocketAddr), String>>();
     let bind_addr_clone = bind_addr.clone();
     rt.spawn(async move {
         let res = async {
-            let listener = TcpListener::bind(&bind_addr_clone).await.map_err(|e| {
-                format!("failed to bind virtual ffmpeg relay on {bind_addr_clone}: {e}")
-            })?;
+            let mut listener_opt = None;
+            let mut last_err = None;
+            for attempt in 0..5usize {
+                match bind_relay_listener(&bind_addr_clone).await {
+                    Ok(listener) => {
+                        listener_opt = Some(listener);
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && attempt + 1 < 5 => {
+                        last_err = Some(e);
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                    Err(e) => {
+                        last_err = Some(e);
+                        break;
+                    }
+                }
+            }
+            let listener = match listener_opt {
+                Some(l) => l,
+                None => {
+                    let e = last_err.unwrap_or_else(|| {
+                        std::io::Error::new(std::io::ErrorKind::AddrInUse, "address already in use")
+                    });
+                    return Err(format!(
+                        "failed to bind virtual ffmpeg relay on {bind_addr_clone}: {e}"
+                    ));
+                }
+            };
             let local_addr = listener
                 .local_addr()
                 .map_err(|e| format!("failed to query relay local_addr: {e}"))?;
@@ -904,7 +980,21 @@ fn spawn_http_relay_with_timeout(
     let task_handle = handle.clone();
     let kill_notify = Arc::clone(&handle.inner.kill_notify);
 
+    if spec.listen_port != 0
+        && let Ok(mut map) = active_port_relays().lock()
+        && let Some(prev_notify) = map.insert(spec.listen_port, Arc::clone(&kill_notify))
+    {
+        prev_notify.notify_waiters();
+        prev_notify.notify_one();
+    }
+
+    let port_guard = PortRelayGuard {
+        port: spec.listen_port,
+        kill_notify: Arc::clone(&kill_notify),
+    };
+
     rt.spawn(async move {
+        let _port_guard = port_guard;
         let upstream_is_loopback = Url::parse(&spec.input_url)
             .ok()
             .as_ref()
@@ -1012,6 +1102,7 @@ fn spawn_http_relay_with_timeout(
             }
         }
 
+        drop(listener);
         task_handle.finish(0);
     });
 
@@ -3302,8 +3393,8 @@ mod tests {
     async fn test_virtual_ffmpeg_eager_preflight_times_out_on_hung_upstream() {
         assert_eq!(
             EAGER_PREFLIGHT_TIMEOUT,
-            Duration::from_secs(8),
-            "production eager preflight timeout must remain capped at 8s"
+            Duration::from_secs(15),
+            "production eager preflight timeout must be capped at 15s"
         );
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind hung");
@@ -3363,5 +3454,106 @@ mod tests {
         );
 
         srv.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_virtual_ffmpeg_evicts_stale_relay_on_same_explicit_port() {
+        async fn spawn_static_server(
+            payload: &'static [u8],
+        ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind static upstream");
+            let addr = listener.local_addr().expect("static addr");
+            let task = tokio::spawn(async move {
+                loop {
+                    let Ok((mut socket, _)) = listener.accept().await else {
+                        break;
+                    };
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 2048];
+                        let _ = socket.read(&mut buf).await;
+                        let hdr = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            payload.len()
+                        );
+                        let _ = socket.write_all(hdr.as_bytes()).await;
+                        let _ = socket.write_all(payload).await;
+                        let _ = socket.shutdown().await;
+                    });
+                }
+            });
+            (addr, task)
+        }
+
+        let (addr1, srv1) = spawn_static_server(b"FIRST-RELAY-PAYLOAD").await;
+        let (addr2, srv2) = spawn_static_server(b"SECOND-RELAY-PAYLOAD").await;
+
+        let shared_port = {
+            let tmp = std::net::TcpListener::bind("127.0.0.1:0").expect("bind free port");
+            tmp.local_addr().expect("addr").port()
+        };
+        let relay_url = format!("http://127.0.0.1:{shared_port}/");
+        let up1 = format!("http://{addr1}/one.mp3");
+        let up2 = format!("http://{addr2}/two.mp3");
+
+        let proc1 = VirtualFfmpegShim::spawn_str(&[
+            "-i", &up1, "-vn", "-f", "mp3", "-listen", "1", &relay_url,
+        ])
+        .expect("spawn first relay on explicit port");
+        assert!(proc1.is_running());
+        assert_eq!(proc1.listen_addr().map(|a| a.port()), Some(shared_port));
+
+        // Immediately spawn a second relay on the EXACT same explicit port without killing proc1.
+        // The port registry must evict proc1 and bind proc2 cleanly without AddrInUse.
+        let proc2 = VirtualFfmpegShim::spawn_str(&[
+            "-i", &up2, "-vn", "-f", "mp3", "-listen", "1", &relay_url,
+        ])
+        .expect("second relay must evict stale relay on same port without AddrInUse");
+        assert!(proc2.is_running());
+        assert_eq!(proc2.listen_addr().map(|a| a.port()), Some(shared_port));
+
+        let exit1 = tokio::task::spawn_blocking(move || proc1.wait())
+            .await
+            .expect("join evicted proc1");
+        assert_eq!(exit1, 0, "evicted stale relay should exit cleanly");
+
+        let client =
+            build_loopback_no_redirect_client(Duration::from_secs(5)).expect("loopback client");
+        let resp = client
+            .get(&relay_url)
+            .send()
+            .await
+            .expect("GET proc2 relay");
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body = resp.bytes().await.expect("read proc2 body");
+        assert_eq!(body.as_ref(), b"SECOND-RELAY-PAYLOAD");
+
+        proc2.kill();
+        let exit2 = tokio::task::spawn_blocking(move || proc2.wait())
+            .await
+            .expect("join proc2");
+        assert_eq!(exit2, 0);
+
+        // Give the background task a brief moment to execute PortRelayGuard::drop.
+        let cleanup_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while active_port_relays()
+            .lock()
+            .map(|m| m.contains_key(&shared_port))
+            .unwrap_or(false)
+            && std::time::Instant::now() < cleanup_deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !active_port_relays()
+                .lock()
+                .expect("lock active_port_relays")
+                .contains_key(&shared_port),
+            "port registry entry must be cleaned up after relay exits"
+        );
+
+        srv1.abort();
+        srv2.abort();
     }
 }

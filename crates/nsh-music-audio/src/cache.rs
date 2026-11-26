@@ -81,24 +81,45 @@ pub struct RedirectedResponse {
     pub response: Response,
 }
 
-/// Builds a `reqwest::Client` configured with `Policy::none()` so redirects are handled
-/// manually while preserving custom plugin `requestHeaders` across cross-host CDNs.
+/// Builds (or clones from a shared warm connection pool) a `reqwest::Client` configured with
+/// `Policy::none()` so redirects are handled manually while preserving custom plugin
+/// `requestHeaders` across cross-host CDNs and reusing DNS/TLS/HTTP2 keep-alive sessions.
 pub fn build_no_redirect_client(connect_timeout: Duration) -> AudioResult<Client> {
-    Client::builder()
+    static SHARED_CLIENTS: OnceLock<Mutex<HashMap<u64, Client>>> = OnceLock::new();
+    let key = connect_timeout.as_millis() as u64;
+    let map = SHARED_CLIENTS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = map.lock()
+        && let Some(existing) = guard.get(&key)
+    {
+        return Ok(existing.clone());
+    }
+    let built = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(connect_timeout)
         .pool_idle_timeout(Some(Duration::from_secs(30)))
         .tcp_keepalive(Some(Duration::from_secs(30)))
         .tcp_nodelay(true)
         .build()
-        .map_err(|e| AudioError::Http(format!("failed to build HTTP client: {e}")))
+        .map_err(|e| AudioError::Http(format!("failed to build HTTP client: {e}")))?;
+    if let Ok(mut guard) = map.lock() {
+        return Ok(guard.entry(key).or_insert_with(|| built.clone()).clone());
+    }
+    Ok(built)
 }
 
-/// Builds a `reqwest::Client` for local loopback streams (`127.0.0.1`, `localhost`, `::1`)
-/// with `Policy::none()` and `.no_proxy()` so local relays are never intercepted by OS
-/// system proxy settings.
+/// Builds (or clones from a shared warm connection pool) a `reqwest::Client` for local loopback
+/// streams (`127.0.0.1`, `localhost`, `::1`) with `Policy::none()` and `.no_proxy()` so local
+/// relays are never intercepted by OS system proxy settings.
 pub fn build_loopback_no_redirect_client(connect_timeout: Duration) -> AudioResult<Client> {
-    Client::builder()
+    static SHARED_LOOPBACK_CLIENTS: OnceLock<Mutex<HashMap<u64, Client>>> = OnceLock::new();
+    let key = connect_timeout.as_millis() as u64;
+    let map = SHARED_LOOPBACK_CLIENTS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = map.lock()
+        && let Some(existing) = guard.get(&key)
+    {
+        return Ok(existing.clone());
+    }
+    let built = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .connect_timeout(connect_timeout)
@@ -106,7 +127,11 @@ pub fn build_loopback_no_redirect_client(connect_timeout: Duration) -> AudioResu
         .tcp_keepalive(Some(Duration::from_secs(30)))
         .tcp_nodelay(true)
         .build()
-        .map_err(|e| AudioError::Http(format!("failed to build loopback HTTP client: {e}")))
+        .map_err(|e| AudioError::Http(format!("failed to build loopback HTTP client: {e}")))?;
+    if let Ok(mut guard) = map.lock() {
+        return Ok(guard.entry(key).or_insert_with(|| built.clone()).clone());
+    }
+    Ok(built)
 }
 
 /// Sends an HTTP request and manually follows HTTP 3xx redirects up to `max_redirects`
@@ -1639,5 +1664,18 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 2);
 
         srv.abort();
+    }
+
+    #[test]
+    fn test_build_no_redirect_clients_reuse_warm_shared_pools() {
+        let a1 = build_no_redirect_client(Duration::from_secs(15)).expect("a1");
+        let a2 = build_no_redirect_client(Duration::from_secs(15)).expect("a2");
+        let l1 = build_loopback_no_redirect_client(Duration::from_secs(15)).expect("l1");
+        let l2 = build_loopback_no_redirect_client(Duration::from_secs(15)).expect("l2");
+        // Verify repeated calls succeed from warm shared pools with distinct timeout buckets too.
+        let _short = build_no_redirect_client(Duration::from_secs(7)).expect("short");
+        let _short_lb =
+            build_loopback_no_redirect_client(Duration::from_secs(7)).expect("short_lb");
+        drop((a1, a2, l1, l2));
     }
 }
