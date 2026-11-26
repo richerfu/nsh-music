@@ -64,10 +64,51 @@ fn sidebar_top_clearance() -> f32 {
     }
 }
 
+/// Builds hidden-titlebar attributes matching `main`'s 44pt integrated header band.
+pub fn main_window_attributes() -> WindowAttributes {
+    let mut bar = TitleBarOptions::default();
+    bar.style = TitleBarStyle::Hidden;
+    bar.height = Some(px(TITLE_BAR_HEIGHT));
+    let mut attrs = WindowAttributes::default();
+    attrs.title_bar = Some(bar);
+    attrs
+}
+
+/// Renders the Settings child window (`id = "settings"`, `parent = "main"`).
+pub fn settings_window(store: AppStore) -> AnyElement {
+    let settings_attrs = main_window_attributes();
+
+    desktop_window()
+        .id("settings")
+        .parent("main")
+        .kind(WindowKind::Normal)
+        .default_size(size(px(780.0), px(640.0)))
+        .restore_bounds(true)
+        .title(move || store.t("settings.title").to_string())
+        .attributes(settings_attrs)
+        .open(store.settings_window_open)
+        .on_open_change(move |e| {
+            if !e.open {
+                store.close_settings_window();
+            }
+        })
+        .content(move || {
+            view()
+                .flex_1()
+                .w_full()
+                .h_full()
+                .bg(theme::bg)
+                .text_color(theme::fg)
+                .child(pages::settings::settings_window_content(store))
+                .child(pages::render_settings_modal(store))
+                .child(toast_overlay(store.toasts))
+        })
+        .into_element()
+}
+
 /// Renders the full Desktop workspace shell.
 pub fn desktop_shell(store: AppStore) -> View {
     configure_hidden_title_bar();
-    install_desktop_menu_and_tray(store);
     let search_ref = element_ref();
     let sidebar_header_h = signal(84.0_f32);
     register_desktop_shortcuts(store, search_ref);
@@ -79,12 +120,6 @@ pub fn desktop_shell(store: AppStore) -> View {
             untracked(|| store.refresh_remote_devices());
         }
     });
-
-    let mut settings_bar = TitleBarOptions::default();
-    settings_bar.style = TitleBarStyle::Hidden;
-    settings_bar.height = Some(px(TITLE_BAR_HEIGHT));
-    let mut settings_attrs = WindowAttributes::default();
-    settings_attrs.title_bar = Some(settings_bar);
 
     let show_suggestions = computed(move || {
         !store.sidebar_collapsed.get()
@@ -155,33 +190,6 @@ pub fn desktop_shell(store: AppStore) -> View {
                         .child(sidebar_suggestions_popover(store)),
                 )
         }))
-        // Native Desktop Settings child window (unified with Plugins).
-        .child(
-            desktop_window()
-                .id("settings")
-                .kind(WindowKind::Normal)
-                .default_size(size(px(780.0), px(640.0)))
-                .restore_bounds(true)
-                .title(move || store.t("settings.title").to_string())
-                .attributes(settings_attrs)
-                .open(store.settings_window_open)
-                .on_open_change(move |e| {
-                    if !e.open {
-                        store.close_settings_window();
-                    }
-                })
-                .content(move || {
-                    view()
-                        .flex_1()
-                        .w_full()
-                        .h_full()
-                        .bg(theme::bg)
-                        .text_color(theme::fg)
-                        .child(pages::settings::settings_window_content(store))
-                        .child(pages::render_settings_modal(store))
-                        .child(toast_overlay(store.toasts))
-                }),
-        )
 }
 
 #[cfg(any(
@@ -240,10 +248,10 @@ fn resolve_tray_icon_src() -> nsh_core::element::ImageSrc {
     target_os = "windows",
     all(target_os = "linux", not(target_env = "ohos"))
 ))]
-fn install_desktop_menu_and_tray(store: AppStore) {
+pub fn install_desktop_menu_and_tray(store: AppStore, show_main: std::rc::Rc<dyn Fn()>) {
     use nsh_core::{
         desktop::MenuRole,
-        element::desktop::{MenuItem, main_window, quit, set_application_menu, set_tray, tray},
+        element::desktop::{MenuItem, quit, set_application_menu, set_tray, tray},
     };
     use nsh_music_core::i18n::Locale;
 
@@ -373,13 +381,15 @@ fn install_desktop_menu_and_tray(store: AppStore) {
         } else {
             store.t("player.play").to_string()
         };
+        let show_main_click = show_main.clone();
+        let show_main_menu = show_main.clone();
 
         set_tray(
             tray()
                 .icon(tray_icon_src.clone())
                 .tooltip(tooltip)
-                .on_click(|_| {
-                    main_window().focus();
+                .on_click(move |_| {
+                    show_main_click();
                 })
                 .menu([
                     MenuItem::new(play_label).on_select(move || store.toggle_play()),
@@ -388,8 +398,8 @@ fn install_desktop_menu_and_tray(store: AppStore) {
                     MenuItem::new(store.t("player.next").to_string())
                         .on_select(move || store.next_track()),
                     MenuItem::separator(),
-                    MenuItem::new(store.t("tray.show_window").to_string()).on_select(|| {
-                        main_window().focus();
+                    MenuItem::new(store.t("tray.show_window").to_string()).on_select(move || {
+                        show_main_menu();
                     }),
                     MenuItem::new(store.t("menu.settings").to_string()).on_select(move || {
                         store.open_settings_window(SettingsSection::General);
@@ -406,7 +416,7 @@ fn install_desktop_menu_and_tray(store: AppStore) {
     target_os = "windows",
     all(target_os = "linux", not(target_env = "ohos"))
 )))]
-fn install_desktop_menu_and_tray(_store: AppStore) {}
+pub fn install_desktop_menu_and_tray(_store: AppStore, _show_main: std::rc::Rc<dyn Fn()>) {}
 
 fn configure_hidden_title_bar() {
     let mut bar = TitleBarOptions::default();

@@ -29,8 +29,59 @@ pub fn root_app() -> View {
 
 /// Mounts the full adaptive `nsh-music` application root bound to a caller-provided [`AppStore`].
 pub fn root_app_with_store(store: AppStore) -> View {
+    use std::rc::Rc;
+
+    use nsh_core::{
+        desktop::WindowKind,
+        element::desktop::{WindowRef, current_window, on_reopen, window as desktop_window},
+    };
+
     provide_store(store);
-    shell::device_shell(store)
+
+    let main_window_ref: Stored<Option<WindowRef>> = stored(None);
+    let show_main: Rc<dyn Fn()> = Rc::new(move || {
+        if !store.main_window_open.get_untracked() {
+            store.open_main_window();
+        } else if let Some(win) = main_window_ref.with(|w| w.clone()) {
+            win.focus();
+        }
+    });
+
+    if os().is_desktop() {
+        let reopen = show_main.clone();
+        on_reopen(move || reopen());
+        shell::desktop::install_desktop_menu_and_tray(store, show_main);
+    }
+
+    let main_win = desktop_window()
+        .id("main")
+        .kind(WindowKind::Normal)
+        .restore_bounds(true)
+        .title(move || store.t("app.name").to_string())
+        .attributes(shell::desktop::main_window_attributes())
+        .open(store.main_window_open)
+        .on_open_change(move |e| {
+            if !e.open {
+                main_window_ref.with(|w| *w = None);
+                store.close_main_window();
+            }
+        })
+        .content(move || {
+            main_window_ref.with(|w| *w = Some(current_window()));
+            shell::device_shell(store)
+        });
+
+    // Outer wrapper has no visual paint so HarmonyOS hosts `"main"` directly
+    // inside the EntryAbility main window, while still filling viewport on mobile.
+    view()
+        .flex_1()
+        .w_full()
+        .h_full()
+        .child(main_win)
+        .child(when(
+            move || os().is_desktop(),
+            move || shell::desktop::settings_window(store),
+        ))
 }
 
 /// NSH root component named by `nsh.json` (`"root": "App"`).

@@ -14,18 +14,18 @@ edition = "2024"
 license = "AGPL-3.0"
 
 [workspace.dependencies]
-nsh-core = { version = "0.6" }
-nsh-base = { version = "0.6", default-features = false }
-nsh-engine = { version = "0.6", default-features = false }
-nsh-testing = { version = "0.6", default-features = false }
-nsh-platform-macos = { version = "0.6", default-features = false, features = ["shader", "svg"] }
-nsh-platform-linux = { version = "0.6", default-features = false, features = [
+nsh-core = { version = "0.7" }
+nsh-base = { version = "0.7", default-features = false }
+nsh-engine = { version = "0.7", default-features = false }
+nsh-testing = { version = "0.7", default-features = false }
+nsh-platform-macos = { version = "0.7", default-features = false, features = ["shader", "svg"] }
+nsh-platform-linux = { version = "0.7", default-features = false, features = [
   "shader",
   "svg",
   "net",
   "sound",
 ] }
-nsh-platform-windows = { version = "0.6", default-features = false, features = [
+nsh-platform-windows = { version = "0.7", default-features = false, features = [
   "shader",
   "svg",
   "net",
@@ -36,7 +36,7 @@ nsh-music-audio = { path = "crates/nsh-music-audio" }
 nsh-music-plugin = { path = "crates/nsh-music-plugin" }
 nsh-web-signin = { path = "crates/nsh-web-signin" }
 
-ffmpeg-sys-next = { path = "../rust-ffmpeg-sys", default-features = false, features = [
+ffmpeg-sys-next = { git = "https://github.com/richerfu/rust-ffmpeg-sys", default-features = false, features = [
   "avcodec",
   "avformat",
   "swresample",
@@ -159,17 +159,3 @@ when = "always"
 [profile.dev.package."*"]
 debug = 0
 opt-level = 2
-
-[patch.crates-io]
-nsh-macros = { path = "../nsh/crates/nsh-macros" }
-nsh-core = { path = "../nsh/crates/nsh-core" }
-nsh-base = { path = "../nsh/crates/nsh-base" }
-nsh-engine = { path = "../nsh/crates/nsh-engine" }
-nsh-package = { path = "../nsh/crates/nsh-package" }
-nsh-js = { path = "../nsh/crates/nsh-js" }
-nsh-dev = { path = "../nsh/crates/nsh-dev" }
-nsh-bundler = { path = "../nsh/crates/nsh-bundler" }
-nsh-testing = { path = "../nsh/crates/nsh-testing" }
-nsh-platform-macos = { path = "../nsh/crates/nsh-platform-macos" }
-nsh-platform-linux = { path = "../nsh/crates/nsh-platform-linux" }
-nsh-platform-windows = { path = "../nsh/crates/nsh-platform-windows" }

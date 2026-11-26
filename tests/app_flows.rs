@@ -1474,3 +1474,55 @@ fn phone_browse_tab_cache_and_idempotent_switch() {
         "plugin Browse -> Library -> Browse must hit browse_cache with browse_loading == false"
     );
 }
+
+#[test]
+fn desktop_linux_closing_settings_keeps_main_alive_and_closing_main_quits() {
+    let _guard = IsolatedStateGuard::acquire();
+    let mut app = start_viewport(1280.0, 800.0, Os::Linux, Idiom::Desktop);
+
+    app.wait_for("id:desktop-shell").unwrap();
+    assert!(
+        app.window_state("main").unwrap().is_some(),
+        "primary desktop window `main` must open on launch"
+    );
+    assert!(!app.quit(), "app must not quit on launch");
+
+    // Opening and closing the Settings child window must leave `main` open and running.
+    app.press("id:nav-settings").unwrap();
+    app.wait_for("id:settings-sidebar").unwrap();
+    assert!(
+        app.window_state("settings").unwrap().is_some(),
+        "settings window should open"
+    );
+
+    app.press_window_close("settings").unwrap();
+    app.wait_for_gone("id:settings-sidebar", GONE_TIMEOUT)
+        .unwrap();
+    assert!(
+        !app.quit(),
+        "closing settings child window must not quit the app"
+    );
+    assert!(
+        app.window_state("main").unwrap().is_some(),
+        "primary desktop window `main` must remain open after closing settings"
+    );
+    assert!(
+        app.window_state("settings").unwrap().is_none(),
+        "settings window state must be None after closing"
+    );
+    assert!(
+        app.screen().matches("id:desktop-shell").unwrap(),
+        "desktop shell must stay rendered after closing settings"
+    );
+
+    // Re-opening settings after close must continue working cleanly.
+    app.press("id:nav-settings").unwrap();
+    app.wait_for("id:settings-sidebar").unwrap();
+
+    // Closing `main` quits the app (including any open child window) under Linux/OHOS QuitMode::Platform.
+    app.press_window_close("main").unwrap();
+    assert!(
+        app.quit(),
+        "closing primary `main` window must quit under Linux QuitMode::Platform"
+    );
+}

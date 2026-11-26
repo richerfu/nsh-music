@@ -418,6 +418,7 @@ pub struct AppStore {
 
     // Settings, locale, theme, modals, toasts
     pub settings: Signal<AppSettings>,
+    pub main_window_open: Signal<bool>,
     pub settings_window_open: Signal<bool>,
     pub settings_section: Signal<SettingsSection>,
     pub locale: Signal<Locale>,
@@ -773,6 +774,7 @@ impl AppStore {
             active_show: signal(None),
 
             settings: signal(settings),
+            main_window_open: signal(true),
             settings_window_open: signal(false),
             settings_section: signal(SettingsSection::General),
             locale: signal(initial_locale),
@@ -1070,6 +1072,19 @@ impl AppStore {
     /// Closes the desktop Settings window.
     pub fn close_settings_window(&self) {
         self.settings_window_open.set(false);
+    }
+
+    /// Opens (or re-opens) the primary desktop window.
+    pub fn open_main_window(&self) {
+        self.main_window_open.set(true);
+    }
+
+    /// Closes the primary desktop window along with the Settings child window.
+    pub fn close_main_window(&self) {
+        batch(|| {
+            self.main_window_open.set(false);
+            self.settings_window_open.set(false);
+        });
     }
 
     /// Pops one entry from navigation history into the forward stack.
@@ -4197,6 +4212,7 @@ impl AppStore {
             active_show: signal(None),
 
             settings: signal(settings),
+            main_window_open: signal(true),
             settings_window_open: signal(false),
             settings_section: signal(SettingsSection::General),
             locale: signal(Locale::En),
