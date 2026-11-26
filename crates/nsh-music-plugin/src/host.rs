@@ -99,14 +99,29 @@ pub type WebSignInHandler =
 pub type OpenUrlHandler = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 
 /// Runtime platform override options for `HostContext` (useful for testing mobile sandbox behavior on desktop).
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct HostRuntimeOptions {
     pub locale: Option<String>,
     pub is_mobile_override: Option<bool>,
     pub platform_override: Option<String>,
+    pub mobile_virtual_compat: bool,
     pub sign_in_prompt: Option<SignInPromptCallback>,
     pub web_sign_in_handler: Option<WebSignInHandler>,
     pub open_url_handler: Option<OpenUrlHandler>,
+}
+
+impl Default for HostRuntimeOptions {
+    fn default() -> Self {
+        Self {
+            locale: None,
+            is_mobile_override: None,
+            platform_override: None,
+            mobile_virtual_compat: true,
+            sign_in_prompt: None,
+            web_sign_in_handler: None,
+            open_url_handler: None,
+        }
+    }
 }
 
 impl std::fmt::Debug for HostRuntimeOptions {
@@ -115,6 +130,7 @@ impl std::fmt::Debug for HostRuntimeOptions {
             .field("locale", &self.locale)
             .field("is_mobile_override", &self.is_mobile_override)
             .field("platform_override", &self.platform_override)
+            .field("mobile_virtual_compat", &self.mobile_virtual_compat)
             .field("has_sign_in_prompt", &self.sign_in_prompt.is_some())
             .field(
                 "has_web_sign_in_handler",
@@ -144,17 +160,18 @@ pub(crate) struct ExternalProcessHandle {
 impl ExternalProcessHandle {
     pub(crate) fn spawn(cmd: &str, args: &[String], opts: &SpawnOptions) -> Result<Self, String> {
         #[cfg(unix)]
-        let (program, augmented_path) = {
-            let base_path = opts
-                .env
-                .get("PATH")
-                .cloned()
-                .or_else(|| std::env::var("PATH").ok())
-                .unwrap_or_default();
-            let augmented = augment_unix_path(&base_path);
-            let resolved =
-                resolve_unix_executable(cmd, &augmented).unwrap_or_else(|| PathBuf::from(cmd));
-            (resolved, augmented)
+        let (program, effective_path) = {
+            if let Some(explicit_path) = opts.env.get("PATH") {
+                let resolved = resolve_unix_executable(cmd, explicit_path)
+                    .unwrap_or_else(|| PathBuf::from(cmd));
+                (resolved, explicit_path.clone())
+            } else {
+                let base_path = std::env::var("PATH").unwrap_or_default();
+                let augmented = augment_unix_path(&base_path);
+                let resolved =
+                    resolve_unix_executable(cmd, &augmented).unwrap_or_else(|| PathBuf::from(cmd));
+                (resolved, augmented)
+            }
         };
         #[cfg(not(unix))]
         let program = PathBuf::from(cmd);
@@ -173,7 +190,7 @@ impl ExternalProcessHandle {
         }
         #[cfg(unix)]
         {
-            command.env("PATH", &augmented_path);
+            command.env("PATH", &effective_path);
         }
 
         let mut child = command
@@ -806,6 +823,8 @@ pub struct HostContext {
     virtualizer: MobileProcessVirtualizer,
     is_mobile: bool,
     platform: String,
+    mobile_virtual_compat: AtomicBool,
+    last_runtime_error: RwLock<Option<String>>,
     granted: AtomicBool,
     next_proc_id: AtomicU64,
     processes: Mutex<HashMap<u64, Arc<ManagedProcess>>>,
@@ -840,14 +859,14 @@ impl HostContext {
 
         let http_client = reqwest::Client::builder()
             .user_agent("nsh-music/0.1")
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(120))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
         let no_redirect_client = reqwest::Client::builder()
             .user_agent("nsh-music/0.1")
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(120))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
@@ -876,6 +895,8 @@ impl HostContext {
             virtualizer: MobileProcessVirtualizer::with_default_shims(),
             is_mobile,
             platform,
+            mobile_virtual_compat: AtomicBool::new(options.mobile_virtual_compat),
+            last_runtime_error: RwLock::new(None),
             granted: AtomicBool::new(persisted_granted),
             next_proc_id: AtomicU64::new(1),
             processes: Mutex::new(HashMap::new()),
@@ -914,6 +935,35 @@ impl HostContext {
 
     pub fn platform(&self) -> &str {
         &self.platform
+    }
+
+    pub fn mobile_virtual_compat_enabled(&self) -> bool {
+        self.mobile_virtual_compat.load(Ordering::SeqCst)
+    }
+
+    pub fn set_mobile_virtual_compat(&self, enabled: bool) {
+        self.mobile_virtual_compat.store(enabled, Ordering::SeqCst);
+    }
+
+    pub fn last_runtime_error(&self) -> Option<String> {
+        self.last_runtime_error.read().ok().and_then(|g| g.clone())
+    }
+
+    pub fn record_runtime_error(&self, err: impl Into<String>) {
+        let msg = err.into();
+        let trimmed = msg.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if let Ok(mut g) = self.last_runtime_error.write() {
+            *g = Some(trimmed.to_owned());
+        }
+    }
+
+    pub fn clear_runtime_error(&self) {
+        if let Ok(mut g) = self.last_runtime_error.write() {
+            *g = None;
+        }
     }
 
     pub fn locale(&self) -> String {
@@ -979,15 +1029,45 @@ impl HostContext {
             .filter(|s| !s.is_empty())
     }
 
+    pub fn all_storage(&self) -> HashMap<String, serde_json::Value> {
+        self.storage.read().map(|g| g.clone()).unwrap_or_default()
+    }
+
     pub fn resolve_request_headers(
         &self,
         url: &str,
         kind: HeaderRequestKind,
     ) -> Vec<(String, String)> {
+        if self.manifest.has_declared_network_policy() {
+            let Ok(parsed) = url::Url::parse(url) else {
+                return Vec::new();
+            };
+            if !matches!(parsed.scheme(), "http" | "https") {
+                return Vec::new();
+            }
+            let host_clean = parsed
+                .host_str()
+                .unwrap_or("")
+                .trim()
+                .trim_matches(|c| c == '[' || c == ']')
+                .to_ascii_lowercase();
+            if host_clean.is_empty() {
+                return Vec::new();
+            }
+            if !self.manifest.declares_wildcard_network() {
+                let declared = self.manifest.declared_network_hosts();
+                if !declared
+                    .iter()
+                    .any(|pat| network_host_matches(pat, &host_clean))
+                {
+                    return Vec::new();
+                }
+            }
+        }
         let cfg = self.all_config();
-        let cookie = self.cookie_value();
+        let storage = self.all_storage();
         self.header_resolver
-            .resolve(url, kind, &cfg, cookie.as_deref())
+            .resolve_with_storage(url, kind, &cfg, &storage)
     }
 
     pub fn get_storage(&self, key: &str) -> Option<serde_json::Value> {
@@ -1164,7 +1244,7 @@ impl HostContext {
         }
         if allow_loopback_for_process
             && !self.manifest.all_process_commands().is_empty()
-            && (self.is_granted() || self.is_mobile)
+            && (self.is_granted() || (self.is_mobile && self.mobile_virtual_compat_enabled()))
         {
             patterns.push("127.0.0.1".to_owned());
             patterns.push("localhost".to_owned());
@@ -1246,8 +1326,6 @@ impl HostContext {
             &self.no_redirect_client
         };
 
-        let mut req = client.request(method, url);
-
         // Apply plugin manifest requestHeaders first, then let explicit opts.headers override.
         let mut merged_headers = self.resolve_request_headers(url, HeaderRequestKind::Api);
         for (k, v) in opts.headers {
@@ -1261,17 +1339,25 @@ impl HostContext {
                 merged_headers.push((k, v));
             }
         }
-        for (k, v) in merged_headers {
-            req = req.header(&k, &v);
-        }
-        if let Some(body) = opts.body {
-            req = req.body(body);
-        }
-        if let Some(ms) = opts.timeout_ms {
-            req = req.timeout(Duration::from_millis(ms));
-        }
+        let body_bytes = opts.body;
+        let timeout_ms = opts.timeout_ms;
 
-        let resp = tokio::select! {
+        let build_req = |headers_list: &[(String, String)], body: Option<&[u8]>| {
+            let mut req = client.request(method.clone(), url);
+            for (k, v) in headers_list {
+                req = req.header(k.as_str(), v.as_str());
+            }
+            if let Some(bytes) = body {
+                req = req.body(bytes.to_vec());
+            }
+            if let Some(ms) = timeout_ms {
+                req = req.timeout(Duration::from_millis(ms));
+            }
+            req
+        };
+
+        let req = build_req(&merged_headers, body_bytes.as_deref());
+        let mut resp = tokio::select! {
             _ = &mut abort_rx => {
                 return Err("AbortError: The operation was aborted".to_owned());
             }
@@ -1279,6 +1365,50 @@ impl HostContext {
                 sent.map_err(|e| format!("host.fetch failed for `{url}`: {e}"))?
             }
         };
+
+        // YouTube Music's `ANDROID_MUSIC` InnerTube client rejects web `Cookie` / `SAPISIDHASH`
+        // auth headers with HTTP 400 on `/youtubei/v1/next` and `/youtubei/v1/browse` (lyrics).
+        // Retry once anonymously with web auth/origin headers stripped so signed-in plugins
+        // receive `MPLY*` timed lyrics cleanly without patching plugin JS.
+        let innertube_endpoint = if parsed_url.path().ends_with("/youtubei/v1/next") {
+            Some("/next")
+        } else if parsed_url.path().ends_with("/youtubei/v1/browse") {
+            Some("/browse")
+        } else {
+            None
+        };
+        if resp.status() == reqwest::StatusCode::BAD_REQUEST
+            && method == reqwest::Method::POST
+            && let Some(endpoint_label) = innertube_endpoint
+            && body_bytes
+                .as_deref()
+                .is_some_and(|b| contains_subslice(b, b"ANDROID_MUSIC"))
+            && merged_headers
+                .iter()
+                .any(|(k, _)| is_innertube_web_auth_header(k))
+        {
+            log::info!(
+                target: "nsh_music_plugin",
+                "retrying ANDROID_MUSIC InnerTube {endpoint_label} anonymously after HTTP 400 for plugin `{}`",
+                self.plugin_id
+            );
+            let anon_headers: Vec<(String, String)> = merged_headers
+                .into_iter()
+                .filter(|(k, _)| !is_innertube_web_auth_header(k))
+                .collect();
+            let retry_req = build_req(&anon_headers, body_bytes.as_deref());
+            let retry_res = tokio::select! {
+                _ = &mut abort_rx => {
+                    return Err("AbortError: The operation was aborted".to_owned());
+                }
+                sent = retry_req.send() => sent,
+            };
+            if let Ok(retry_resp) = retry_res
+                && retry_resp.status().is_success()
+            {
+                resp = retry_resp;
+            }
+        }
 
         let status = resp.status();
         let final_url = resp.url().to_string();
@@ -1329,29 +1459,49 @@ impl HostContext {
         args: &[String],
         opts: &SpawnOptions,
     ) -> Result<(u64, bool, Arc<ManagedProcess>), Result<MobileSandboxError, String>> {
-        // 1. Consult registered virtual process shims (e.g. `ffmpeg`).
-        if let Some((is_virtual, proc)) = self.virtualizer.spawn(cmd, args, opts, self)? {
-            let id = self.next_proc_id.fetch_add(1, Ordering::Relaxed);
-            if let Ok(mut map) = self.processes.lock() {
-                map.insert(id, Arc::clone(&proc));
+        let virtual_compat = self.mobile_virtual_compat_enabled();
+
+        if virtual_compat {
+            // 1. Consult registered virtual process shims (e.g. `ffmpeg`, `yt-dlp`).
+            match self.virtualizer.spawn(cmd, args, opts, self) {
+                Ok(Some((is_virtual, proc))) => {
+                    self.clear_runtime_error();
+                    let id = self.next_proc_id.fetch_add(1, Ordering::Relaxed);
+                    if let Ok(mut map) = self.processes.lock() {
+                        map.insert(id, Arc::clone(&proc));
+                    }
+                    return Ok((id, is_virtual, proc));
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    if let Err(ref msg) = err {
+                        self.record_runtime_error(msg);
+                    }
+                    return Err(err);
+                }
             }
-            return Ok((id, is_virtual, proc));
+
+            // 2. Non-virtualized binaries are blocked on mobile sandboxes (without `"allowed"` in error text).
+            if self.is_mobile {
+                return Err(Ok(MobileSandboxError::new(cmd, &self.platform)));
+            }
         }
 
-        // 2. Non-virtualized binaries are blocked on mobile sandboxes (without `"allowed"` in error text).
-        if self.is_mobile {
-            return Err(Ok(MobileSandboxError::new(cmd, &self.platform)));
-        }
-
-        // 3. Enforce desktop `permissions.process` & Allow Programs matching `mygo-music`.
+        // 3. Enforce `permissions.process` & Allow Programs matching `mygo-music`.
         if self.manifest.all_process_commands().is_empty() {
-            return Err(Err("spawn needs the process permission".to_owned()));
+            let msg = "spawn needs the process permission".to_owned();
+            if !virtual_compat {
+                self.record_runtime_error(&msg);
+            }
+            return Err(Err(msg));
         }
         if !self.granted.load(Ordering::SeqCst) {
-            return Err(Err(
-                "the listener hasn't allowed this plugin to start programs: enable Allow Programs in plugin settings"
-                    .to_owned(),
-            ));
+            let msg = "the listener hasn't allowed this plugin to start programs: enable Allow Programs in plugin settings"
+                .to_owned();
+            if !virtual_compat {
+                self.record_runtime_error(&msg);
+            }
+            return Err(Err(msg));
         }
 
         let resolved_cmd = resolve_relative_command(&self.plugin_dir, cmd);
@@ -1359,14 +1509,22 @@ impl HostContext {
             .manifest
             .allows_process(&self.plugin_dir, &resolved_cmd)
         {
-            return Err(Err(format!(
-                "{cmd} isn't one of the programs in the plugin's process permission"
-            )));
+            let msg = format!("{cmd} isn't one of the programs in the plugin's process permission");
+            if !virtual_compat {
+                self.record_runtime_error(&msg);
+            }
+            return Err(Err(msg));
         }
 
         let effective_opts = with_default_cwd(opts, &self.plugin_dir);
-        let handle =
-            ExternalProcessHandle::spawn(&resolved_cmd, args, &effective_opts).map_err(Err)?;
+        let handle = match ExternalProcessHandle::spawn(&resolved_cmd, args, &effective_opts) {
+            Ok(handle) => handle,
+            Err(err) => {
+                self.record_runtime_error(&err);
+                return Err(Err(err));
+            }
+        };
+        self.clear_runtime_error();
         let proc = Arc::new(ManagedProcess::from_external(handle));
         let id = self.next_proc_id.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut map) = self.processes.lock() {
@@ -2161,11 +2319,13 @@ fn install_capabilities<'js>(
 ) -> rquickjs::Result<()> {
     let caps = Object::new(ctx.clone())?;
     let is_mobile = state.is_mobile();
+    let virtual_compat = state.mobile_virtual_compat_enabled();
     caps.set("platform", state.platform())?;
     caps.set("isMobile", is_mobile)?;
-    caps.set("embeddedFfmpeg", true)?;
-    caps.set("embeddedYtdlp", true)?;
-    caps.set("canSpawnExternal", !is_mobile)?;
+    caps.set("mobileVirtualCompat", virtual_compat)?;
+    caps.set("embeddedFfmpeg", virtual_compat)?;
+    caps.set("embeddedYtdlp", virtual_compat)?;
+    caps.set("canSpawnExternal", !is_mobile || !virtual_compat)?;
     caps.set("openUrl", true)?;
     caps.set(
         "webSignInMode",
@@ -2177,13 +2337,15 @@ fn install_capabilities<'js>(
     )?;
 
     let vprocs = Array::new(ctx.clone())?;
-    for (idx, name) in state
-        .virtualizer
-        .virtualized_commands()
-        .into_iter()
-        .enumerate()
-    {
-        vprocs.set(idx, name)?;
+    if virtual_compat {
+        for (idx, name) in state
+            .virtualizer
+            .virtualized_commands()
+            .into_iter()
+            .enumerate()
+        {
+            vprocs.set(idx, name)?;
+        }
     }
     caps.set("virtualProcesses", vprocs)?;
 
@@ -3350,5 +3512,263 @@ pub(crate) fn js_to_json<'js>(
             Ok(serde_json::from_str(&text).unwrap_or(serde_json::Value::Null))
         }
         None => Ok(serde_json::Value::Null),
+    }
+}
+
+fn is_innertube_web_auth_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("cookie")
+        || name.eq_ignore_ascii_case("authorization")
+        || name.eq_ignore_ascii_case("x-goog-authuser")
+        || name.eq_ignore_ascii_case("origin")
+        || name.eq_ignore_ascii_case("x-origin")
+}
+
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    fn read_full_http_request(stream: &mut std::net::TcpStream) -> String {
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        let mut header_end: Option<usize> = None;
+        let mut content_len: usize = 0;
+
+        loop {
+            match stream.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    if header_end.is_none()
+                        && let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n")
+                    {
+                        header_end = Some(pos + 4);
+                        let hdr_str = String::from_utf8_lossy(&buf[..pos]);
+                        for line in hdr_str.lines() {
+                            if let Some((k, v)) = line.split_once(':')
+                                && k.trim().eq_ignore_ascii_case("content-length")
+                            {
+                                content_len = v.trim().parse().unwrap_or(0);
+                            }
+                        }
+                    }
+                    if let Some(hend) = header_end
+                        && buf.len() >= hend + content_len
+                    {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    #[test]
+    fn android_music_innertube_400_retries_anonymously_on_next_and_browse() {
+        let root = std::env::temp_dir().join(format!(
+            "nsh-plugin-host-android-retry-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let plugin_dir = root.join("plugin");
+        let data_dir = root.join("data");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::create_dir_all(&data_dir).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let port = listener.local_addr().unwrap().port();
+
+        // Expect 4 requests: (/next with auth -> 400, /next anon -> 200,
+        //                     /browse with auth -> 400, /browse anon -> 200).
+        let server_thread = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let raw = read_full_http_request(&mut stream);
+                let lower = raw.to_ascii_lowercase();
+                let has_auth = lower.contains("\ncookie:")
+                    || lower.contains("\nauthorization:")
+                    || lower.contains("\nx-goog-authuser:")
+                    || lower.contains("\norigin:")
+                    || lower.contains("\nx-origin:");
+                let has_android_ua = lower.contains("com.google.android.apps.youtube.music");
+                let has_android_body = raw.contains("ANDROID_MUSIC");
+                seen.push((has_auth, has_android_ua, has_android_body));
+
+                let (status_line, body) = if has_auth {
+                    (
+                        "HTTP/1.1 400 Bad Request",
+                        r#"{"error":{"code":400,"message":"bad android auth"}}"#,
+                    )
+                } else {
+                    (
+                        "HTTP/1.1 200 OK",
+                        r#"{"browseId":"MPLYt_ok","timedLyricsData":[{"lyricLine":"hello"}]}"#,
+                    )
+                };
+                let resp = format!(
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+            seen
+        });
+
+        let manifest = Arc::new(
+            PluginManifest::parse_json(
+                r#"{
+                    "id": "yt-retry-test",
+                    "name": "YT Retry Test",
+                    "permissions": { "network": ["127.0.0.1"] }
+                }"#,
+            )
+            .unwrap(),
+        );
+        let ctx = HostContext::new(
+            plugin_dir,
+            data_dir,
+            manifest,
+            Arc::new(PluginLocales::default()),
+            HostRuntimeOptions::default(),
+        );
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        for endpoint in ["next", "browse"] {
+            let url = format!("http://127.0.0.1:{port}/youtubei/v1/{endpoint}?prettyPrint=false");
+            let opts = FetchOptions {
+                method: "POST".to_owned(),
+                headers: vec![
+                    ("Content-Type".to_owned(), "application/json".to_owned()),
+                    (
+                        "User-Agent".to_owned(),
+                        "com.google.android.apps.youtube.music/7.21.50 (Linux; U; Android 14) gzip"
+                            .to_owned(),
+                    ),
+                    ("Origin".to_owned(), "https://music.youtube.com".to_owned()),
+                    (
+                        "X-Origin".to_owned(),
+                        "https://music.youtube.com".to_owned(),
+                    ),
+                    ("Cookie".to_owned(), "SAPISID=secret".to_owned()),
+                    (
+                        "Authorization".to_owned(),
+                        "SAPISIDHASH 123_abc".to_owned(),
+                    ),
+                    ("X-Goog-AuthUser".to_owned(), "0".to_owned()),
+                ],
+                body: Some(
+                    br#"{"context":{"client":{"clientName":"ANDROID_MUSIC"}},"videoId":"dQw4w9WgXcQ"}"#
+                        .to_vec(),
+                ),
+                timeout_ms: Some(5_000),
+                follow_redirects: true,
+            };
+            let (_tx, rx) = tokio::sync::oneshot::channel();
+            let resp = rt
+                .block_on(ctx.perform_fetch(&url, opts, rx))
+                .expect("retry succeeds");
+            assert!(resp.ok, "endpoint={endpoint} should succeed after retry");
+            assert_eq!(resp.status, 200);
+            let body = String::from_utf8_lossy(&resp.bytes);
+            assert!(body.contains("MPLYt_ok"), "body={body}");
+        }
+
+        let seen = server_thread.join().expect("server thread");
+        assert_eq!(
+            seen,
+            vec![
+                (true, true, true),
+                (false, true, true),
+                (true, true, true),
+                (false, true, true),
+            ]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_request_headers_enforces_declared_network_hosts_and_storage_placeholders() {
+        let root =
+            std::env::temp_dir().join(format!("nsh-plugin-host-reqheaders-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let plugin_dir = root.join("plugin");
+        let data_dir = root.join("data");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::create_dir_all(&data_dir).unwrap();
+
+        let manifest = Arc::new(
+            PluginManifest::parse_json(
+                r#"{
+                    "id": "selfhost-demo",
+                    "name": "Selfhost Demo",
+                    "permissions": {
+                        "network": ["navidrome.example.com"]
+                    },
+                    "requestHeaders": [
+                        {
+                            "hosts": ["{setting:server}", "evil.outside.com"],
+                            "kinds": ["image", "audio"],
+                            "headers": {
+                                "Cookie": "music-token={storage:token}",
+                                "X-User": "{setting:username}",
+                                "Host": "spoofed.invalid"
+                            }
+                        }
+                    ]
+                }"#,
+            )
+            .unwrap(),
+        );
+        let ctx = HostContext::new(
+            plugin_dir,
+            data_dir,
+            manifest,
+            Arc::new(PluginLocales::default()),
+            HostRuntimeOptions::default(),
+        );
+        ctx.set_config("server", "https://navidrome.example.com:4533/sub");
+        ctx.set_config("username", "tester");
+        ctx.set_storage("token", serde_json::json!("sess-xyz"));
+
+        // Declared network host receives expanded `{setting:*}` and `{storage:*}` headers (no `Host`).
+        let allowed = ctx.resolve_request_headers(
+            "https://navidrome.example.com:4533/rest/stream?id=7",
+            HeaderRequestKind::Audio,
+        );
+        assert!(allowed.contains(&("Cookie".to_owned(), "music-token=sess-xyz".to_owned())));
+        assert!(allowed.contains(&("X-User".to_owned(), "tester".to_owned())));
+        assert!(!allowed.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")));
+
+        // Host listed only in `requestHeaders` (outside `permissions.network`) MUST be blocked.
+        let blocked = ctx.resolve_request_headers(
+            "https://evil.outside.com/track.mp3",
+            HeaderRequestKind::Audio,
+        );
+        assert!(
+            blocked.is_empty(),
+            "host outside declared permissions.network must not receive requestHeaders: {blocked:?}"
+        );
+
+        // Changing `{setting:server}` to a host outside `permissions.network` is also blocked.
+        ctx.set_config("server", "https://undeclared.example.org");
+        let blocked_setting = ctx.resolve_request_headers(
+            "https://undeclared.example.org/cover.jpg",
+            HeaderRequestKind::Image,
+        );
+        assert!(blocked_setting.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

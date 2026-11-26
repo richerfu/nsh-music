@@ -443,6 +443,40 @@ impl PluginManifest {
         Ok(())
     }
 
+    /// Returns network hosts/domains explicitly declared in `domains` and `permissions.network`
+    /// (excluding `requestHeaders` patterns and wildcard `*`), deduplicated.
+    pub fn declared_network_hosts(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for host in self
+            .domains
+            .iter()
+            .map(String::as_str)
+            .chain(self.permissions.network.iter().map(String::as_str))
+        {
+            let h = host.trim();
+            if !h.is_empty() && h != "*" && !out.iter().any(|x| x == h) {
+                out.push(h.to_owned());
+            }
+        }
+        out
+    }
+
+    /// Returns `true` if `domains` or `permissions.network` has any declared entry.
+    pub fn has_declared_network_policy(&self) -> bool {
+        self.domains
+            .iter()
+            .chain(self.permissions.network.iter())
+            .any(|h| !h.trim().is_empty())
+    }
+
+    /// Returns `true` if `domains` or `permissions.network` explicitly declares wildcard `*`.
+    pub fn declares_wildcard_network(&self) -> bool {
+        self.domains
+            .iter()
+            .chain(self.permissions.network.iter())
+            .any(|h| h.trim() == "*")
+    }
+
     /// Returns all declared network hosts/domains (deduplicated).
     pub fn all_network_hosts(&self) -> Vec<String> {
         let mut out = Vec::new();
@@ -974,6 +1008,16 @@ mod tests {
         assert!(hosts.contains(&"api.bilibili.com".to_owned()));
         assert!(hosts.contains(&"*.bilivideo.com".to_owned()));
         assert!(hosts.contains(&"*.hdslb.com".to_owned()));
+
+        let declared = manifest.declared_network_hosts();
+        assert!(declared.contains(&"api.bilibili.com".to_owned()));
+        assert!(declared.contains(&"*.bilivideo.com".to_owned()));
+        assert!(
+            !declared.contains(&"*.hdslb.com".to_owned()),
+            "requestHeaders hosts must not leak into declared_network_hosts()"
+        );
+        assert!(manifest.has_declared_network_policy());
+        assert!(!manifest.declares_wildcard_network());
     }
 
     #[test]

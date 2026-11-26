@@ -295,7 +295,9 @@ enum RuntimeCommand {
         reply: std_mpsc::SyncSender<Result<serde_json::Value, SourceError>>,
         started: Arc<AtomicBool>,
         cancelled: Arc<AtomicBool>,
+        cancel_notify: Arc<tokio::sync::Notify>,
     },
+    Ping(std_mpsc::SyncSender<()>),
     Shutdown,
 }
 
@@ -421,6 +423,31 @@ impl PluginSource {
         self.host_ctx.set_granted(granted);
     }
 
+    /// Returns whether mobile virtualization compatibility shims (`ffmpeg` / `yt-dlp`) are enabled.
+    pub fn mobile_virtual_compat(&self) -> bool {
+        self.host_ctx.mobile_virtual_compat_enabled()
+    }
+
+    /// Enables or disables mobile virtualization compatibility shims for this plugin.
+    pub fn set_mobile_virtual_compat(&self, enabled: bool) {
+        self.host_ctx.set_mobile_virtual_compat(enabled);
+    }
+
+    /// Returns the most recent process/runtime invocation error recorded for this plugin, if any.
+    pub fn runtime_error(&self) -> Option<String> {
+        self.host_ctx.last_runtime_error()
+    }
+
+    /// Records a runtime error message to be surfaced on this plugin's UI card.
+    pub fn record_runtime_error(&self, err: impl Into<String>) {
+        self.host_ctx.record_runtime_error(err);
+    }
+
+    /// Clears any recorded runtime error message for this plugin.
+    pub fn clear_runtime_error(&self) {
+        self.host_ctx.clear_runtime_error();
+    }
+
     /// Stops the active QuickJS worker, terminates any spawned processes, and boots a fresh worker.
     pub fn restart(&self) -> Result<(), RuntimeError> {
         self.host_ctx.kill_all_processes();
@@ -477,7 +504,7 @@ impl PluginSource {
             .unwrap_or(timeout);
         let is_low_priority = is_low_priority_method(method);
 
-        let tx = {
+        let (tx, hi_tx) = {
             let mut guard = self
                 .worker
                 .lock()
@@ -496,15 +523,17 @@ impl PluginSource {
                 *guard = Some(fresh);
             }
             let handle = guard.as_ref().unwrap();
-            if is_low_priority {
+            let call_tx = if is_low_priority {
                 handle.lo_tx.clone()
             } else {
                 handle.hi_tx.clone()
-            }
+            };
+            (call_tx, handle.hi_tx.clone())
         };
 
         let started = Arc::new(AtomicBool::new(false));
         let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel_notify = Arc::new(tokio::sync::Notify::new());
         let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
         if tx
             .send(RuntimeCommand::Call {
@@ -513,6 +542,7 @@ impl PluginSource {
                 reply: reply_tx,
                 started: Arc::clone(&started),
                 cancelled: Arc::clone(&cancelled),
+                cancel_notify: Arc::clone(&cancel_notify),
             })
             .is_err()
         {
@@ -526,15 +556,28 @@ impl PluginSource {
             Ok(res) => res,
             Err(std_mpsc::RecvTimeoutError::Timeout) => {
                 cancelled.store(true, Ordering::SeqCst);
+                cancel_notify.notify_one();
                 let was_started = started.load(Ordering::SeqCst);
                 if !is_low_priority && was_started {
-                    log::warn!(
-                        target: "nsh_music_plugin",
-                        "plugin `{}` timed out calling `{method}` after {:?}; restarting worker",
-                        self.manifest.id,
-                        effective_timeout
-                    );
-                    let _ = self.restart();
+                    let (pong_tx, pong_rx) = std_mpsc::sync_channel(1);
+                    let alive = hi_tx.send(RuntimeCommand::Ping(pong_tx)).is_ok()
+                        && pong_rx.recv_timeout(Duration::from_millis(1500)).is_ok();
+                    if alive {
+                        log::warn!(
+                            target: "nsh_music_plugin",
+                            "plugin `{}` timed out calling `{method}` after {:?}, but liveness ping succeeded; preserving worker and active processes",
+                            self.manifest.id,
+                            effective_timeout
+                        );
+                    } else {
+                        log::warn!(
+                            target: "nsh_music_plugin",
+                            "plugin `{}` timed out calling `{method}` after {:?} and failed liveness ping; restarting worker",
+                            self.manifest.id,
+                            effective_timeout
+                        );
+                        let _ = self.restart();
+                    }
                 } else {
                     log::warn!(
                         target: "nsh_music_plugin",
@@ -688,6 +731,9 @@ impl PluginSource {
         quality: Quality,
         orig_err: &SourceError,
     ) -> Option<Result<StreamInfo, String>> {
+        if !self.host_ctx.mobile_virtual_compat_enabled() {
+            return None;
+        }
         if !matches!(
             orig_err,
             SourceError::Unavailable(_) | SourceError::Message(_)
@@ -1342,6 +1388,7 @@ impl MusicSource for PluginSource {
 
         match &resolved {
             Ok(info) => {
+                self.host_ctx.clear_runtime_error();
                 log::info!(
                     target: "nsh_music_plugin",
                     "plugin stream resolved: plugin_id={} track_id={} quality={} media_type={} url={}",
@@ -1353,6 +1400,11 @@ impl MusicSource for PluginSource {
                 );
             }
             Err(err) => {
+                if !self.host_ctx.mobile_virtual_compat_enabled()
+                    && self.host_ctx.last_runtime_error().is_none()
+                {
+                    self.host_ctx.record_runtime_error(err.to_string());
+                }
                 log::warn!(
                     target: "nsh_music_plugin",
                     "plugin stream failed: plugin_id={} track_id={} quality={} err={}",
@@ -1639,12 +1691,16 @@ fn run_plugin_actor(
             };
             match cmd {
                 RuntimeCommand::Shutdown => break,
+                RuntimeCommand::Ping(pong) => {
+                    let _ = pong.send(());
+                }
                 RuntimeCommand::Call {
                     method,
                     args,
                     reply,
                     started,
                     cancelled,
+                    cancel_notify,
                 } => {
                     if cancelled.load(Ordering::SeqCst) {
                         continue;
@@ -1656,7 +1712,15 @@ fn run_plugin_actor(
                     let dispatch_ref = dispatch_obj.clone();
                     let result = qjs_ctx
                         .async_with(async |ctx| {
-                            invoke_plugin_function(&ctx, dispatch_ref, &method, &args).await
+                            invoke_plugin_function(
+                                &ctx,
+                                dispatch_ref,
+                                &method,
+                                &args,
+                                &cancelled,
+                                &cancel_notify,
+                            )
+                            .await
                         })
                         .await;
                     let _ = reply.send(result);
@@ -1676,6 +1740,8 @@ async fn invoke_plugin_function<'js>(
     dispatch_persistent: Persistent<Object<'static>>,
     method: &str,
     args: &[serde_json::Value],
+    cancelled: &AtomicBool,
+    cancel_notify: &tokio::sync::Notify,
 ) -> Result<serde_json::Value, SourceError> {
     let dispatch = dispatch_persistent
         .restore(ctx)
@@ -1709,11 +1775,29 @@ async fn invoke_plugin_function<'js>(
         .map_err(|e| caught_to_source_error(ctx, e))?;
 
     let resolved: Value<'js> = if let Some(promise) = raw_ret.clone().into_promise() {
-        promise
-            .into_future::<Value<'js>>()
-            .await
-            .catch(ctx)
-            .map_err(|e| caught_to_source_error(ctx, e))?
+        let fut = promise.into_future::<Value<'js>>();
+        tokio::pin!(fut);
+        loop {
+            if cancelled.load(Ordering::SeqCst) {
+                return Err(SourceError::Message(format!(
+                    "the plugin didn't answer {method} in time"
+                )));
+            }
+            tokio::select! {
+                biased;
+                res = &mut fut => {
+                    break res.catch(ctx).map_err(|e| caught_to_source_error(ctx, e))?;
+                }
+                _ = cancel_notify.notified() => {
+                    if cancelled.load(Ordering::SeqCst) {
+                        return Err(SourceError::Message(format!(
+                            "the plugin didn't answer {method} in time"
+                        )));
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+        }
     } else {
         raw_ret
     };
@@ -2052,16 +2136,16 @@ mod tests {
             "register_rescue_relay must cap active rescue relays at 3"
         );
 
-        // 1. Start a slow low-priority `lyrics` call with a short 80ms timeout (times out while started).
+        // 1. Start a slow low-priority `lyrics` call with a 140ms timeout (times out while started).
         let s_lo = Arc::clone(&source);
         let t_lo = thread::spawn(move || {
-            s_lo.call_raw_with_timeout("lyrics", vec![], Duration::from_millis(80))
+            s_lo.call_raw_with_timeout("lyrics", vec![], Duration::from_millis(140))
         });
 
-        // Wait until `lyrics` is executing, then enqueue a high-priority `track` call with a 50ms timeout
-        // so it times out BEFORE starting (`cancelled = true`, `started = false`).
+        // Wait until `lyrics` is executing, then enqueue a high-priority `track` call with a 40ms timeout
+        // so it strictly times out BEFORE `lyrics` finishes or cancels (`cancelled = true`, `started = false`).
         thread::sleep(Duration::from_millis(30));
-        let queued_res = source.call_raw_with_timeout("track", vec![], Duration::from_millis(50));
+        let queued_res = source.call_raw_with_timeout("track", vec![], Duration::from_millis(40));
         assert!(
             queued_res.is_err(),
             "queued high-priority call should time out"
@@ -2128,5 +2212,145 @@ mod tests {
             preserved_non_unavailable,
             SourceError::Message("Original message".to_owned())
         );
+    }
+
+    #[test]
+    fn slow_async_interactive_timeout_preserves_vm_and_running_processes() {
+        let root = std::env::temp_dir().join(format!(
+            "nsh-plugin-slow-async-ping-ok-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let plugin_dir = root.join("plugin");
+        let data_dir = root.join("data");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::create_dir_all(&data_dir).unwrap();
+
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            r#"{
+                "id":"slow-async-safe",
+                "name":"Slow Async Safe",
+                "version":"0.1.0",
+                "main":"index.js",
+                "permissions":{"process":["ffmpeg"]}
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            plugin_dir.join("index.js"),
+            r#"
+            let generation = 0;
+            export async function bumpGen() {
+                generation += 1;
+                return generation;
+            }
+            export async function getGen() {
+                return generation;
+            }
+            export async function search() {
+                await host.sleep(600);
+                return { tracks: [] };
+            }
+            "#,
+        )
+        .unwrap();
+
+        let source = PluginSource::load(&plugin_dir, &data_dir, HostRuntimeOptions::default())
+            .expect("load slow-async plugin");
+
+        assert_eq!(
+            source.call_raw("bumpGen", vec![]).unwrap(),
+            serde_json::json!(1)
+        );
+        let relay = VirtualFfmpegShim::spawn(&[
+            "-i".to_owned(),
+            "http://127.0.0.1:9/unused".to_owned(),
+            "-listen".to_owned(),
+            "1".to_owned(),
+            "http://127.0.0.1:0/".to_owned(),
+        ])
+        .expect("spawn virtual relay");
+        source.host_ctx.register_rescue_relay(relay);
+        assert_eq!(source.host_ctx.active_process_count(), 1);
+
+        // High-priority interactive call times out while awaiting slow async I/O (`host.sleep`):
+        // cancellation yields control back to worker loop, `Ping` succeeds, so VM & relay survive.
+        let err = source
+            .call_raw_with_timeout("search", vec![], Duration::from_millis(80))
+            .expect_err("slow search must time out");
+        assert!(err.to_string().contains("in time"), "got {err}");
+
+        assert_eq!(
+            source.host_ctx.active_process_count(),
+            1,
+            "slow async interactive timeout must NOT kill running processes"
+        );
+        assert_eq!(
+            source.call_raw("getGen", vec![]).unwrap(),
+            serde_json::json!(1),
+            "VM state must be preserved when liveness ping succeeds"
+        );
+
+        source.shutdown();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn synchronous_infinite_loop_fails_ping_and_restarts_cleanly() {
+        let root = std::env::temp_dir().join(format!(
+            "nsh-plugin-sync-hang-ping-fail-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let plugin_dir = root.join("plugin");
+        let data_dir = root.join("data");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::create_dir_all(&data_dir).unwrap();
+
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            r#"{"id":"sync-hang","name":"Sync Hang","version":"0.1.0","main":"index.js"}"#,
+        )
+        .unwrap();
+        fs::write(
+            plugin_dir.join("index.js"),
+            r#"
+            let generation = 0;
+            export async function bumpGen() {
+                generation += 1;
+                return generation;
+            }
+            export async function getGen() {
+                return generation;
+            }
+            export async function search() {
+                while (true) {}
+            }
+            "#,
+        )
+        .unwrap();
+
+        let source = PluginSource::load(&plugin_dir, &data_dir, HostRuntimeOptions::default())
+            .expect("load sync-hang plugin");
+        assert_eq!(
+            source.call_raw("bumpGen", vec![]).unwrap(),
+            serde_json::json!(1)
+        );
+
+        let err = source
+            .call_raw_with_timeout("search", vec![], Duration::from_millis(80))
+            .expect_err("infinite JS loop must time out");
+        assert!(err.to_string().contains("in time"), "got {err}");
+
+        // Liveness ping timed out on the wedged worker and restarted it -> fresh VM (`generation == 0`).
+        assert_eq!(
+            source.call_raw("getGen", vec![]).unwrap(),
+            serde_json::json!(0),
+            "wedged JS loop must trigger worker restart cleanly"
+        );
+
+        source.shutdown();
+        let _ = fs::remove_dir_all(&root);
     }
 }

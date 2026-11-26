@@ -24,6 +24,7 @@ pub(crate) mod yt_format_selector;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use nsh_music_core::model::SettingDef;
@@ -92,6 +93,8 @@ pub struct PluginSummary {
     pub report: CompatReport,
     pub settings: Vec<SettingDef>,
     pub load_error: Option<String>,
+    #[serde(default)]
+    pub runtime_error: Option<String>,
 }
 
 /// Manages lifecycle, persistence, installation, and runtime actors for all installed music plugins.
@@ -105,6 +108,7 @@ pub struct PluginManager {
     web_sign_in_handler: RwLock<Option<WebSignInHandler>>,
     open_url_handler: RwLock<Option<OpenUrlHandler>>,
     is_mobile_override: Option<bool>,
+    mobile_virtual_compat: AtomicBool,
 }
 
 impl PluginManager {
@@ -126,6 +130,7 @@ impl PluginManager {
             web_sign_in_handler: RwLock::new(None),
             open_url_handler: RwLock::new(None),
             is_mobile_override: None,
+            mobile_virtual_compat: AtomicBool::new(true),
         })
     }
 
@@ -344,6 +349,7 @@ impl PluginManager {
                     report: src.compat_report().clone(),
                     settings: info.settings,
                     load_error: None,
+                    runtime_error: src.runtime_error(),
                 });
             } else {
                 let manifest =
@@ -374,6 +380,7 @@ impl PluginManager {
                     report,
                     settings: info.settings,
                     load_error,
+                    runtime_error: None,
                 });
             }
         }
@@ -403,12 +410,54 @@ impl PluginManager {
                     report: src.compat_report().clone(),
                     settings: info.settings,
                     load_error: None,
+                    runtime_error: src.runtime_error(),
                 });
             }
         }
 
         out.sort_by(|a, b| a.id.cmp(&b.id));
         out
+    }
+
+    /// Returns whether mobile virtualization compatibility shims (`ffmpeg` / `yt-dlp`) are enabled.
+    pub fn mobile_virtual_compat(&self) -> bool {
+        self.mobile_virtual_compat.load(Ordering::SeqCst)
+    }
+
+    /// Enables or disables mobile virtualization compatibility across all loaded plugins,
+    /// clearing any stale runtime errors and restarting QuickJS workers so cached tool probes reset.
+    pub fn set_mobile_virtual_compat(&self, enabled: bool) {
+        self.mobile_virtual_compat.store(enabled, Ordering::SeqCst);
+        let sources: Vec<Arc<PluginSource>> = self
+            .loaded
+            .read()
+            .map(|guard| guard.values().cloned().collect())
+            .unwrap_or_default();
+        for src in sources {
+            src.set_mobile_virtual_compat(enabled);
+            src.clear_runtime_error();
+            if let Err(err) = src.restart() {
+                log::warn!(
+                    target: "nsh_music_plugin",
+                    "failed to restart plugin `{}` after toggling mobile_virtual_compat={enabled}: {err}",
+                    src.manifest().id
+                );
+            }
+        }
+    }
+
+    /// Records a runtime error message on the given loaded plugin so it surfaces in [`PluginSummary::runtime_error`].
+    pub fn record_runtime_error(&self, plugin_id: &str, err: impl Into<String>) {
+        if let Some(src) = self.get(plugin_id) {
+            src.record_runtime_error(err);
+        }
+    }
+
+    /// Clears any recorded runtime error message on the given loaded plugin.
+    pub fn clear_runtime_error(&self, plugin_id: &str) {
+        if let Some(src) = self.get(plugin_id) {
+            src.clear_runtime_error();
+        }
     }
 
     /// Sets the active locale on the manager and every loaded plugin.
@@ -521,6 +570,7 @@ impl PluginManager {
             locale: Some(self.locale()),
             is_mobile_override: self.is_mobile_override,
             platform_override: None,
+            mobile_virtual_compat: self.mobile_virtual_compat(),
             sign_in_prompt: self.sign_in_prompt.read().ok().and_then(|g| g.clone()),
             web_sign_in_handler: self.web_sign_in_handler.read().ok().and_then(|g| g.clone()),
             open_url_handler: self.open_url_handler.read().ok().and_then(|g| g.clone()),
@@ -2242,6 +2292,204 @@ mod tests {
 
         mgr.shutdown_all();
         let _ = upstream_thread.join();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mobile_virtual_compat_toggle_bypasses_shims_for_path_spawn_and_records_runtime_error() {
+        let root = temp_workspace("mobile-virtual-compat-toggle");
+        let fixture = root.join("fixture-toggle");
+        fs::create_dir_all(&fixture).unwrap();
+
+        fs::write(
+            fixture.join("plugin.json"),
+            r#"{
+                "id": "virtual-toggle-demo",
+                "name": "Virtual Toggle Demo",
+                "main": "index.ts",
+                "permissions": {
+                    "network": ["127.0.0.1"],
+                    "process": ["ffmpeg", "yt-dlp", "nsh-missing-cli-99999"]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        fs::write(
+            fixture.join("index.ts"),
+            r#"
+            export async function getTrack(id: string) {
+                if (id === "caps") {
+                    const c = host.capabilities;
+                    return {
+                        id,
+                        name: `mobile=${c.isMobile}|mvc=${c.mobileVirtualCompat}|canSpawn=${c.canSpawnExternal}|ef=${c.embeddedFfmpeg}|ey=${c.embeddedYtdlp}|vp=${c.virtualProcesses.join(",")}`,
+                        duration: 1000
+                    };
+                }
+                if (id === "missing-cli") {
+                    host.spawn("nsh-missing-cli-99999", ["--version"], {
+                        env: { PATH: "/nonexistent-nsh-path-check" }
+                    });
+                    return { id, name: "unexpected", duration: 1000 };
+                }
+                const yt = host.spawn("yt-dlp", ["--version"], {
+                    env: { PATH: "/nonexistent-nsh-path-check" }
+                });
+                const line = await yt.readLine();
+                const code = await yt.wait();
+                return {
+                    id,
+                    name: `yt=${code}:${Boolean(line && line.includes("nsh-virtual-ytdlp"))}`,
+                    duration: 1000
+                };
+            }
+
+            export async function stream({ id, quality }: { id: string; quality: string }) {
+                const ff = host.spawn("ffmpeg", ["-version"], {
+                    env: { PATH: "/nonexistent-nsh-path-check" }
+                });
+                const code = await ff.wait();
+                if (code !== 0) {
+                    throw new Error(`ffmpeg exited with ${code}`);
+                }
+                return {
+                    url: `https://example.invalid/${id}.m4a`,
+                    type: "audio/mp4",
+                    quality
+                };
+            }
+            "#,
+        )
+        .unwrap();
+
+        let mgr = PluginManager::new(root.join("plugins"), root.join("data"))
+            .unwrap()
+            .with_mobile_override(true);
+        assert!(mgr.mobile_virtual_compat());
+
+        let src = mgr
+            .install_from_dir(&fixture)
+            .expect("install toggle demo plugin");
+        assert!(src.mobile_virtual_compat());
+
+        // 1. With mobile_virtual_compat = true (default): virtual shims succeed & runtime_error == None.
+        let caps_on = src.get_track("caps").expect("caps while enabled");
+        assert_eq!(
+            caps_on.name,
+            "mobile=true|mvc=true|canSpawn=false|ef=true|ey=true|vp=ffmpeg,yt-dlp"
+        );
+        let yt_on = src.get_track("yt").expect("virtual yt-dlp succeeds");
+        assert_eq!(yt_on.name, "yt=0:true");
+        let stream_on = src
+            .stream("1_8jBVA9a3U", Quality::High)
+            .expect("virtual ffmpeg stream succeeds");
+        assert_eq!(stream_on.url, "https://example.invalid/1_8jBVA9a3U.m4a");
+        assert_eq!(src.runtime_error(), None);
+        let summary_on = mgr
+            .plugins()
+            .into_iter()
+            .find(|p| p.id == "virtual-toggle-demo")
+            .expect("summary while enabled");
+        assert_eq!(summary_on.runtime_error, None);
+
+        // 2. Turn mobile_virtual_compat OFF: bypasses virtual shims & MobileSandboxError,
+        //    attempts real PATH spawn, fails with PATH error, and records error in PluginSummary.runtime_error.
+        mgr.set_mobile_virtual_compat(false);
+        assert!(!mgr.mobile_virtual_compat());
+        assert!(!src.mobile_virtual_compat());
+
+        let caps_off = src.get_track("caps").expect("caps after restart");
+        assert_eq!(
+            caps_off.name,
+            "mobile=true|mvc=false|canSpawn=true|ef=false|ey=false|vp="
+        );
+
+        let yt_err = src
+            .get_track("yt")
+            .expect_err("yt-dlp must bypass virtual shim and fail on empty PATH");
+        let yt_err_msg = yt_err.to_string();
+        assert!(
+            yt_err_msg.contains("failed to spawn `yt-dlp`"),
+            "expected PATH spawn failure for yt-dlp, got: {yt_err_msg}"
+        );
+        assert!(
+            !yt_err_msg.contains("MobileSandboxError"),
+            "must NOT return MobileSandboxError when mobile_virtual_compat=false: {yt_err_msg}"
+        );
+
+        let summary_after_yt = mgr
+            .plugins()
+            .into_iter()
+            .find(|p| p.id == "virtual-toggle-demo")
+            .expect("summary after yt-dlp failure");
+        assert!(
+            summary_after_yt
+                .runtime_error
+                .as_deref()
+                .is_some_and(|e| e.contains("failed to spawn `yt-dlp`")),
+            "expected runtime_error on PluginSummary, got: {:?}",
+            summary_after_yt.runtime_error
+        );
+
+        // Missing non-virtualized CLI also skips MobileSandboxError and fails via PATH.
+        let missing_err = src
+            .get_track("missing-cli")
+            .expect_err("missing CLI must fail via PATH");
+        let missing_msg = missing_err.to_string();
+        assert!(
+            missing_msg.contains("failed to spawn `nsh-missing-cli-99999`")
+                && !missing_msg.contains("MobileSandboxError"),
+            "unexpected missing-cli error: {missing_msg}"
+        );
+
+        // stream() with a YouTube-like ID must NOT fall back to VirtualYtdlpShim rescue when disabled.
+        src.clear_runtime_error();
+        let stream_err = src
+            .stream("1_8jBVA9a3U", Quality::High)
+            .expect_err("stream must bypass VirtualFfmpegShim and YouTube rescue when disabled");
+        let stream_msg = stream_err.to_string();
+        assert!(
+            stream_msg.contains("failed to spawn `ffmpeg`")
+                && !stream_msg.contains("MobileSandboxError"),
+            "unexpected stream error: {stream_msg}"
+        );
+        let summary_after_stream = mgr
+            .plugins()
+            .into_iter()
+            .find(|p| p.id == "virtual-toggle-demo")
+            .expect("summary after stream failure");
+        assert!(
+            summary_after_stream
+                .runtime_error
+                .as_deref()
+                .is_some_and(|e| e.contains("failed to spawn `ffmpeg`")),
+            "expected ffmpeg PATH failure in PluginSummary.runtime_error, got: {:?}",
+            summary_after_stream.runtime_error
+        );
+
+        // Explicit manager helpers record & clear runtime_error cleanly.
+        mgr.record_runtime_error("virtual-toggle-demo", "manual test error");
+        assert_eq!(src.runtime_error().as_deref(), Some("manual test error"));
+        mgr.clear_runtime_error("virtual-toggle-demo");
+        assert_eq!(src.runtime_error(), None);
+
+        // 3. Re-enabling mobile_virtual_compat restores virtual shims and clears any recorded error.
+        mgr.record_runtime_error("virtual-toggle-demo", "stale path error");
+        mgr.set_mobile_virtual_compat(true);
+        assert_eq!(src.runtime_error(), None);
+        let yt_back = src
+            .get_track("yt")
+            .expect("virtual yt-dlp works again once re-enabled");
+        assert_eq!(yt_back.name, "yt=0:true");
+        let summary_restored = mgr
+            .plugins()
+            .into_iter()
+            .find(|p| p.id == "virtual-toggle-demo")
+            .expect("summary after re-enabling");
+        assert_eq!(summary_restored.runtime_error, None);
+
+        mgr.shutdown_all();
         let _ = fs::remove_dir_all(&root);
     }
 }
