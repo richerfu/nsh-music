@@ -139,6 +139,9 @@ nsh-platform-linux.workspace = true
 [target.'cfg(target_os = "windows")'.dependencies]
 nsh-platform-windows.workspace = true
 
+[target.'cfg(target_env = "ohos")'.dependencies]
+nsh-platform-harmonyos = { path = "../nsh-platform-harmonyos.worktrees/upgrade-nsh-0.7", default-features = false }
+
 [dev-dependencies]
 nsh-engine.workspace = true
 nsh-testing = { workspace = true, features = ["live"] }

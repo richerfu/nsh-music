@@ -1,6 +1,7 @@
 //! Cross-platform native music player built on Native Shell (NSH).
 
 pub mod pages;
+pub mod platform;
 pub mod shell;
 pub mod state;
 pub mod ui;
