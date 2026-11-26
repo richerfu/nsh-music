@@ -17,8 +17,8 @@ use nsh_core::prelude::*;
 use nsh_music_core::model::SearchKind;
 
 use crate::pages::{
-    ARTWORK_SIZE_CARD, PagesOwner, card_grid, page_scroll, shimmer_card_grid, shimmer_track_list,
-    sized_artwork_url, virtual_track_list,
+    ARTWORK_SIZE_CARD, PagesOwner, card_grid, page_scroll, pagination_footer, shimmer_card_grid,
+    shimmer_track_list, sized_artwork_url, virtual_track_list,
 };
 use crate::state::{AppStore, Route};
 use crate::ui::theme::{colors, font_size, radius};
@@ -422,7 +422,7 @@ pub fn search_page(store: AppStore, form: DeviceForm) -> View {
                 };
             }
 
-            match tab_kind {
+            let results_view: AnyElement = match tab_kind {
                 SearchKind::Tracks => {
                     if results.tracks.is_empty() {
                         return empty_state(Icon::Search, store.t("search.no_results"), query)
@@ -599,7 +599,21 @@ pub fn search_page(store: AppStore, form: DeviceForm) -> View {
                         .collect();
                     card_grid(store, form, cards).into_element()
                 }
-            }
+            };
+
+            view()
+                .w_full()
+                .gap_3()
+                .child(results_view)
+                .child(pagination_footer(
+                    store,
+                    form,
+                    "search-load-more-btn",
+                    move || store.search_results.with(|r| r.more),
+                    move || store.search_loading_more.get(),
+                    move || store.load_more_search(),
+                ))
+                .into_element()
         })
     }));
 

@@ -10,8 +10,8 @@ use nsh_core::prelude::*;
 use nsh_music_core::model::Playlist;
 
 use crate::pages::{
-    ARTWORK_SIZE_CARD, PagesOwner, card_grid, page_scroll, shimmer_card_grid, shimmer_track_list,
-    shuffle_and_play, sized_artwork_url, virtual_track_list,
+    ARTWORK_SIZE_CARD, PagesOwner, card_grid, page_scroll, pagination_footer, shimmer_card_grid,
+    shimmer_track_list, shuffle_and_play, sized_artwork_url, virtual_track_list,
 };
 use crate::state::{ActiveModal, AppStore, Route};
 use crate::ui::theme::{colors, font_size, radius};
@@ -173,6 +173,14 @@ pub fn library_page(store: AppStore, form: DeviceForm) -> View {
                         None,
                     ))
                     .child(card_grid(store, form, cards))
+                    .child(pagination_footer(
+                        store,
+                        form,
+                        "saved-albums-load-more-btn",
+                        move || store.saved_albums_more.get(),
+                        move || store.saved_albums_loading_more.get(),
+                        move || store.load_more_saved_albums(),
+                    ))
                     .into_element()
             })
         }))
@@ -613,7 +621,24 @@ fn liked_tracks_block(store: AppStore, form: DeviceForm, preview_only: bool) -> 
                     tracks
                 };
                 let queue = Rc::new(shown);
-                virtual_track_list(store, form, queue, true, true, None, None).into_element()
+                let list = virtual_track_list(store, form, queue, true, true, None, None);
+                if preview_only {
+                    list.into_element()
+                } else {
+                    view()
+                        .w_full()
+                        .gap_3()
+                        .child(list)
+                        .child(pagination_footer(
+                            store,
+                            form,
+                            "liked-load-more-btn",
+                            move || store.liked_more.get(),
+                            move || store.liked_loading_more.get(),
+                            move || store.load_more_liked(),
+                        ))
+                        .into_element()
+                }
             })
         }))
 }
@@ -863,6 +888,14 @@ fn phone_library_page(store: AppStore, form: DeviceForm) -> View {
                     None,
                 ))
                 .child(card_grid(store, form, cards))
+                .child(pagination_footer(
+                    store,
+                    form,
+                    "saved-albums-load-more-btn",
+                    move || store.saved_albums_more.get(),
+                    move || store.saved_albums_loading_more.get(),
+                    move || store.load_more_saved_albums(),
+                ))
                 .into_element()
         })
     }));

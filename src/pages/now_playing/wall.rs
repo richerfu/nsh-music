@@ -406,50 +406,144 @@ fn wall_cover_grid(store: AppStore, form: DeviceForm) -> View {
                     )
             })
             .otherwise(move || {
-                scroll().flex_1().w_full().scrollbar(false).child(
-                    view()
-                        .w_full()
-                        .px(px(if is_phone { 20.0 } else { 48.0 }))
-                        .pt(px(if is_phone { 8.0 } else { 16.0 }))
-                        .pb_6()
-                        .gap(px(gap_pt))
-                        .items_center()
-                        .child(each(
-                            rows_memo,
-                            |(ri, _): &(usize, Vec<WallQueueEntry>)| *ri,
-                            move |row_sig, _| {
-                                let row_idx = row_sig.with_untracked(|(ri, _)| *ri);
-                                let sway_ref = if row_idx.is_multiple_of(2) {
-                                    &sway_even
-                                } else {
-                                    &sway_odd
-                                };
-                                let items_memo =
-                                    computed(move || row_sig.with(|(_, items)| items.clone()));
-
-                                view()
-                                    .flex_row()
-                                    .items_center()
-                                    .justify_center()
-                                    .gap(px(gap_pt))
-                                    .bind_translate_x(sway_ref)
-                                    .child(each(
-                                        items_memo,
-                                        |e: &WallQueueEntry| (e.queue_idx, e.id.clone()),
-                                        move |entry_sig, _| {
-                                            wall_tile_button(store, entry_sig, tile_pt)
-                                        },
-                                    ))
-                            },
-                        )),
+                virtual_list(
+                    move || rows_memo.with(Vec::len),
+                    move |at| {
+                        wall_row_cell(
+                            store, at, rows_memo, tile_pt, gap_pt, is_phone, sway_even, sway_odd,
+                        )
+                    },
                 )
+                .keys(move || {
+                    rows_memo.with(|rows| {
+                        rows.iter()
+                            .map(|(ri, _)| format!("wall-row-{ri}"))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .estimated_item_size(px(tile_pt + gap_pt))
+                .row_gap(px(gap_pt))
+                .content_padding_x(px(if is_phone { 20.0 } else { 48.0 }))
+                .content_padding_top(px(if is_phone { 8.0 } else { 16.0 }))
+                .content_padding_bottom(px(24.0))
+                .scrollbar(false)
+                .flex_1()
+                .w_full()
             }),
         )
 }
 
-fn wall_tile_button(store: AppStore, entry_sig: ReadSignal<WallQueueEntry>, tile_pt: f32) -> View {
+#[allow(clippy::too_many_arguments)]
+fn wall_row_cell(
+    store: AppStore,
+    at: Position,
+    rows_memo: Memo<Vec<(usize, Vec<WallQueueEntry>)>>,
+    tile_pt: f32,
+    gap_pt: f32,
+    is_phone: bool,
+    sway_even: AnimatedValue,
+    sway_odd: AnimatedValue,
+) -> View {
+    let items_memo = computed(move || {
+        rows_memo.with(|rows| {
+            rows.get(at.index())
+                .map(|(_, items)| items.clone())
+                .unwrap_or_default()
+        })
+    });
+    let sway_ref = if untracked(|| at.index()).is_multiple_of(2) {
+        &sway_even
+    } else {
+        &sway_odd
+    };
+
+    view()
+        .w_full()
+        .flex_row()
+        .items_center()
+        .justify_center()
+        .gap(px(gap_pt))
+        .bind_translate_x(sway_ref)
+        .child(each(
+            items_memo,
+            |e: &WallQueueEntry| (e.queue_idx, e.id.clone()),
+            move |entry_sig, _| wall_tile_button(store, entry_sig, tile_pt, is_phone),
+        ))
+}
+
+fn wall_tile_button(
+    store: AppStore,
+    entry_sig: ReadSignal<WallQueueEntry>,
+    tile_pt: f32,
+    is_phone: bool,
+) -> View {
     let queue_idx = entry_sig.with_untracked(|e| e.queue_idx);
     let is_playing_tile = computed(move || store.current_index.get() == Some(queue_idx));
+    let has_img = computed(move || entry_sig.with(|e| !e.cover_uri.is_empty()));
+
+    if is_phone {
+        // Mobile fast-path: skip desktop hover signals/overlays, per-tile spring animations,
+        // and per-tile Elevation::Card shadows so scrolling 100+ covers is instant.
+        return view().child(
+            button()
+                .selected(is_playing_tile)
+                .accessibility_label(move || Some(entry_sig.with(|e| e.name.clone())))
+                .on_press(move || {
+                    if !is_playing_tile.get_untracked() {
+                        store.play_from_queue(queue_idx);
+                    }
+                })
+                .relative()
+                .size(px(tile_pt))
+                .flex_shrink_0()
+                .rounded(px(12.0))
+                .overflow_hidden()
+                .border_1()
+                .border_color(move || theme::np_fg().opacity(0.10))
+                .bg_linear_to_br()
+                .gradient_from(move || {
+                    let (a, _) = entry_sig.with(|e| theme::fallback_cover_gradient(&e.seed));
+                    AdaptiveColor::from(a)
+                })
+                .gradient_to(move || {
+                    let (_, b) = entry_sig.with(|e| theme::fallback_cover_gradient(&e.seed));
+                    AdaptiveColor::from(b)
+                })
+                .items_center()
+                .justify_center()
+                .active(|s| s.scale(motion::press_scale))
+                .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
+                .child(when(
+                    move || !has_img.get(),
+                    move || {
+                        icon(
+                            Icon::Disc,
+                            (tile_pt * 0.30).clamp(24.0, 42.0),
+                            colors::NP_FG,
+                        )
+                        .opacity(0.40)
+                    },
+                ))
+                .child(when(has_img, move || {
+                    image(move || entry_sig.with(|e| e.cover_uri.clone()))
+                        .object_fit(ResizeMode::Cover)
+                        .absolute()
+                        .inset_0()
+                        .size_full()
+                }))
+                // Crisp 2pt white ring on the active playing track (`ui_wall.go:3687-3689`)
+                .child(when(is_playing_tile, || {
+                    view()
+                        .absolute()
+                        .inset_0()
+                        .rounded(px(12.0))
+                        .border_2()
+                        .border_color(move || theme::np_fg().opacity(0.90))
+                        .pointer_events(PointerEvents::None)
+                })),
+        );
+    }
+
     let hovered = signal(false);
 
     let tile_scale = animated_value(if untracked(|| is_playing_tile.get()) && !reduce_motion() {
@@ -480,8 +574,6 @@ fn wall_tile_button(store: AppStore, entry_sig: ReadSignal<WallQueueEntry>, tile
             motion::animate_spring(&tile_scale, target, motion::spring_snappy());
         }
     });
-
-    let has_img = move || entry_sig.with(|e| !e.cover_uri.is_empty());
 
     view().child(
         Elevated::elevation(
@@ -517,7 +609,7 @@ fn wall_tile_button(store: AppStore, entry_sig: ReadSignal<WallQueueEntry>, tile
             Elevation::Card,
         )
         .child(when(
-            move || !has_img(),
+            move || !has_img.get(),
             move || {
                 icon(
                     Icon::Disc,

@@ -511,7 +511,17 @@ fn pad_floating_player_dock(store: AppStore, has_left_rail: bool) -> View {
             0.0_f32
         } else {
             let raw = (store.position_ms.get() as f32 / dur as f32).clamp(0.0, 1.0);
-            (raw * 400.0).round() / 400.0
+            (raw * 1000.0).round() / 1000.0
+        }
+    });
+
+    let buffered_ratio = computed(move || {
+        let dur = store.duration_ms.get();
+        if dur == 0 {
+            0.0_f32
+        } else {
+            let raw = (store.buffered_ms.get() as f32 / dur as f32).clamp(0.0, 1.0);
+            (raw * 200.0).round() / 200.0
         }
     });
 
@@ -535,10 +545,13 @@ fn pad_floating_player_dock(store: AppStore, has_left_rail: bool) -> View {
                     .w_full()
                     .h(px(PAD_DOCK_HEIGHT))
                     .rounded(px(radius::XL))
-                    .bg(theme::card_elevated)
+                    .overflow_hidden()
+                    .bg(move || theme::mini_player_surface(store.current_accent.get()))
+                    .backdrop_blur(px(20.0))
                     .border_1()
-                    .border_color(theme::border)
-                    .overflow_hidden(),
+                    .border_color(move || theme::mini_player_border(store.current_accent.get()))
+                    .transition_colors()
+                    .duration(move || motion::transition_ms(220.0)),
                 Elevation::Floating,
             )
             .child(
@@ -565,17 +578,36 @@ fn pad_floating_player_dock(store: AppStore, has_left_rail: bool) -> View {
                             .rounded(px(radius::CONTROL))
                             .active(|s| s.opacity(0.8))
                             .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
-                            .child(dynamic(move || {
-                                let seed = track_seed.get();
-                                untracked(move || {
-                                    artwork_box(
-                                        store.current_artwork_uri,
-                                        seed,
-                                        48.0,
-                                        radius::CONTROL,
-                                    )
-                                })
-                            }))
+                            .child(
+                                Elevated::elevation(
+                                    view()
+                                        .size(px(48.0))
+                                        .rounded(px(radius::CONTROL))
+                                        .overflow_hidden()
+                                        .flex_shrink_0(),
+                                    Elevation::Subtle,
+                                )
+                                .child(dynamic(move || {
+                                    let seed = track_seed.get();
+                                    untracked(move || {
+                                        artwork_box(
+                                            store.current_artwork_uri,
+                                            seed,
+                                            48.0,
+                                            radius::CONTROL,
+                                        )
+                                    })
+                                }))
+                                .child(
+                                    view()
+                                        .absolute()
+                                        .inset_0()
+                                        .rounded(px(radius::CONTROL))
+                                        .border_1()
+                                        .border_color(theme::glass_rim)
+                                        .pointer_events(PointerEvents::None),
+                                ),
+                            )
                             .child(
                                 view()
                                     .flex_1()
@@ -699,14 +731,30 @@ fn pad_floating_player_dock(store: AppStore, has_left_rail: bool) -> View {
                             ),
                     ),
             )
-            // Bottom progress hairline.
+            // Full-bleed bottom progress hairline with buffered + artwork-accent fills.
             .child(
-                view().w_full().h(px(2.5)).bg(theme::track_rail).child(
-                    view()
-                        .h_full()
-                        .w(move || relative(progress_ratio.get()))
-                        .bg(theme::primary),
-                ),
+                view()
+                    .w_full()
+                    .h(px(2.5))
+                    .bg(move || theme::track_rail().opacity(0.65))
+                    .child(
+                        view()
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .left_0()
+                            .w(move || relative(buffered_ratio.get()))
+                            .bg(move || theme::track_buffered().opacity(0.55)),
+                    )
+                    .child(
+                        view()
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .left_0()
+                            .w(move || relative(progress_ratio.get()))
+                            .bg(move || theme::mini_player_accent(store.current_accent.get())),
+                    ),
             ),
         )
 }

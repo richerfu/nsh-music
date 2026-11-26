@@ -22,7 +22,7 @@ use crate::{
         icons::{Icon, icon, icon_reactive},
         loading_spinner, motion,
         scrubber::scrubber,
-        styled_menu,
+        styled_lazy_menu,
         theme::{self, DeviceForm, Elevated, Elevation, colors},
         track_row::format_duration_ms,
     },
@@ -37,6 +37,14 @@ enum PhoneSection {
     Lyrics,
     Stage,
     More,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PhoneMoreSubpanel {
+    Queue,
+    Wall,
+    Comments,
+    Podcast,
 }
 
 /// Renders the full-window / full-screen Now Playing overlay stage.
@@ -485,6 +493,20 @@ fn phone_sheet_stage(store: AppStore, form: DeviceForm) -> View {
             .current_track
             .with(|t| t.as_ref().is_some_and(Track::is_episode))
     });
+    let more_subpanel = computed(move || match panels::effective_panel(store) {
+        NowPlayingPanel::Wall => PhoneMoreSubpanel::Wall,
+        NowPlayingPanel::Comments => PhoneMoreSubpanel::Comments,
+        NowPlayingPanel::Podcast => PhoneMoreSubpanel::Podcast,
+        NowPlayingPanel::Queue | NowPlayingPanel::Lyrics | NowPlayingPanel::Stage => {
+            PhoneMoreSubpanel::Queue
+        }
+    });
+    let is_art = computed(move || section.get() == PhoneSection::Art);
+    let show_bottom_scrubber = computed(move || {
+        let sec = section.get();
+        sec != PhoneSection::Stage
+            && !(sec == PhoneSection::More && more_subpanel.get() == PhoneMoreSubpanel::Wall)
+    });
     let cover_size_memo = computed(move || {
         let raw = phone_cover_size();
         (raw / 4.0).round() * 4.0
@@ -614,20 +636,18 @@ fn phone_sheet_stage(store: AppStore, form: DeviceForm) -> View {
                             .gap_1p5()
                             .child(phone_more_subtabs(store))
                             .child(dynamic(move || {
-                                let panel = panels::effective_panel(store);
-                                untracked(|| match panel {
-                                    NowPlayingPanel::Wall => {
+                                let sub = more_subpanel.get();
+                                untracked(|| match sub {
+                                    PhoneMoreSubpanel::Wall => {
                                         wall::wall_panel(store, form).key("np-phone-wall")
                                     }
-                                    NowPlayingPanel::Comments => {
+                                    PhoneMoreSubpanel::Comments => {
                                         panels::comments_panel(store, form).key("np-phone-comments")
                                     }
-                                    NowPlayingPanel::Podcast => {
+                                    PhoneMoreSubpanel::Podcast => {
                                         panels::podcast_panel(store, form).key("np-phone-podcast")
                                     }
-                                    NowPlayingPanel::Queue
-                                    | NowPlayingPanel::Lyrics
-                                    | NowPlayingPanel::Stage => {
+                                    PhoneMoreSubpanel::Queue => {
                                         panels::queue_panel(store, form).key("np-phone-queue")
                                     }
                                 })
@@ -635,31 +655,44 @@ fn phone_sheet_stage(store: AppStore, form: DeviceForm) -> View {
                     })
                 })),
         )
-        // Cover view bottom thumb-zone dock: expressive track info + scrubber/badge + 64pt Play transport
-        .child(when(
-            move || section.get() == PhoneSection::Art,
-            move || phone_cover_bottom_dock(store),
-        ))
-        // Non-Cover tabs without their own bottom bar (`Lyrics`, `Queue`, `Comments`, `Podcast`):
-        // sleek thumb-zone scrubber + elapsed/quality/remaining row (quick pause sits in top mini bar)
-        .child(when(
-            move || {
-                let sec = section.get();
-                sec != PhoneSection::Art
-                    && sec != PhoneSection::Stage
-                    && !(sec == PhoneSection::More
-                        && panels::effective_panel(store) == NowPlayingPanel::Wall)
-            },
-            move || phone_compact_scrubber_dock(store),
-        ))
+        // Single persistent bottom dock & scrubber so the scrubber + 30fps smoke canvas are
+        // never torn down/recreated when switching between Cover / Lyrics / More tabs.
+        .child(when(show_bottom_scrubber, move || {
+            view()
+                .w_full()
+                .px(px(20.0))
+                .pt_1()
+                .gap(move || if is_art.get() { px(12.0) } else { px(2.0) })
+                .child(when(is_art, move || phone_cover_track_header(store)))
+                .child(
+                    view()
+                        .w_full()
+                        .gap_0p5()
+                        .child(stage_scrubber_bar(store, false))
+                        .child(phone_scrubber_meta_row(store)),
+                )
+                .child(when(is_art, move || phone_thumb_transport(store, 64.0)))
+        }))
 }
 
 fn phone_section_switcher(store: AppStore, section: Signal<PhoneSection>) -> View {
-    let items: &[(PhoneSection, &str)] = &[
-        (PhoneSection::Art, "now_playing.mode.cover"),
-        (PhoneSection::Lyrics, "now_playing.panel.lyrics"),
-        (PhoneSection::Stage, "now_playing.panel.stage"),
-        (PhoneSection::More, "common.more"),
+    let items: &[(PhoneSection, &str, &str)] = &[
+        (
+            PhoneSection::Art,
+            "now_playing.mode.cover",
+            "np-phone-tab-cover",
+        ),
+        (
+            PhoneSection::Lyrics,
+            "now_playing.panel.lyrics",
+            "np-phone-tab-lyrics",
+        ),
+        (
+            PhoneSection::Stage,
+            "now_playing.panel.stage",
+            "np-phone-tab-stage",
+        ),
+        (PhoneSection::More, "common.more", "np-phone-tab-more"),
     ];
 
     view()
@@ -681,30 +714,33 @@ fn phone_section_switcher(store: AppStore, section: Signal<PhoneSection>) -> Vie
                 .border_color(move || theme::np_fg().opacity(0.08))
                 .pointer_events(PointerEvents::None),
         )
-        .children(items.iter().copied().map(move |(sec, key)| {
+        .children(items.iter().copied().map(move |(sec, key, tid)| {
             let active = move || section.get() == sec;
             button()
+                .test_id(tid)
                 .selected(active)
                 .accessibility_label(move || Some(store.t(key)))
                 .on_press(move || {
-                    section.set(sec);
-                    match sec {
-                        PhoneSection::Lyrics => {
-                            store.set_now_playing_panel(NowPlayingPanel::Lyrics);
-                        }
-                        PhoneSection::Stage => {
-                            store.set_now_playing_panel(NowPlayingPanel::Stage);
-                        }
-                        PhoneSection::More => {
-                            if matches!(
-                                store.now_playing_panel.get_untracked(),
-                                NowPlayingPanel::Lyrics | NowPlayingPanel::Stage
-                            ) {
-                                store.set_now_playing_panel(NowPlayingPanel::Queue);
+                    batch(|| {
+                        match sec {
+                            PhoneSection::Lyrics => {
+                                store.set_now_playing_panel(NowPlayingPanel::Lyrics);
                             }
+                            PhoneSection::Stage => {
+                                store.set_now_playing_panel(NowPlayingPanel::Stage);
+                            }
+                            PhoneSection::More => {
+                                if matches!(
+                                    store.now_playing_panel.get_untracked(),
+                                    NowPlayingPanel::Lyrics | NowPlayingPanel::Stage
+                                ) {
+                                    store.set_now_playing_panel(NowPlayingPanel::Queue);
+                                }
+                            }
+                            PhoneSection::Art => {}
                         }
-                        PhoneSection::Art => {}
-                    }
+                        section.set(sec);
+                    });
                 })
                 .min_w(px(44.0))
                 .min_h(px(44.0))
@@ -905,75 +941,44 @@ fn phone_mini_track_bar(store: AppStore, section: Signal<PhoneSection>) -> View 
     )
 }
 
-/// Phone Cover view bottom dock: expressive 20pt title + 15pt clickable artist + Like & `···`,
-/// tactile scrubber + elapsed/lossless-or-quality/remaining row, and generously spaced
-/// thumb-zone transport with prominent 64pt Play/Pause circle.
-fn phone_cover_bottom_dock(store: AppStore) -> View {
+/// Phone Cover view track header: expressive 20pt bold title + 15pt clickable artist + Like & `···`.
+fn phone_cover_track_header(store: AppStore) -> View {
     view()
         .w_full()
-        .px(px(20.0))
-        .pt_1()
-        .gap_3()
-        // Expressive track title (20pt Bold) + clickable artist subtitle (15pt ~68%) + Like & `···`
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap_2()
         .child(
             view()
-                .w_full()
+                .flex_1()
+                .min_w(px(0.0))
+                .gap_1()
+                .child(
+                    text(move || {
+                        store.current_track.with(|t| {
+                            t.as_ref()
+                                .map(|tr| SharedString::from(tr.name.clone()))
+                                .unwrap_or_else(|| store.t("player.idle_title"))
+                        })
+                    })
+                    .number_of_lines(1)
+                    .text_size(px(20.0))
+                    .font_weight(FontWeight::BOLD)
+                    .letter_spacing(px(-0.35))
+                    .text_color(theme::np_fg),
+                )
+                .child(clickable_artist_links(store, 15.0, 0.68)),
+        )
+        .child(
+            view()
                 .flex_row()
                 .items_center()
-                .justify_between()
-                .gap_2()
-                .child(
-                    view()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .gap_1()
-                        .child(
-                            text(move || {
-                                store.current_track.with(|t| {
-                                    t.as_ref()
-                                        .map(|tr| SharedString::from(tr.name.clone()))
-                                        .unwrap_or_else(|| store.t("player.idle_title"))
-                                })
-                            })
-                            .number_of_lines(1)
-                            .text_size(px(20.0))
-                            .font_weight(FontWeight::BOLD)
-                            .letter_spacing(px(-0.35))
-                            .text_color(theme::np_fg),
-                        )
-                        .child(clickable_artist_links(store, 15.0, 0.68)),
-                )
-                .child(
-                    view()
-                        .flex_row()
-                        .items_center()
-                        .flex_shrink_0()
-                        .gap_0p5()
-                        .child(stage_like_button(store, 22.0, true))
-                        .child(song_more_menu(store, 21.0, true)),
-                ),
-        )
-        // Tactile scrubber + elapsed / Lossless-or-quality badge / remaining
-        .child(
-            view()
-                .w_full()
+                .flex_shrink_0()
                 .gap_0p5()
-                .child(stage_scrubber_bar(store, false))
-                .child(phone_scrubber_meta_row(store)),
+                .child(stage_like_button(store, 22.0, true))
+                .child(song_more_menu(store, 21.0, true)),
         )
-        // Generously spaced thumb-zone transport with prominent 64pt Play/Pause circle
-        .child(phone_thumb_transport(store, 64.0))
-}
-
-/// Compact bottom scrubber dock for non-Cover Phone tabs (`Lyrics`, `Queue`, `Comments`, `Podcast`).
-fn phone_compact_scrubber_dock(store: AppStore) -> View {
-    view()
-        .w_full()
-        .px(px(20.0))
-        .pt_1()
-        .gap_0p5()
-        .child(stage_scrubber_bar(store, false))
-        .child(phone_scrubber_meta_row(store))
 }
 
 /// Phone scrubber meta row: elapsed · centered gold `Lossless` OR crisp quality badge · remaining/Buffering.
@@ -986,13 +991,19 @@ pub(crate) fn phone_scrubber_meta_row(store: AppStore) -> View {
         .flex_row()
         .items_center()
         .justify_between()
-        // Left: elapsed time
+        // Left: elapsed time (follows live scrubber drag preview when scrubbing)
         .child(
-            text(move || format_duration_ms(store.position_ms.get() as i64))
-                .tabular_nums()
-                .text_size(px(11.5))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(move || theme::np_fg().opacity(0.56)),
+            text(move || {
+                let pos = store
+                    .scrubber_preview_ms
+                    .get()
+                    .unwrap_or_else(|| store.position_ms.get());
+                format_duration_ms(pos as i64)
+            })
+            .tabular_nums()
+            .text_size(px(11.5))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(move || theme::np_fg().opacity(0.56)),
         )
         // Center: gold `Lossless` badge when stream is lossless, else subtle quality badge (`High`/`Standard`)
         .child(when(has_track, move || {
@@ -1047,7 +1058,11 @@ pub(crate) fn phone_scrubber_meta_row(store: AppStore) -> View {
             .otherwise(move || {
                 text(move || {
                     let dur = store.duration_ms.get();
-                    let pos = store.position_ms.get().min(dur);
+                    let pos = store
+                        .scrubber_preview_ms
+                        .get()
+                        .unwrap_or_else(|| store.position_ms.get())
+                        .min(dur);
                     let rem = dur.saturating_sub(pos);
                     format!("-{}", format_duration_ms(rem as i64))
                 })
@@ -1239,17 +1254,30 @@ fn phone_more_subtabs(store: AppStore) -> View {
             store,
             NowPlayingPanel::Queue,
             "now_playing.panel.queue",
+            "np-more-tab-queue",
         ))
         .child(when(
             move || !is_episode.get(),
-            move || phone_subtab_pill(store, NowPlayingPanel::Wall, "now_playing.panel.wall"),
+            move || {
+                phone_subtab_pill(
+                    store,
+                    NowPlayingPanel::Wall,
+                    "now_playing.panel.wall",
+                    "np-more-tab-wall",
+                )
+            },
         ))
         .child(when(
             move || store.active_can("comments"),
             move || phone_comments_subtab_pill(store),
         ))
         .child(when(is_episode, move || {
-            phone_subtab_pill(store, NowPlayingPanel::Podcast, "now_playing.panel.podcast")
+            phone_subtab_pill(
+                store,
+                NowPlayingPanel::Podcast,
+                "now_playing.panel.podcast",
+                "np-more-tab-podcast",
+            )
         }))
 }
 
@@ -1257,6 +1285,7 @@ fn phone_subtab_pill(
     store: AppStore,
     panel: NowPlayingPanel,
     key: &'static str,
+    tid: &'static str,
 ) -> impl IntoElement {
     let active = move || {
         let cur = panels::effective_panel(store);
@@ -1270,6 +1299,7 @@ fn phone_subtab_pill(
         }
     };
     button()
+        .test_id(tid)
         .selected(active)
         .accessibility_label(move || Some(store.t(key)))
         .on_press(move || store.set_now_playing_panel(panel))
@@ -1324,6 +1354,7 @@ fn phone_subtab_pill(
 fn phone_comments_subtab_pill(store: AppStore) -> impl IntoElement {
     let active = move || panels::effective_panel(store) == NowPlayingPanel::Comments;
     button()
+        .test_id("np-more-tab-comments")
         .selected(active)
         .accessibility_label(move || Some(store.t("now_playing.panel.comments")))
         .on_press(move || store.set_now_playing_panel(NowPlayingPanel::Comments))
@@ -1719,126 +1750,130 @@ pub(crate) fn clickable_artist_links(store: AppStore, size_pt: f32, muted_alpha:
     }))
 }
 
+fn build_song_more_actions(store: AppStore) -> Vec<ContextMenuAction> {
+    let Some(tr) = store.current_track.get_untracked() else {
+        return Vec::new();
+    };
+
+    let mut actions = vec![
+        ContextMenuAction::new(store.t("player.play_next"), {
+            let t = tr.clone();
+            move || store.enqueue_next(t.clone())
+        })
+        .icon(Icon::Queue),
+        ContextMenuAction::new(store.t("player.add_to_queue"), {
+            let t = tr.clone();
+            move || store.enqueue(t.clone())
+        })
+        .icon(Icon::Plus),
+    ];
+
+    // Navigation links (close Now Playing cleanly before navigating)
+    let mut first_nav = true;
+    if !tr.show_id.is_empty() && store.active_can("show") {
+        let sid = tr.show_id.clone();
+        let mut act = ContextMenuAction::new(store.t("track.go_to_podcast"), move || {
+            store.close_now_playing();
+            store.navigate(Route::ShowDetail { id: sid.clone() });
+        })
+        .icon(Icon::Podcast);
+        if first_nav {
+            act = act.separator_before();
+            first_nav = false;
+        }
+        actions.push(act);
+    }
+    if let Some(ar) = tr.artists.first()
+        && !ar.id.is_empty()
+        && store.active_can("artist")
+    {
+        let aid = ar.id.clone();
+        let mut act = ContextMenuAction::new(store.t("now_playing.go_to_artist"), move || {
+            store.close_now_playing();
+            store.navigate(Route::ArtistDetail { id: aid.clone() });
+        })
+        .icon(Icon::User);
+        if first_nav {
+            act = act.separator_before();
+            first_nav = false;
+        }
+        actions.push(act);
+    }
+    if !tr.album.id.is_empty() && store.active_can("album") {
+        let aid = tr.album.id.clone();
+        let mut act = ContextMenuAction::new(store.t("now_playing.go_to_album"), move || {
+            store.close_now_playing();
+            store.navigate(Route::AlbumDetail { id: aid.clone() });
+        })
+        .icon(Icon::Disc);
+        if first_nav {
+            act = act.separator_before();
+        }
+        actions.push(act);
+    }
+
+    // Copy & Download actions
+    actions.push(
+        ContextMenuAction::new(store.t("track.copy_title"), {
+            let t = tr.clone();
+            move || store.copy_track_title(&t)
+        })
+        .separator_before(),
+    );
+    actions.push(ContextMenuAction::new(
+        store.t("track.copy_title_artists"),
+        {
+            let t = tr.clone();
+            move || store.copy_track_title_and_artists(&t)
+        },
+    ));
+    if !tr.url.is_empty() {
+        actions.push(
+            ContextMenuAction::new(store.t("track.copy_link"), {
+                let t = tr.clone();
+                move || store.copy_track_link(&t)
+            })
+            .icon(Icon::External),
+        );
+    }
+    if store.can_download_track(&tr) {
+        actions.push(
+            ContextMenuAction::new(store.t("track.download"), {
+                let t = tr.clone();
+                move || store.download_track(t.clone())
+            })
+            .icon(Icon::Download),
+        );
+    }
+
+    actions
+}
+
 /// `···` song action menu (`Play Next`, `Add to Queue`, `Go to Artist`, `Go to Album`,
 /// `Copy Title`, `Download`) matching `mygo-music` `songMenu`.
+/// Actions are built lazily only when opened via [`styled_lazy_menu`], with a flat
+/// non-nested trigger view.
 pub(crate) fn song_more_menu(store: AppStore, glyph_size: f32, touch: bool) -> View {
     let target = if touch { 44.0 } else { 32.0 };
+    let has_track = computed(move || store.current_track.with(Option::is_some));
 
-    view().flex_shrink_0().child(dynamic(move || {
-        let track_opt = store.current_track.get();
-        let _loc = store.locale.get();
-
-        let Some(tr) = track_opt else {
-            return view();
-        };
-
-        let mut actions = vec![
-            ContextMenuAction::new(store.t("player.play_next"), {
-                let t = tr.clone();
-                move || store.enqueue_next(t.clone())
-            })
-            .icon(Icon::Queue),
-            ContextMenuAction::new(store.t("player.add_to_queue"), {
-                let t = tr.clone();
-                move || store.enqueue(t.clone())
-            })
-            .icon(Icon::Plus),
-        ];
-
-        // Navigation links (close Now Playing cleanly before navigating)
-        let mut first_nav = true;
-        if !tr.show_id.is_empty() && store.active_can("show") {
-            let sid = tr.show_id.clone();
-            let mut act = ContextMenuAction::new(store.t("track.go_to_podcast"), move || {
-                store.close_now_playing();
-                store.navigate(Route::ShowDetail { id: sid.clone() });
-            })
-            .icon(Icon::Podcast);
-            if first_nav {
-                act = act.separator_before();
-                first_nav = false;
-            }
-            actions.push(act);
-        }
-        if let Some(ar) = tr.artists.first()
-            && !ar.id.is_empty()
-            && store.active_can("artist")
-        {
-            let aid = ar.id.clone();
-            let mut act = ContextMenuAction::new(store.t("now_playing.go_to_artist"), move || {
-                store.close_now_playing();
-                store.navigate(Route::ArtistDetail { id: aid.clone() });
-            })
-            .icon(Icon::User);
-            if first_nav {
-                act = act.separator_before();
-                first_nav = false;
-            }
-            actions.push(act);
-        }
-        if !tr.album.id.is_empty() && store.active_can("album") {
-            let aid = tr.album.id.clone();
-            let mut act = ContextMenuAction::new(store.t("now_playing.go_to_album"), move || {
-                store.close_now_playing();
-                store.navigate(Route::AlbumDetail { id: aid.clone() });
-            })
-            .icon(Icon::Disc);
-            if first_nav {
-                act = act.separator_before();
-            }
-            actions.push(act);
-        }
-
-        // Copy & Download actions
-        actions.push(
-            ContextMenuAction::new(store.t("track.copy_title"), {
-                let t = tr.clone();
-                move || store.copy_track_title(&t)
-            })
-            .separator_before(),
-        );
-        actions.push(ContextMenuAction::new(
-            store.t("track.copy_title_artists"),
-            {
-                let t = tr.clone();
-                move || store.copy_track_title_and_artists(&t)
-            },
-        ));
-        if !tr.url.is_empty() {
-            actions.push(
-                ContextMenuAction::new(store.t("track.copy_link"), {
-                    let t = tr.clone();
-                    move || store.copy_track_link(&t)
-                })
-                .icon(Icon::External),
-            );
-        }
-        if store.can_download_track(&tr) {
-            actions.push(
-                ContextMenuAction::new(store.t("track.download"), {
-                    let t = tr.clone();
-                    move || store.download_track(t.clone())
-                })
-                .icon(Icon::Download),
-            );
-        }
-
-        let trigger = button()
-            .accessibility_label(move || Some(store.t("common.more")))
+    view().flex_shrink_0().child(when(has_track, move || {
+        let trigger = view()
+            .test_id("np-song-more-btn")
+            .role(AccessibilityRole::Button)
+            .label(move || store.t("common.more"))
             .min_w(px(target))
             .min_h(px(target))
             .items_center()
             .justify_center()
             .rounded_full()
             .bg(colors::TRANSPARENT)
-            .transition_colors()
-            .duration(move || motion::transition_ms(120.0))
             .hover(|s| s.bg(move || theme::np_fg().opacity(0.10)))
             .active(|s| s.scale(motion::press_scale))
             .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
             .child(icon(Icon::MoreHorizontal, glyph_size, colors::NP_FG).opacity(0.70));
 
-        view().child(styled_menu(trigger, actions))
+        styled_lazy_menu(trigger, move || build_song_more_actions(store))
     }))
 }
 
@@ -1897,6 +1932,7 @@ pub(crate) fn stage_scrubber_bar(store: AppStore, show_labels: bool) -> impl Int
         .accent(move || store.current_accent.get())
         .show_labels(show_labels)
         .on_dark_stage(true)
+        .on_preview(move |ms| store.scrubber_preview_ms.set(ms))
         .on_seek(move |ms| store.seek(ms))
 }
 
@@ -1910,12 +1946,18 @@ fn scrubber_meta_row(store: AppStore) -> View {
         .flex_row()
         .items_center()
         .justify_between()
-        // Left: elapsed time
+        // Left: elapsed time (follows live scrubber drag preview when scrubbing)
         .child(
-            text(move || format_duration_ms(store.position_ms.get() as i64))
-                .tabular_nums()
-                .text_size(px(11.0))
-                .text_color(move || theme::np_fg().opacity(0.50)),
+            text(move || {
+                let pos = store
+                    .scrubber_preview_ms
+                    .get()
+                    .unwrap_or_else(|| store.position_ms.get());
+                format_duration_ms(pos as i64)
+            })
+            .tabular_nums()
+            .text_size(px(11.0))
+            .text_color(move || theme::np_fg().opacity(0.50)),
         )
         // Center: gold `Lossless` badge (`ui_nowplaying.go:1501-1507`)
         .child(when(
@@ -1945,7 +1987,11 @@ fn scrubber_meta_row(store: AppStore) -> View {
             .otherwise(move || {
                 text(move || {
                     let dur = store.duration_ms.get();
-                    let pos = store.position_ms.get().min(dur);
+                    let pos = store
+                        .scrubber_preview_ms
+                        .get()
+                        .unwrap_or_else(|| store.position_ms.get())
+                        .min(dur);
                     let rem = dur.saturating_sub(pos);
                     format!("-{}", format_duration_ms(rem as i64))
                 })

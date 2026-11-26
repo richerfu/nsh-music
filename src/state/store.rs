@@ -6,13 +6,13 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nsh_core::file_dialog::{FileFilter, OpenDialog, SaveDialog};
 use nsh_core::prelude::*;
 use nsh_music_audio::{
     AudioBackendCapabilities, AudioEngine, AudioEngineConfig, PlaybackSnapshot, PlaybackStatus,
-    SPECTRUM_BANDS, audio_backend_capabilities,
+    RemoteCommand, RemoteLoopMode, SPECTRUM_BANDS, audio_backend_capabilities,
 };
 use nsh_music_core::{
     i18n::{I18n, Locale},
@@ -360,6 +360,7 @@ pub struct AppStore {
     pub queue: Signal<Vec<Track>>,
     pub current_index: Signal<Option<usize>>,
     pub position_ms: Signal<u64>,
+    pub scrubber_preview_ms: Signal<Option<u64>>,
     pub duration_ms: Signal<u64>,
     pub buffered_ms: Signal<u64>,
     pub volume: Signal<f32>,
@@ -383,6 +384,8 @@ pub struct AppStore {
     pub comments: Signal<Vec<Comment>>,
     pub comments_total: Signal<usize>,
     pub comments_loading: Signal<bool>,
+    pub comments_more: Signal<bool>,
+    pub comments_loading_more: Signal<bool>,
 
     // Now Playing overlay
     pub now_playing_open: Signal<bool>,
@@ -396,6 +399,7 @@ pub struct AppStore {
     pub search_tab: Signal<SearchKind>,
     pub search_results: Signal<SearchResult>,
     pub search_loading: Signal<bool>,
+    pub search_loading_more: Signal<bool>,
     pub recent_searches: Signal<Vec<String>>,
     pub search_suggestions: Signal<Vec<String>>,
     pub search_suggest_open: Signal<bool>,
@@ -410,11 +414,16 @@ pub struct AppStore {
     pub active_artist: Signal<Option<ArtistPage>>,
     pub liked_tracks: Signal<Vec<Track>>,
     pub liked_ids: Signal<HashSet<String>>,
+    pub liked_more: Signal<bool>,
+    pub liked_loading_more: Signal<bool>,
     pub recent_tracks: Signal<Vec<Track>>,
     pub saved_albums: Signal<Vec<Album>>,
+    pub saved_albums_more: Signal<bool>,
+    pub saved_albums_loading_more: Signal<bool>,
     pub stations: Signal<Vec<Station>>,
     pub podcasts: Signal<Vec<Show>>,
     pub active_show: Signal<Option<ShowPage>>,
+    pub show_episodes_loading_more: Signal<bool>,
 
     // Settings, locale, theme, modals, toasts
     pub settings: Signal<AppSettings>,
@@ -437,6 +446,7 @@ pub struct AppStore {
     last_track_id: Stored<Option<String>>,
     last_played_reported_id: Stored<Option<String>>,
     last_snapshot: Stored<Option<PlaybackSnapshot>>,
+    pending_seek: Stored<Option<(u64, Instant)>>,
     active_station_id: Stored<Option<String>>,
     pending_sign_in_prompt: Stored<PendingSignInSlot>,
     has_sign_in_prompt: Stored<Arc<AtomicBool>>,
@@ -445,6 +455,7 @@ pub struct AppStore {
     active_web_sign_in: Stored<ActiveWebSignInSlot>,
     pending_open_urls: Stored<PendingOpenUrlsSlot>,
     has_open_url_request: Stored<Arc<AtomicBool>>,
+    pending_remote_toggle_favorite: Stored<Arc<AtomicBool>>,
     signing_in_source_id: Stored<Option<String>>,
     search_suggest_gen: Stored<u64>,
     browse_cache: Stored<HashMap<(String, String), Browse>>,
@@ -629,6 +640,7 @@ impl AppStore {
                 }
             })));
         }
+        plugin_mgr.set_mobile_virtual_compat(settings.mobile_virtual_compat);
         let _ = plugin_mgr.load_all();
 
         let mut audio_cfg = AudioEngineConfig {
@@ -670,6 +682,22 @@ impl AppStore {
                     )))
                 }
             })));
+        }
+
+        let pending_remote_toggle_favorite = Arc::new(AtomicBool::new(false));
+        {
+            let remote = audio.remote_controller();
+            crate::platform::install_platform_remote(remote);
+            remote.update_loop_mode(RemoteLoopMode::from_repeat_shuffle(
+                session.repeat,
+                session.shuffle,
+            ));
+            let fav_flag = Arc::clone(&pending_remote_toggle_favorite);
+            remote.on_command(Arc::new(move |cmd| {
+                if matches!(cmd, RemoteCommand::ToggleFavorite) {
+                    fav_flag.store(true, Ordering::Release);
+                }
+            }));
         }
 
         let artwork = if use_sandbox {
@@ -716,6 +744,7 @@ impl AppStore {
             queue: signal(session.queue.clone()),
             current_index: signal(session.current_index),
             position_ms: signal(session.position_ms.max(0) as u64),
+            scrubber_preview_ms: signal(None),
             duration_ms: signal(
                 session
                     .current_track()
@@ -743,6 +772,8 @@ impl AppStore {
             comments: signal(Vec::new()),
             comments_total: signal(0),
             comments_loading: signal(false),
+            comments_more: signal(false),
+            comments_loading_more: signal(false),
 
             now_playing_open: signal(false),
             now_playing_mode: signal(initial_mode),
@@ -754,6 +785,7 @@ impl AppStore {
             search_tab: signal(SearchKind::Tracks),
             search_results: signal(SearchResult::default()),
             search_loading: signal(false),
+            search_loading_more: signal(false),
             recent_searches: signal(session.recent_searches.clone()),
             search_suggestions: signal(Vec::new()),
             search_suggest_open: signal(false),
@@ -767,11 +799,16 @@ impl AppStore {
             active_artist: signal(None),
             liked_tracks: signal(Vec::new()),
             liked_ids: signal(HashSet::new()),
+            liked_more: signal(false),
+            liked_loading_more: signal(false),
             recent_tracks: signal(Vec::new()),
             saved_albums: signal(Vec::new()),
+            saved_albums_more: signal(false),
+            saved_albums_loading_more: signal(false),
             stations: signal(Vec::new()),
             podcasts: signal(Vec::new()),
             active_show: signal(None),
+            show_episodes_loading_more: signal(false),
 
             settings: signal(settings),
             main_window_open: signal(true),
@@ -792,6 +829,7 @@ impl AppStore {
             last_track_id: stored(None),
             last_played_reported_id: stored(None),
             last_snapshot: stored(None),
+            pending_seek: stored(None),
             active_station_id: stored(None),
             pending_sign_in_prompt: stored(pending_sign_in_prompt),
             has_sign_in_prompt: stored(has_sign_in_prompt),
@@ -800,6 +838,7 @@ impl AppStore {
             active_web_sign_in: stored(active_web_sign_in),
             pending_open_urls: stored(pending_open_urls),
             has_open_url_request: stored(has_open_url_request),
+            pending_remote_toggle_favorite: stored(pending_remote_toggle_favorite),
             signing_in_source_id: stored(None),
             search_suggest_gen: stored(0),
             browse_cache: stored(HashMap::new()),
@@ -1231,6 +1270,24 @@ impl AppStore {
         }
     }
 
+    /// Refreshes the `plugins` summary signal (including per-plugin `runtime_error` banners).
+    pub fn refresh_plugin_summaries(&self) {
+        let summaries = self.plugin_mgr.with(|m| m.plugins());
+        self.plugins.set(summaries);
+    }
+
+    /// Toggles in-process mobile virtualization compatibility (`ffmpeg`/`yt-dlp` shims vs system `PATH`).
+    pub fn set_mobile_virtual_compat(&self, enabled: bool) {
+        self.settings.update(|s| {
+            s.mobile_virtual_compat = enabled;
+        });
+        self.persist_settings();
+        self.plugin_mgr
+            .with(|m| m.set_mobile_virtual_compat(enabled));
+        self.invalidate_browse_cache();
+        self.refresh_sources();
+    }
+
     fn invalidate_browse_cache(&self) {
         self.browse_cache.with(HashMap::clear);
         self.browse_req_gen.with(|g| *g = g.wrapping_add(1));
@@ -1251,17 +1308,23 @@ impl AppStore {
             self.playlists.set(Vec::new());
             self.liked_tracks.set(Vec::new());
             self.liked_ids.set(HashSet::new());
+            self.liked_more.set(false);
+            self.liked_loading_more.set(false);
             self.recent_tracks.set(Vec::new());
             self.saved_albums.set(Vec::new());
+            self.saved_albums_more.set(false);
+            self.saved_albums_loading_more.set(false);
             self.stations.set(Vec::new());
             self.podcasts.set(Vec::new());
             self.search_suggestions.set(Vec::new());
             self.search_suggest_open.set(false);
             self.search_results.set(SearchResult::default());
+            self.search_loading_more.set(false);
             self.active_playlist.set(None);
             self.active_album.set(None);
             self.active_artist.set(None);
             self.active_show.set(None);
+            self.show_episodes_loading_more.set(false);
             self.remote_devices.set(Vec::new());
             self.active_remote_device.set(None);
         });
@@ -1337,12 +1400,15 @@ impl AppStore {
                 return;
             }
             let mut err_msg: Option<String> = None;
+            let mut plugin_err = false;
+            let mut plugin_ok = false;
             batch(|| {
                 if store.browse_loading.get_untracked() {
                     store.browse_loading.set(false);
                 }
                 match res {
                     Ok(Ok(mut browse)) => {
+                        plugin_ok = source_id != LocalMusicSource::SOURCE_ID;
                         if browse.title.is_empty() && !fallback_title.is_empty() {
                             browse.title = fallback_title;
                         }
@@ -1356,6 +1422,7 @@ impl AppStore {
                         }
                     }
                     Ok(Err(err)) => {
+                        plugin_err = source_id != LocalMusicSource::SOURCE_ID;
                         err_msg = Some(format!("{source_id}: {err}"));
                     }
                     Err(err) => {
@@ -1363,6 +1430,15 @@ impl AppStore {
                     }
                 }
             });
+            if plugin_err
+                || (plugin_ok
+                    && store.plugins.with_untracked(|list| {
+                        list.iter()
+                            .any(|p| p.id == source_id && p.runtime_error.is_some())
+                    }))
+            {
+                store.refresh_plugin_summaries();
+            }
             if let Some(msg) = err_msg {
                 store.toasts.error(msg);
             }
@@ -1891,6 +1967,7 @@ impl AppStore {
     /// Plays a single track immediately (replacing the queue with `[track]`).
     pub fn play_track(&self, track: Track) {
         self.active_station_id.replace(None);
+        self.pending_seek.replace(None);
         self.audio.with(|a| {
             a.set_radio_refill(None);
             a.play_track(track.clone());
@@ -1901,6 +1978,7 @@ impl AppStore {
             self.current_track.set(Some(track.clone()));
             self.playback_status.set(PlaybackStatus::Playing);
             self.is_playing.set(true);
+            self.scrubber_preview_ms.set(None);
             self.position_ms.set(0);
             self.duration_ms.set(track.duration.max(0) as u64);
         });
@@ -1915,6 +1993,7 @@ impl AppStore {
         let idx = start_index.min(tracks.len() - 1);
         let selected = tracks[idx].clone();
         self.active_station_id.replace(None);
+        self.pending_seek.replace(None);
         self.audio.with(|a| {
             a.set_radio_refill(None);
             a.play_queue(tracks.clone(), idx);
@@ -1925,6 +2004,7 @@ impl AppStore {
             self.current_track.set(Some(selected.clone()));
             self.playback_status.set(PlaybackStatus::Playing);
             self.is_playing.set(true);
+            self.scrubber_preview_ms.set(None);
             self.position_ms.set(0);
             self.duration_ms.set(selected.duration.max(0) as u64);
         });
@@ -2083,6 +2163,7 @@ impl AppStore {
     pub fn clear_queue(&self) {
         self.audio.with(|a| a.clear_queue());
         self.last_track_id.replace(None);
+        self.pending_seek.replace(None);
         batch(|| {
             self.queue.set(Vec::new());
             self.current_index.set(None);
@@ -2090,9 +2171,16 @@ impl AppStore {
             self.playback_status.set(PlaybackStatus::Stopped);
             self.is_playing.set(false);
             self.current_is_lossless.set(false);
+            self.scrubber_preview_ms.set(None);
             self.position_ms.set(0);
             self.duration_ms.set(0);
+            self.lyrics.set(ParsedLyrics::default());
+            self.active_lyric.set(None);
             self.lyrics_loading.set(false);
+            self.comments.set(Vec::new());
+            self.comments_total.set(0);
+            self.comments_more.set(false);
+            self.comments_loading_more.set(false);
             self.comments_loading.set(false);
         });
     }
@@ -2137,9 +2225,11 @@ impl AppStore {
     }
 
     pub fn next_track(&self) {
+        self.pending_seek.replace(None);
         self.audio.with(|a| a.next_track());
         let q = self.queue.get_untracked();
         if q.is_empty() {
+            self.scrubber_preview_ms.set(None);
             return;
         }
         let cur = self.current_index.get_untracked().unwrap_or(0);
@@ -2148,6 +2238,7 @@ impl AppStore {
         batch(|| {
             self.current_index.set(Some(next_idx));
             self.current_track.set(Some(next_track.clone()));
+            self.scrubber_preview_ms.set(None);
             self.position_ms.set(0);
             self.duration_ms.set(next_track.duration.max(0) as u64);
             self.is_playing.set(true);
@@ -2157,9 +2248,11 @@ impl AppStore {
     }
 
     pub fn prev_track(&self) {
+        self.pending_seek.replace(None);
         self.audio.with(|a| a.prev_track());
         let q = self.queue.get_untracked();
         if q.is_empty() {
+            self.scrubber_preview_ms.set(None);
             return;
         }
         let cur = self.current_index.get_untracked().unwrap_or(0);
@@ -2168,6 +2261,7 @@ impl AppStore {
         batch(|| {
             self.current_index.set(Some(prev_idx));
             self.current_track.set(Some(prev_track.clone()));
+            self.scrubber_preview_ms.set(None);
             self.position_ms.set(0);
             self.duration_ms.set(prev_track.duration.max(0) as u64);
             self.is_playing.set(true);
@@ -2177,9 +2271,22 @@ impl AppStore {
     }
 
     pub fn seek(&self, position_ms: u64) {
-        let clamped = position_ms.min(self.duration_ms.get_untracked().max(position_ms));
+        let dur = self.duration_ms.get_untracked();
+        let clamped = if dur > 0 {
+            position_ms.min(dur)
+        } else {
+            position_ms
+        };
+        self.pending_seek.replace(Some((clamped, Instant::now())));
+        log::info!(
+            target: "nsh_music_ui",
+            "seek requested: {position_ms}ms -> clamped={clamped}ms"
+        );
         self.audio.with(|a| a.seek(clamped));
-        self.position_ms.set(clamped);
+        batch(|| {
+            self.scrubber_preview_ms.set(None);
+            self.position_ms.set(clamped);
+        });
         self.update_active_lyric(clamped);
     }
 
@@ -2297,6 +2404,14 @@ impl AppStore {
             let _ = s.toggle_liked_track(track.clone());
         });
         self.persist_session();
+
+        if self
+            .current_track
+            .with_untracked(|cur| cur.as_ref().is_some_and(|t| t.id == id))
+        {
+            self.audio
+                .with(|a| a.remote_controller().update_favorite(&id, now_liked));
+        }
 
         let src = self.source_by_id(&track.source);
         let track_id = track.id.clone();
@@ -2753,6 +2868,7 @@ impl AppStore {
         batch(|| {
             self.search_query.set(trimmed.clone());
             self.search_suggest_open.set(false);
+            self.search_loading_more.set(false);
         });
         if trimmed.is_empty() {
             self.search_results.set(SearchResult::default());
@@ -2781,8 +2897,19 @@ impl AppStore {
             match res {
                 Ok(Ok(result)) => {
                     store.search_results.set(result);
+                    if source_id != LocalMusicSource::SOURCE_ID
+                        && store.plugins.with_untracked(|list| {
+                            list.iter()
+                                .any(|p| p.id == source_id && p.runtime_error.is_some())
+                        })
+                    {
+                        store.refresh_plugin_summaries();
+                    }
                 }
                 Ok(Err(err)) => {
+                    if source_id != LocalMusicSource::SOURCE_ID {
+                        store.refresh_plugin_summaries();
+                    }
                     store.toasts.error(format!("{source_id}: {err}"));
                 }
                 Err(err) => {
@@ -2806,6 +2933,341 @@ impl AppStore {
         });
         self.persist_session();
         self.recent_searches.set(Vec::new());
+    }
+
+    // -------------------------------------------------------------------------
+    // Pagination (`load_more_*`)
+    // -------------------------------------------------------------------------
+
+    /// Loads the next page of search results for the active query & tab, deduplicating by ID.
+    pub fn load_more_search(&self) {
+        if self.search_loading.get_untracked() || self.search_loading_more.get_untracked() {
+            return;
+        }
+        let query = self.search_query.get_untracked();
+        let trimmed = query.trim().to_owned();
+        if trimmed.is_empty() {
+            return;
+        }
+        let kind = self.search_tab.get_untracked();
+        let (has_more, offset) = self.search_results.with_untracked(|r| {
+            let len = match kind {
+                SearchKind::Tracks => r.tracks.len(),
+                SearchKind::Albums => r.albums.len(),
+                SearchKind::Artists => r.artists.len(),
+                SearchKind::Playlists => r.playlists.len(),
+                SearchKind::Shows => r.shows.len(),
+            };
+            (r.more, len)
+        });
+        if !has_more {
+            return;
+        }
+
+        let source_id = self.active_source_id.get_untracked();
+        let src = self.active_source();
+        self.search_loading_more.set(true);
+        let store = *self;
+        self.spawn_app(async move {
+            let q_bg = trimmed.clone();
+            let res = blocking(move || src.search(&q_bg, kind, offset)).await;
+            let still_current = store.active_source_id.get_untracked() == source_id
+                && store.search_query.get_untracked().trim() == trimmed
+                && store.search_tab.get_untracked() == kind;
+            if !still_current {
+                return;
+            }
+            store.search_loading_more.set(false);
+            match res {
+                Ok(Ok(page)) => {
+                    store.search_results.update(|cur| {
+                        let added = match kind {
+                            SearchKind::Tracks => {
+                                let mut seen: HashSet<String> =
+                                    cur.tracks.iter().map(|t| t.id.clone()).collect();
+                                let mut count = 0usize;
+                                for item in page.tracks {
+                                    if item.id.is_empty() || seen.insert(item.id.clone()) {
+                                        cur.tracks.push(item);
+                                        count += 1;
+                                    }
+                                }
+                                count
+                            }
+                            SearchKind::Albums => {
+                                let mut seen: HashSet<String> =
+                                    cur.albums.iter().map(|a| a.id.clone()).collect();
+                                let mut count = 0usize;
+                                for item in page.albums {
+                                    if item.id.is_empty() || seen.insert(item.id.clone()) {
+                                        cur.albums.push(item);
+                                        count += 1;
+                                    }
+                                }
+                                count
+                            }
+                            SearchKind::Artists => {
+                                let mut seen: HashSet<String> =
+                                    cur.artists.iter().map(|a| a.id.clone()).collect();
+                                let mut count = 0usize;
+                                for item in page.artists {
+                                    if item.id.is_empty() || seen.insert(item.id.clone()) {
+                                        cur.artists.push(item);
+                                        count += 1;
+                                    }
+                                }
+                                count
+                            }
+                            SearchKind::Playlists => {
+                                let mut seen: HashSet<String> =
+                                    cur.playlists.iter().map(|p| p.id.clone()).collect();
+                                let mut count = 0usize;
+                                for item in page.playlists {
+                                    if item.id.is_empty() || seen.insert(item.id.clone()) {
+                                        cur.playlists.push(item);
+                                        count += 1;
+                                    }
+                                }
+                                count
+                            }
+                            SearchKind::Shows => {
+                                let mut seen: HashSet<String> =
+                                    cur.shows.iter().map(|s| s.id.clone()).collect();
+                                let mut count = 0usize;
+                                for item in page.shows {
+                                    if item.id.is_empty() || seen.insert(item.id.clone()) {
+                                        cur.shows.push(item);
+                                        count += 1;
+                                    }
+                                }
+                                count
+                            }
+                        };
+                        cur.more = page.more && added > 0;
+                    });
+                }
+                Ok(Err(err)) => {
+                    if source_id != LocalMusicSource::SOURCE_ID {
+                        store.refresh_plugin_summaries();
+                    }
+                    store.toasts.error(format!("{source_id}: {err}"));
+                }
+                Err(err) => {
+                    store.toasts.error(format!("{source_id}: {err}"));
+                }
+            }
+        });
+    }
+
+    /// Loads the next page of liked tracks for the active source, deduplicating by ID.
+    pub fn load_more_liked(&self) {
+        if !self.liked_more.get_untracked() || self.liked_loading_more.get_untracked() {
+            return;
+        }
+        let source_id = self.active_source_id.get_untracked();
+        let offset = self.liked_tracks.with_untracked(Vec::len);
+        let src = self.active_source();
+        self.liked_loading_more.set(true);
+        let store = *self;
+        self.spawn_app(async move {
+            let res = blocking(move || src.liked(offset)).await;
+            if store.active_source_id.get_untracked() != source_id {
+                return;
+            }
+            store.liked_loading_more.set(false);
+            match res {
+                Ok(Ok(page)) => {
+                    let mut added_ids = Vec::new();
+                    let mut added = 0usize;
+                    store.liked_tracks.update(|list| {
+                        let mut seen: HashSet<String> = list.iter().map(|t| t.id.clone()).collect();
+                        for track in page.tracks {
+                            if track.id.is_empty() || seen.insert(track.id.clone()) {
+                                if !track.id.is_empty() {
+                                    added_ids.push(track.id.clone());
+                                }
+                                list.push(track);
+                                added += 1;
+                            }
+                        }
+                    });
+                    batch(|| {
+                        if !added_ids.is_empty() {
+                            store.liked_ids.update(|ids| {
+                                for id in added_ids {
+                                    ids.insert(id);
+                                }
+                            });
+                        }
+                        store.liked_more.set(page.more && added > 0);
+                    });
+                }
+                Ok(Err(err)) => {
+                    store.toasts.error(format!("{source_id}: {err}"));
+                }
+                Err(err) => {
+                    store.toasts.error(format!("{source_id}: {err}"));
+                }
+            }
+        });
+    }
+
+    /// Loads the next page of saved albums for the active source, deduplicating by ID.
+    pub fn load_more_saved_albums(&self) {
+        if !self.saved_albums_more.get_untracked() || self.saved_albums_loading_more.get_untracked()
+        {
+            return;
+        }
+        let source_id = self.active_source_id.get_untracked();
+        let offset = self.saved_albums.with_untracked(Vec::len);
+        let src = self.active_source();
+        self.saved_albums_loading_more.set(true);
+        let store = *self;
+        self.spawn_app(async move {
+            let res = blocking(move || src.saved_albums(offset)).await;
+            if store.active_source_id.get_untracked() != source_id {
+                return;
+            }
+            store.saved_albums_loading_more.set(false);
+            match res {
+                Ok(Ok(page)) => {
+                    let mut added = 0usize;
+                    store.saved_albums.update(|list| {
+                        let mut seen: HashSet<String> = list.iter().map(|a| a.id.clone()).collect();
+                        for album in page.albums {
+                            if album.id.is_empty() || seen.insert(album.id.clone()) {
+                                list.push(album);
+                                added += 1;
+                            }
+                        }
+                    });
+                    store.saved_albums_more.set(page.more && added > 0);
+                }
+                Ok(Err(err)) => {
+                    store.toasts.error(format!("{source_id}: {err}"));
+                }
+                Err(err) => {
+                    store.toasts.error(format!("{source_id}: {err}"));
+                }
+            }
+        });
+    }
+
+    /// Loads the next page of episodes for the currently open podcast show, deduplicating by ID.
+    pub fn load_more_show_episodes(&self) {
+        if self.show_episodes_loading_more.get_untracked() {
+            return;
+        }
+        let target = self.active_show.with_untracked(|opt| {
+            opt.as_ref()
+                .filter(|p| p.more && !p.show.id.is_empty())
+                .map(|p| (p.show.id.clone(), p.episodes.len()))
+        });
+        let Some((show_id, offset)) = target else {
+            return;
+        };
+        let source_id = self.active_source_id.get_untracked();
+        let src = self.active_source();
+        self.show_episodes_loading_more.set(true);
+        let store = *self;
+        self.spawn_app(async move {
+            let sid_bg = show_id.clone();
+            let res = blocking(move || src.show(&sid_bg, offset)).await;
+            let still_current = store.active_source_id.get_untracked() == source_id
+                && store
+                    .active_show
+                    .with_untracked(|opt| opt.as_ref().is_some_and(|p| p.show.id == show_id));
+            if !still_current {
+                return;
+            }
+            store.show_episodes_loading_more.set(false);
+            match res {
+                Ok(Ok(page)) => {
+                    store.active_show.update(|opt| {
+                        if let Some(cur) = opt
+                            && cur.show.id == show_id
+                        {
+                            let mut seen: HashSet<String> =
+                                cur.episodes.iter().map(|e| e.id.clone()).collect();
+                            let mut added = 0usize;
+                            for ep in page.episodes {
+                                if ep.id.is_empty() || seen.insert(ep.id.clone()) {
+                                    cur.episodes.push(ep);
+                                    added += 1;
+                                }
+                            }
+                            cur.more = page.more && added > 0;
+                        }
+                    });
+                }
+                Ok(Err(err)) => {
+                    store.toasts.error(format!("{source_id}: {err}"));
+                }
+                Err(err) => {
+                    store.toasts.error(format!("{source_id}: {err}"));
+                }
+            }
+        });
+    }
+
+    /// Loads the next page of listener comments for the currently playing track, deduplicating by ID.
+    pub fn load_more_comments(&self) {
+        if !self.comments_more.get_untracked()
+            || self.comments_loading.get_untracked()
+            || self.comments_loading_more.get_untracked()
+        {
+            return;
+        }
+        let Some(track) = self.current_track.get_untracked() else {
+            return;
+        };
+        let track_id = track.id.clone();
+        let source_id = if track.source.is_empty() {
+            self.active_source_id.get_untracked()
+        } else {
+            track.source.clone()
+        };
+        let src = self.source_by_id(&source_id);
+        let offset = self.comments.with_untracked(Vec::len);
+        self.comments_loading_more.set(true);
+        let store = *self;
+        self.spawn_app(async move {
+            let tid_bg = track_id.clone();
+            let res = blocking(move || src.comments(&tid_bg, offset)).await;
+            let still_current = store
+                .last_track_id
+                .with(|id| id.as_deref() == Some(track_id.as_str()));
+            if !still_current {
+                return;
+            }
+            store.comments_loading_more.set(false);
+            match res {
+                Ok(Ok(page)) => {
+                    let mut added = 0usize;
+                    store.comments.update(|list| {
+                        let mut seen: HashSet<String> = list.iter().map(|c| c.id.clone()).collect();
+                        for c in page.comments {
+                            if c.id.is_empty() || seen.insert(c.id.clone()) {
+                                list.push(c);
+                                added += 1;
+                            }
+                        }
+                    });
+                    batch(|| {
+                        if page.total > store.comments_total.get_untracked() {
+                            store.comments_total.set(page.total);
+                        }
+                        store.comments_more.set(page.more && added > 0);
+                    });
+                }
+                Ok(Err(err)) => {
+                    store.toasts.error(format!("{source_id}: {err}"));
+                }
+                Err(err) => {
+                    store.toasts.error(format!("{source_id}: {err}"));
+                }
+            }
+        });
     }
 
     // -------------------------------------------------------------------------
@@ -2922,7 +3384,10 @@ impl AppStore {
 
     pub fn copy_track_title(&self, track: &Track) {
         if !track.name.is_empty() {
-            set_clipboard(track.name.clone());
+            let name = track.name.clone();
+            self.spawn_app(async move {
+                let _ = set_clipboard(name).await;
+            });
             self.toasts.info(self.t("common.copied"));
         }
     }
@@ -2935,14 +3400,19 @@ impl AppStore {
             format!("{} - {}", track.name, artists)
         };
         if !text.is_empty() {
-            set_clipboard(text);
+            self.spawn_app(async move {
+                let _ = set_clipboard(text).await;
+            });
             self.toasts.info(self.t("common.copied"));
         }
     }
 
     pub fn copy_track_link(&self, track: &Track) {
         if !track.url.is_empty() {
-            set_clipboard(track.url.clone());
+            let url = track.url.clone();
+            self.spawn_app(async move {
+                let _ = set_clipboard(url).await;
+            });
             self.toasts.info(self.t("common.copied"));
         }
     }
@@ -2993,6 +3463,9 @@ impl AppStore {
             let track_id = track.id.clone();
             let stream_res = blocking(move || src.stream(&track_id, quality)).await;
             let Ok(Ok(stream)) = stream_res else {
+                if source_id != LocalMusicSource::SOURCE_ID {
+                    store.refresh_plugin_summaries();
+                }
                 store.toasts.error(store.t("track.download_failed"));
                 return;
             };
@@ -3030,7 +3503,14 @@ impl AppStore {
             let src_dl = store.source_by_id(&source_id);
             let url = stream.url.clone();
             let stream_headers = stream.headers.clone();
+            let cached_path = store.audio.with(|a| a.cache().get_cached_path(&url));
             let write_res = blocking(move || -> Result<(), String> {
+                if let Some(cached) = cached_path
+                    && cached.is_file()
+                {
+                    std::fs::copy(&cached, &dest).map_err(|e| e.to_string())?;
+                    return Ok(());
+                }
                 if let Some(local_path) = url.strip_prefix("file://") {
                     std::fs::copy(local_path, &dest).map_err(|e| e.to_string())?;
                     return Ok(());
@@ -3200,13 +3680,22 @@ impl AppStore {
         let src = self.active_source();
         let home = src.home().unwrap_or_default();
         let playlists = src.playlists().unwrap_or_default();
-        let liked = src.liked(0).map(|p| p.tracks).unwrap_or_default();
+        let liked_page = src.liked(0).unwrap_or_default();
+        let liked = liked_page.tracks;
+        let liked_more = liked_page.more;
         let recent = src.recent().unwrap_or_default();
-        let albums = src.saved_albums(0).map(|a| a.albums).unwrap_or_default();
+        let albums_page = src.saved_albums(0).unwrap_or_default();
+        let albums = albums_page.albums;
+        let albums_more = albums_page.more;
         let stations = src.stations().unwrap_or_default();
         let shows = src.shows().unwrap_or_default();
 
         let liked_set: HashSet<String> = liked.iter().map(|t| t.id.clone()).collect();
+        if let Some(cur) = self.current_track.get_untracked() {
+            let is_fav = liked_set.contains(&cur.id);
+            self.audio
+                .with(|a| a.remote_controller().update_favorite(&cur.id, is_fav));
+        }
         self.browse_cache
             .with(|cache| cache.insert((source_id, String::new()), home.clone()));
 
@@ -3216,8 +3705,12 @@ impl AppStore {
             self.playlists.set(playlists);
             self.liked_tracks.set(liked);
             self.liked_ids.set(liked_set);
+            self.liked_more.set(liked_more);
+            self.liked_loading_more.set(false);
             self.recent_tracks.set(recent);
             self.saved_albums.set(albums);
+            self.saved_albums_more.set(albums_more);
+            self.saved_albums_loading_more.set(false);
             self.stations.set(stations);
             self.podcasts.set(shows);
         });
@@ -3241,12 +3734,15 @@ impl AppStore {
             }
 
             let mut home_err: Option<String> = None;
+            let mut plugin_err = false;
+            let mut plugin_ok = false;
             batch(|| {
                 if store.browse_loading.get_untracked() {
                     store.browse_loading.set(false);
                 }
                 match home_res {
                     Ok(Ok(home)) => {
+                        plugin_ok = source_id != LocalMusicSource::SOURCE_ID;
                         if !home.sections.is_empty() || source_id == LocalMusicSource::SOURCE_ID {
                             store.browse_cache.with(|cache| {
                                 cache.insert((source_id.clone(), String::new()), home.clone());
@@ -3266,6 +3762,7 @@ impl AppStore {
                         }
                     }
                     Ok(Err(err)) => {
+                        plugin_err = source_id != LocalMusicSource::SOURCE_ID;
                         home_err = Some(format!("{source_id}: {err}"));
                     }
                     Err(err) => {
@@ -3273,6 +3770,15 @@ impl AppStore {
                     }
                 }
             });
+            if plugin_err
+                || (plugin_ok
+                    && store.plugins.with_untracked(|list| {
+                        list.iter()
+                            .any(|p| p.id == source_id && p.runtime_error.is_some())
+                    }))
+            {
+                store.refresh_plugin_summaries();
+            }
             if let Some(msg) = home_err {
                 store.toasts.error(msg);
             }
@@ -3281,9 +3787,9 @@ impl AppStore {
             let lib_bundle = blocking(move || {
                 (
                     src.playlists().unwrap_or_default(),
-                    src.liked(0).map(|p| p.tracks).unwrap_or_default(),
+                    src.liked(0).unwrap_or_default(),
                     src.recent().unwrap_or_default(),
-                    src.saved_albums(0).map(|a| a.albums).unwrap_or_default(),
+                    src.saved_albums(0).unwrap_or_default(),
                     src.stations().unwrap_or_default(),
                     src.shows().unwrap_or_default(),
                 )
@@ -3294,14 +3800,28 @@ impl AppStore {
                 return;
             }
 
-            if let Ok((playlists, liked, recent, albums, stations, shows)) = lib_bundle {
+            if let Ok((playlists, liked_page, recent, albums_page, stations, shows)) = lib_bundle {
+                let liked = liked_page.tracks;
+                let liked_more = liked_page.more;
+                let albums = albums_page.albums;
+                let albums_more = albums_page.more;
                 let liked_set: HashSet<String> = liked.iter().map(|t| t.id.clone()).collect();
+                if let Some(cur) = store.current_track.get_untracked() {
+                    let is_fav = liked_set.contains(&cur.id);
+                    store
+                        .audio
+                        .with(|a| a.remote_controller().update_favorite(&cur.id, is_fav));
+                }
                 batch(|| {
                     store.playlists.set(playlists);
                     store.liked_tracks.set(liked);
                     store.liked_ids.set(liked_set);
+                    store.liked_more.set(liked_more);
+                    store.liked_loading_more.set(false);
                     store.recent_tracks.set(recent);
                     store.saved_albums.set(albums);
+                    store.saved_albums_more.set(albums_more);
+                    store.saved_albums_loading_more.set(false);
                     store.stations.set(stations);
                     store.podcasts.set(shows);
                 });
@@ -3435,6 +3955,7 @@ impl AppStore {
             }
             Route::ShowDetail { id } => {
                 let id = id.clone();
+                self.show_episodes_loading_more.set(false);
                 self.spawn_app(async move {
                     let id_bg = id.clone();
                     let res = blocking(move || src.show(&id_bg, 0)).await;
@@ -3567,6 +4088,7 @@ impl AppStore {
 
     fn on_track_changed(&self, track: &Track) {
         self.last_played_reported_id.replace(None);
+        self.scrubber_preview_ms.set(None);
 
         self.recent_tracks.update(|list| {
             list.retain(|t| t.id != track.id);
@@ -3588,6 +4110,32 @@ impl AppStore {
     fn load_track_extras(&self, track: &Track) {
         let track_id = track.id.clone();
         self.last_track_id.replace(Some(track_id.clone()));
+
+        let source_id = if track.source.is_empty() {
+            self.active_source_id.get_untracked()
+        } else {
+            track.source.clone()
+        };
+        let src_lrc = self.source_by_id(&source_id);
+        let can_comments = src_lrc.can("comments");
+
+        let liked = self.liked_ids.with_untracked(|s| s.contains(&track.id));
+        self.audio.with(|a| {
+            let remote = a.remote_controller();
+            remote.update_favorite(&track.id, liked);
+            remote.update_lyric(&track_id, "");
+        });
+
+        batch(|| {
+            self.lyrics.set(ParsedLyrics::default());
+            self.active_lyric.set(None);
+            self.lyrics_loading.set(true);
+            self.comments.set(Vec::new());
+            self.comments_total.set(0);
+            self.comments_more.set(false);
+            self.comments_loading_more.set(false);
+            self.comments_loading.set(can_comments);
+        });
 
         let seed = if !track.album.id.is_empty() {
             track.album.id.clone()
@@ -3615,6 +4163,10 @@ impl AppStore {
             let expanded = ArtworkLoader::resolve_template(trimmed_cover, 600);
             if let Some(hit) = self.artwork.with(|l| l.cached(&expanded, 600)) {
                 artwork_resolved_sync = true;
+                self.audio.with(|a| {
+                    a.remote_controller()
+                        .update_artwork(&track_id, hit.uri.as_str());
+                });
                 batch(|| {
                     if self.current_artwork_uri.get_untracked() != hit.uri {
                         self.current_artwork_uri.set(hit.uri);
@@ -3641,6 +4193,10 @@ impl AppStore {
                         .last_track_id
                         .with(|id| id.as_deref() == Some(&track_id))
                 {
+                    store.audio.with(|a| {
+                        a.remote_controller()
+                            .update_artwork(&track_id, art.uri.as_str());
+                    });
                     batch(|| {
                         if store.current_artwork_uri.get_untracked() != art.uri {
                             store.current_artwork_uri.set(art.uri);
@@ -3653,27 +4209,39 @@ impl AppStore {
             });
         }
 
-        let src_lrc = self.source_by_id(&track.source);
         let tid_lrc = track.id.clone();
         let tid_check = track.id.clone();
         let store_lrc = *self;
-        let can_comments = src_lrc.can("comments");
-        batch(|| {
-            self.lyrics_loading.set(true);
-            self.comments_loading.set(can_comments);
-        });
         self.spawn_app(async move {
             let res = blocking(move || {
-                let lyrics = src_lrc
-                    .lyrics(&tid_lrc)
-                    .map(|l| parse_lyrics(&l))
-                    .unwrap_or_default();
+                let (lyrics, lrc_for_remote) = match src_lrc.lyrics(&tid_lrc) {
+                    Ok(raw_lyrics) => {
+                        let parsed = parse_lyrics(&raw_lyrics);
+                        let remote_lrc = if !raw_lyrics.lrc.trim().is_empty() {
+                            raw_lyrics.lrc
+                        } else {
+                            parsed.to_lrc_string()
+                        };
+                        (parsed, remote_lrc)
+                    }
+                    Err(err) => {
+                        if !matches!(err, nsh_music_core::model::SourceError::Unsupported) {
+                            log::warn!(
+                                target: "nsh_music",
+                                "lyrics fetch failed for `{}` on `{}`: {err}",
+                                tid_lrc,
+                                source_id
+                            );
+                        }
+                        (ParsedLyrics::default(), String::new())
+                    }
+                };
                 let comments = if can_comments {
                     src_lrc.comments(&tid_lrc, 0).unwrap_or_default()
                 } else {
                     nsh_music_core::model::CommentPage::default()
                 };
-                (lyrics, comments)
+                (lyrics, lrc_for_remote, comments)
             })
             .await;
 
@@ -3682,7 +4250,11 @@ impl AppStore {
                 .with(|id| id.as_deref() == Some(tid_check.as_str()))
             {
                 match res {
-                    Ok((parsed, comment_page)) => {
+                    Ok((parsed, lrc_for_remote, comment_page)) => {
+                        store_lrc.audio.with(|a| {
+                            a.remote_controller()
+                                .update_lyric(&tid_check, &lrc_for_remote);
+                        });
                         let pos = store_lrc.position_ms.get_untracked();
                         let active = parsed.active_position(pos as i64);
                         batch(|| {
@@ -3690,6 +4262,8 @@ impl AppStore {
                             store_lrc.active_lyric.set(active);
                             store_lrc.comments.set(comment_page.comments);
                             store_lrc.comments_total.set(comment_page.total);
+                            store_lrc.comments_more.set(comment_page.more);
+                            store_lrc.comments_loading_more.set(false);
                             store_lrc.lyrics_loading.set(false);
                             store_lrc.comments_loading.set(false);
                             if !can_comments
@@ -3706,6 +4280,8 @@ impl AppStore {
                         batch(|| {
                             store_lrc.lyrics_loading.set(false);
                             store_lrc.comments_loading.set(false);
+                            store_lrc.comments_more.set(false);
+                            store_lrc.comments_loading_more.set(false);
                         });
                     }
                 }
@@ -3830,6 +4406,13 @@ impl AppStore {
             }
         }
 
+        if self
+            .pending_remote_toggle_favorite
+            .with(|f| f.swap(false, Ordering::AcqRel))
+        {
+            self.toggle_like_current();
+        }
+
         let snap = self.audio.with(|a| a.snapshot());
 
         let snapshot_changed = self.last_snapshot.with(|prev| prev.as_ref() != Some(&snap));
@@ -3856,6 +4439,7 @@ impl AppStore {
 
             let mut pos_updated = false;
             let mut playback_error_toast: Option<String> = None;
+            let mut loop_mode_changed = false;
             batch(|| {
                 if engine_has_track || snap.status != PlaybackStatus::Stopped {
                     if status_changed {
@@ -3869,8 +4453,27 @@ impl AppStore {
                         self.is_playing.set(engine_playing);
                     }
 
+                    let skip_stale_pos = if let Some((target, at)) = self.pending_seek.with(|p| *p)
+                    {
+                        let settled_or_expired = track_changed
+                            || matches!(
+                                snap.status,
+                                PlaybackStatus::Stopped | PlaybackStatus::Error(_)
+                            )
+                            || at.elapsed() >= Duration::from_millis(1500)
+                            || snap.position_ms.abs_diff(target) <= 2_500;
+                        if settled_or_expired {
+                            self.pending_seek.replace(None);
+                            false
+                        } else {
+                            true
+                        }
+                    } else {
+                        false
+                    };
+
                     let cur_pos = self.position_ms.get_untracked();
-                    if snap.position_ms != cur_pos {
+                    if !skip_stale_pos && snap.position_ms != cur_pos {
                         let np_open = self.now_playing_open.get_untracked();
                         let panel = self.now_playing_panel.get_untracked();
                         let fine_pos = np_open
@@ -3912,9 +4515,11 @@ impl AppStore {
                     }
                     if self.shuffle.get_untracked() != snap.shuffle {
                         self.shuffle.set(snap.shuffle);
+                        loop_mode_changed = true;
                     }
                     if self.repeat.get_untracked() != snap.repeat {
                         self.repeat.set(snap.repeat);
+                        loop_mode_changed = true;
                     }
                     if self.current_is_lossless.get_untracked() != snap.is_lossless {
                         self.current_is_lossless.set(snap.is_lossless);
@@ -3950,6 +4555,22 @@ impl AppStore {
 
             if let Some(msg) = playback_error_toast {
                 self.toasts.error(msg);
+            }
+            if status_changed
+                && (matches!(snap.status, PlaybackStatus::Error(_))
+                    || (snap.status == PlaybackStatus::Playing
+                        && self
+                            .plugins
+                            .with_untracked(|list| list.iter().any(|p| p.runtime_error.is_some()))))
+            {
+                self.refresh_plugin_summaries();
+            }
+            if loop_mode_changed {
+                self.session.with(|s| {
+                    s.shuffle = snap.shuffle;
+                    s.repeat = snap.repeat;
+                });
+                self.persist_session();
             }
 
             if snap.status == PlaybackStatus::Playing
@@ -4130,6 +4751,7 @@ impl AppStore {
             PluginManager::new(&sandbox.plugins_dir, &sandbox.plugin_data_dir)
                 .expect("init isolated plugin manager"),
         );
+        plugin_mgr.set_mobile_virtual_compat(settings.mobile_virtual_compat);
         let mut audio_cfg = AudioEngineConfig::default();
         audio_cfg.cache.cache_dir = sandbox.audio_cache_dir.clone();
         let audio =
@@ -4159,6 +4781,7 @@ impl AppStore {
             queue: signal(Vec::new()),
             current_index: signal(None),
             position_ms: signal(0),
+            scrubber_preview_ms: signal(None),
             duration_ms: signal(0),
             buffered_ms: signal(0),
             volume: signal(1.0),
@@ -4181,6 +4804,8 @@ impl AppStore {
             comments: signal(Vec::new()),
             comments_total: signal(0),
             comments_loading: signal(false),
+            comments_more: signal(false),
+            comments_loading_more: signal(false),
 
             now_playing_open: signal(false),
             now_playing_mode: signal(NowPlayingMode::Cover),
@@ -4192,6 +4817,7 @@ impl AppStore {
             search_tab: signal(SearchKind::Tracks),
             search_results: signal(SearchResult::default()),
             search_loading: signal(false),
+            search_loading_more: signal(false),
             recent_searches: signal(Vec::new()),
             search_suggestions: signal(Vec::new()),
             search_suggest_open: signal(false),
@@ -4205,11 +4831,16 @@ impl AppStore {
             active_artist: signal(None),
             liked_tracks: signal(Vec::new()),
             liked_ids: signal(HashSet::new()),
+            liked_more: signal(false),
+            liked_loading_more: signal(false),
             recent_tracks: signal(Vec::new()),
             saved_albums: signal(Vec::new()),
+            saved_albums_more: signal(false),
+            saved_albums_loading_more: signal(false),
             stations: signal(Vec::new()),
             podcasts: signal(Vec::new()),
             active_show: signal(None),
+            show_episodes_loading_more: signal(false),
 
             settings: signal(settings),
             main_window_open: signal(true),
@@ -4230,6 +4861,7 @@ impl AppStore {
             last_track_id: stored(None),
             last_played_reported_id: stored(None),
             last_snapshot: stored(None),
+            pending_seek: stored(None),
             active_station_id: stored(None),
             pending_sign_in_prompt: stored(Arc::new(Mutex::new(None))),
             has_sign_in_prompt: stored(Arc::new(AtomicBool::new(false))),
@@ -4238,6 +4870,7 @@ impl AppStore {
             active_web_sign_in: stored(Arc::new(Mutex::new(None))),
             pending_open_urls: stored(Arc::new(Mutex::new(Vec::new()))),
             has_open_url_request: stored(Arc::new(AtomicBool::new(false))),
+            pending_remote_toggle_favorite: stored(Arc::new(AtomicBool::new(false))),
             signing_in_source_id: stored(None),
             search_suggest_gen: stored(0),
             browse_cache: stored(HashMap::new()),
@@ -4528,5 +5161,57 @@ mod tests {
                 "{secondary:?} should be a secondary route on Phone"
             );
         }
+    }
+
+    #[component]
+    fn MobileVirtualCompatStoreTestApp() -> impl IntoElement {
+        let root = std::env::temp_dir().join(format!(
+            "nsh-music-mobile-compat-store-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = AppStore::new_isolated_for_test(&root);
+
+        assert!(store.settings.with_untracked(|s| s.mobile_virtual_compat));
+        assert!(store.plugin_manager().mobile_virtual_compat());
+
+        store.set_mobile_virtual_compat(false);
+        assert!(!store.settings.with_untracked(|s| s.mobile_virtual_compat));
+        assert!(!store.plugin_manager().mobile_virtual_compat());
+
+        store.refresh_plugin_summaries();
+        store.set_mobile_virtual_compat(true);
+        assert!(store.settings.with_untracked(|s| s.mobile_virtual_compat));
+        assert!(store.plugin_manager().mobile_virtual_compat());
+
+        store.audio.with(|a| a.shutdown());
+        let _ = std::fs::remove_dir_all(&root);
+
+        view()
+            .test_id("mobile-compat-store-test-ok")
+            .w(px(120.0))
+            .h(px(40.0))
+            .child(text("ok"))
+    }
+
+    #[test]
+    fn mobile_virtual_compat_toggle_updates_settings_and_plugin_manager() {
+        let viewport = nsh_core::geometry::Size::new(
+            nsh_core::geometry::Points(400.0),
+            nsh_core::geometry::Points(300.0),
+        );
+        let root = nsh_engine::Root::of::<MobileVirtualCompatStoreTestApp>()
+            .tokens(crate::app_tokens())
+            .app_id("com.richerfu.nshmusic.mobile_compat_store_test");
+        let mut config = nsh_engine::EngineConfig::new(root);
+        config.viewport = viewport;
+        config.environment = nsh_engine::Environment {
+            window: viewport,
+            ..nsh_engine::Environment::default()
+        };
+        let mut app = nsh_testing::Headless::start(config)
+            .expect("headless mobile virtual compat test starts");
+        app.wait_for("id:mobile-compat-store-test-ok")
+            .expect("mobile virtual compat store assertions passed");
     }
 }

@@ -574,6 +574,114 @@ pub fn artwork_np_accent(accent: Hsla) -> Hsla {
     mix_color(accent, colors::NP_FG.dark, 0.45)
 }
 
+fn hsla_with_alpha(color: Hsla, alpha: f32) -> Hsla {
+    let c = color.to_rgb();
+    Rgba {
+        a: alpha.clamp(0.0, 1.0),
+        ..c
+    }
+    .to_hsla()
+}
+
+fn srgb_channel_to_linear(c: f32) -> f32 {
+    let c = c.clamp(0.0, 1.0);
+    if c <= 0.03928 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn relative_luminance(rgb: Rgba) -> f32 {
+    0.2126 * srgb_channel_to_linear(rgb.r)
+        + 0.7152 * srgb_channel_to_linear(rgb.g)
+        + 0.0722 * srgb_channel_to_linear(rgb.b)
+}
+
+fn contrast_ratio(a: Rgba, b: Rgba) -> f32 {
+    let la = relative_luminance(a);
+    let lb = relative_luminance(b);
+    let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// Frosted floating mini-player / mobile dock surface gently tinted by the
+/// active album artwork while preserving crisp text contrast (`>= 10:1`).
+///
+/// Neutral gray covers (`s <= 0.12`) remain crisp neutral frosted glass.
+pub fn mini_player_surface(accent: Hsla) -> AdaptiveColor {
+    let c = accent.to_rgb();
+    let (h, s, _) = rgb_to_hsv(c.r, c.g, c.b);
+    if s <= 0.12 {
+        return AdaptiveColor::new(
+            rgb_a(0xffffff, 0.94).to_hsla(),
+            rgb_a(0x222228, 0.90).to_hsla(),
+        );
+    }
+
+    let light_tint = hsv_to_hsla(h, (s * 0.55).clamp(0.18, 0.45), 0.92);
+    let light = hsla_with_alpha(mix_color(rgb(0xffffff).to_hsla(), light_tint, 0.07), 0.92);
+
+    let dark_tint = hsv_to_hsla(h, (s * 0.85).clamp(0.32, 0.68), 0.36);
+    let dark = hsla_with_alpha(mix_color(rgb(0x222228).to_hsla(), dark_tint, 0.14), 0.90);
+
+    AdaptiveColor::new(light, dark)
+}
+
+/// Subtle frosted rim around the floating mini-player / mobile dock, gently
+/// picking up the active album hue when the cover is chromatic (`s > 0.12`).
+pub fn mini_player_border(accent: Hsla) -> AdaptiveColor {
+    let c = accent.to_rgb();
+    let (h, s, _) = rgb_to_hsv(c.r, c.g, c.b);
+    if s <= 0.12 {
+        return AdaptiveColor::new(
+            rgb_a(0x1d1d1f, 0.09).to_hsla(),
+            rgb_a(0xffffff, 0.14).to_hsla(),
+        );
+    }
+
+    let light_tint = hsv_to_hsla(h, (s * 0.80).clamp(0.30, 0.65), 0.38);
+    let light = hsla_with_alpha(mix_color(rgb(0x1d1d1f).to_hsla(), light_tint, 0.35), 0.09);
+
+    let dark_tint = hsv_to_hsla(h, (s * 0.65).clamp(0.28, 0.58), 0.88);
+    let dark = hsla_with_alpha(mix_color(rgb(0xffffff).to_hsla(), dark_tint, 0.35), 0.14);
+
+    AdaptiveColor::new(light, dark)
+}
+
+/// Contrast-safe artwork accent for the mini-player Play/Pause glyph and
+/// bottom progress hairline. Falls back to [`colors::PRIMARY`] for neutral
+/// covers (`s <= 0.12`).
+pub fn mini_player_accent(accent: Hsla) -> AdaptiveColor {
+    let c = accent.to_rgb();
+    let (h, s, _) = rgb_to_hsv(c.r, c.g, c.b);
+    if s <= 0.12 {
+        return colors::PRIMARY;
+    }
+
+    let light_surface = mini_player_surface(accent).light.to_rgb();
+    let light_sat = (s * 1.15).clamp(0.58, 0.85);
+    let mut light_val = 0.72_f32;
+    let mut light = hsv_to_hsla(h, light_sat, light_val);
+    while light_val > 0.34 && contrast_ratio(light.to_rgb(), light_surface) < 4.6 {
+        light_val = (light_val - 0.04).max(0.34);
+        light = hsv_to_hsla(h, light_sat, light_val);
+    }
+
+    let dark = artwork_np_accent(accent);
+    AdaptiveColor::new(light, dark)
+}
+
+/// Soft translucent circular fill behind the Phone mini-player Play/Pause
+/// glyph (`light: 0.12`, `dark: 0.18`).
+pub fn mini_player_play_bg(accent: Hsla) -> AdaptiveColor {
+    let acc = mini_player_accent(accent);
+    AdaptiveColor::new(
+        hsla_with_alpha(acc.light, 0.12),
+        hsla_with_alpha(acc.dark, 0.18),
+    )
+}
+
 /// Curated warm/editorial 2-stop cover palettes for offline or demo artwork.
 /// Kept inside `theme.rs` so no raw color literals exist elsewhere.
 const FALLBACK_GRADIENTS: &[(u32, u32)] = &[
@@ -779,6 +887,25 @@ const MODAL_DARK: &[BoxShadow] = &[
     drop_shadow(24.0, 60.0, -6.0, rgb_a(SHADOW_BLACK, 0.72)),
 ];
 
+// Single outer drop shadows with `spread = 0.0` and zero inset rims so mobile
+// compositors (e.g. HarmonyOS Rosen `CustomShadow`) stay on the hardware fast path.
+const MOBILE_SUBTLE_LIGHT: &[BoxShadow] = &[drop_shadow(1.0, 3.0, 0.0, rgb_a(SHADOW_INK, 0.08))];
+const MOBILE_SUBTLE_DARK: &[BoxShadow] = &[drop_shadow(1.0, 4.0, 0.0, rgb_a(SHADOW_BLACK, 0.36))];
+
+const MOBILE_CARD_LIGHT: &[BoxShadow] = &[drop_shadow(4.0, 14.0, 0.0, rgb_a(SHADOW_INK, 0.10))];
+const MOBILE_CARD_DARK: &[BoxShadow] = &[drop_shadow(6.0, 18.0, 0.0, rgb_a(SHADOW_BLACK, 0.42))];
+
+const MOBILE_FLOATING_LIGHT: &[BoxShadow] = &[drop_shadow(6.0, 20.0, 0.0, rgb_a(SHADOW_INK, 0.14))];
+const MOBILE_FLOATING_DARK: &[BoxShadow] =
+    &[drop_shadow(8.0, 24.0, 0.0, rgb_a(SHADOW_BLACK, 0.50))];
+
+const MOBILE_POPOVER_LIGHT: &[BoxShadow] = &[drop_shadow(8.0, 22.0, 0.0, rgb_a(SHADOW_INK, 0.14))];
+const MOBILE_POPOVER_DARK: &[BoxShadow] =
+    &[drop_shadow(10.0, 26.0, 0.0, rgb_a(SHADOW_BLACK, 0.54))];
+
+const MOBILE_MODAL_LIGHT: &[BoxShadow] = &[drop_shadow(12.0, 28.0, 0.0, rgb_a(SHADOW_INK, 0.20))];
+const MOBILE_MODAL_DARK: &[BoxShadow] = &[drop_shadow(14.0, 32.0, 0.0, rgb_a(SHADOW_BLACK, 0.62))];
+
 impl Elevation {
     pub fn shadows(self) -> (&'static [BoxShadow], &'static [BoxShadow]) {
         match self {
@@ -789,13 +916,27 @@ impl Elevation {
             Self::Modal => (MODAL_LIGHT, MODAL_DARK),
         }
     }
+
+    pub fn native_mobile_shadows(self) -> (&'static [BoxShadow], &'static [BoxShadow]) {
+        match self {
+            Self::Subtle => (MOBILE_SUBTLE_LIGHT, MOBILE_SUBTLE_DARK),
+            Self::Card => (MOBILE_CARD_LIGHT, MOBILE_CARD_DARK),
+            Self::Floating => (MOBILE_FLOATING_LIGHT, MOBILE_FLOATING_DARK),
+            Self::Popover => (MOBILE_POPOVER_LIGHT, MOBILE_POPOVER_DARK),
+            Self::Modal => (MOBILE_MODAL_LIGHT, MOBILE_MODAL_DARK),
+        }
+    }
 }
 
 /// Extension trait adding elevation and glass surface helpers to every [`Styled`] element.
 pub trait Elevated: Styled + Sized {
     /// Applies adaptive light/dark box shadows for the requested [`Elevation`] tier.
     fn elevation(self, level: Elevation) -> Self {
-        let (light, dark) = level.shadows();
+        let (light, dark) = if os().is_desktop() {
+            level.shadows()
+        } else {
+            level.native_mobile_shadows()
+        };
         let dark_vec: Vec<BoxShadow> = dark.to_vec();
         self.shadow(light.iter().copied())
             .dark(move |s: StyleRefinement| s.shadow(dark_vec))
@@ -871,5 +1012,90 @@ mod tests {
         let mixed = artwork_np_accent(blue).to_rgb();
         assert!((mixed.r - 0.45).abs() < 0.02, "r={}", mixed.r);
         assert!(mixed.b > 0.85, "b={}", mixed.b);
+    }
+
+    #[test]
+    fn mini_player_tokens_handle_neutral_and_saturated_covers() {
+        let gray = raw_accent_from_rgb(128, 128, 128);
+        assert_eq!(mini_player_accent(gray), colors::PRIMARY);
+
+        let neutral_surface = mini_player_surface(gray);
+        assert!((neutral_surface.light.to_rgb().a - 0.94).abs() < 0.02);
+        assert!((neutral_surface.dark.to_rgb().a - 0.90).abs() < 0.02);
+        assert!(neutral_surface.light.s < 0.02);
+
+        let neutral_border = mini_player_border(gray);
+        assert!((neutral_border.light.to_rgb().a - 0.09).abs() < 0.02);
+        assert!((neutral_border.dark.to_rgb().a - 0.14).abs() < 0.02);
+
+        let neutral_play_bg = mini_player_play_bg(gray);
+        assert!((neutral_play_bg.light.to_rgb().a - 0.12).abs() < 0.02);
+        assert!((neutral_play_bg.dark.to_rgb().a - 0.18).abs() < 0.02);
+
+        for cover in [
+            raw_accent_from_rgb(240, 80, 96),
+            raw_accent_from_rgb(250, 224, 60),
+            raw_accent_from_rgb(48, 118, 240),
+        ] {
+            let surface = mini_player_surface(cover);
+            let light_surf = surface.light.to_rgb();
+            let dark_surf = surface.dark.to_rgb();
+            assert!((light_surf.a - 0.92).abs() < 0.02, "a={}", light_surf.a);
+            assert!((dark_surf.a - 0.90).abs() < 0.02, "a={}", dark_surf.a);
+
+            // Text readability against frosted dock surfaces must stay >= 10:1.
+            let light_text_contrast = contrast_ratio(colors::FOREGROUND.light.to_rgb(), light_surf);
+            let dark_text_contrast = contrast_ratio(colors::FOREGROUND.dark.to_rgb(), dark_surf);
+            assert!(
+                light_text_contrast >= 10.0,
+                "light text contrast too low: {light_text_contrast:.2}"
+            );
+            assert!(
+                dark_text_contrast >= 10.0,
+                "dark text contrast too low: {dark_text_contrast:.2}"
+            );
+
+            let accent = mini_player_accent(cover);
+            let light_accent_contrast = contrast_ratio(accent.light.to_rgb(), light_surf);
+            assert!(
+                light_accent_contrast >= 4.5,
+                "light mini_player_accent contrast too low: {light_accent_contrast:.2}"
+            );
+            assert_eq!(accent.dark, artwork_np_accent(cover));
+
+            let border = mini_player_border(cover);
+            assert!((border.light.to_rgb().a - 0.09).abs() < 0.02);
+            assert!((border.dark.to_rgb().a - 0.14).abs() < 0.02);
+
+            let play_bg = mini_player_play_bg(cover);
+            assert!((play_bg.light.to_rgb().a - 0.12).abs() < 0.02);
+            assert!((play_bg.dark.to_rgb().a - 0.18).abs() < 0.02);
+        }
+    }
+
+    #[test]
+    fn native_mobile_shadows_satisfy_hardware_fast_path() {
+        for tier in [
+            Elevation::Subtle,
+            Elevation::Card,
+            Elevation::Floating,
+            Elevation::Popover,
+            Elevation::Modal,
+        ] {
+            let (light, dark) = tier.native_mobile_shadows();
+            assert_eq!(light.len(), 1, "{tier:?} light shadow count");
+            assert_eq!(dark.len(), 1, "{tier:?} dark shadow count");
+            for shadow in [light[0], dark[0]] {
+                assert!(!shadow.inset, "{tier:?} mobile shadow must not be inset");
+                assert_eq!(
+                    shadow.spread.0, 0.0,
+                    "{tier:?} mobile shadow spread must be 0.0"
+                );
+                assert!(
+                    shadow.blur.0 > 0.0,
+                    "{tier:?} mobile shadow blur must be > 0.0"
+                );
+            }
+        }
     }
 }

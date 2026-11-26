@@ -1526,3 +1526,770 @@ fn desktop_linux_closing_settings_keeps_main_alive_and_closing_main_quits() {
         "closing primary `main` window must quit under Linux QuitMode::Platform"
     );
 }
+
+fn write_fixture_virtual_cli_plugin(dir: &Path) {
+    fs::write(
+        dir.join("plugin.json"),
+        r#"{
+            "id": "fixture-virtual-cli",
+            "name": "Fixture Virtual CLI",
+            "version": "1.0.0",
+            "author": "Verifier Suite",
+            "description": "Fixture plugin exercising mobile virtualization switch and PATH fallback",
+            "main": "index.js",
+            "permissions": {
+                "process": ["yt-dlp"]
+            }
+        }"#,
+    )
+    .expect("write fixture virtual cli plugin.json");
+
+    fs::write(
+        dir.join("index.js"),
+        r#"
+const TRACK = {
+    id: "vc-1",
+    name: "Virtual Shim Song",
+    artists: [{ id: "ar-vc", name: "Shim Runner" }],
+    album: { id: "al-vc", name: "Virtual Tests" },
+    duration: 180000
+};
+
+export async function home() {
+    const proc = host.spawn("yt-dlp", ["--version"], {
+        env: { PATH: "/nonexistent-nsh-test-path" }
+    });
+    const code = await proc.wait();
+    if (code !== 0) {
+        throw new Error(`yt-dlp exited with ${code}`);
+    }
+    return {
+        title: "Virtual CLI Home",
+        sections: [
+            {
+                title: "Virtual Picks",
+                tracks: [TRACK]
+            }
+        ]
+    };
+}
+"#,
+    )
+    .expect("write fixture virtual cli index.js");
+}
+
+#[test]
+fn phone_source_switcher_and_reactive_plugin_card_status() {
+    let mut guard = IsolatedStateGuard::acquire();
+    let plugin_dir = guard.make_temp_dir("phone-source-switcher-plugin");
+    write_fixture_phone_auth_plugin(&plugin_dir);
+
+    let mut app = start_viewport(390.0, 844.0, Os::Ios, Idiom::Phone);
+    app.wait_for("id:shell-phone").unwrap();
+    app.wait_for("id:phone-source-switcher").unwrap();
+
+    // 1. Open Phone source switcher on clean boot -> press `source-switcher-item-local`.
+    app.press("id:phone-source-switcher").unwrap();
+    app.wait_for("id:source-switcher-item-local").unwrap();
+    check_min_bounds(
+        &app,
+        "source-switcher-item-local",
+        200.0,
+        MIN_TOUCH_TARGET_PT,
+    )
+    .expect("source-switcher-item-local touch bounds");
+    app.press("id:source-switcher-item-local").unwrap();
+    app.wait_for_gone("id:source-switcher-item-local", GONE_TIMEOUT)
+        .unwrap();
+    app.wait_for("id:phone-source-switcher >> text:本地音乐")
+        .unwrap();
+    app.wait_for("还没有音乐").unwrap();
+
+    // 2. Install fixture plugin via Settings -> Plugins.
+    app.press("id:tab-settings").unwrap();
+    app.wait_for("id:phone-settings-plugins").unwrap();
+    app.press("id:phone-settings-plugins").unwrap();
+    app.wait_for("id:phone-plugins-install-btn").unwrap();
+    app.press("id:phone-plugins-install-btn").unwrap();
+    app.wait_for("id:install-plugin-pick-folder").unwrap();
+
+    app.on_pick_paths(vec![plugin_dir]).unwrap();
+    app.press("id:install-plugin-pick-folder").unwrap();
+    app.wait_for("id:confirm-plugin-install-btn").unwrap();
+    app.press("id:confirm-plugin-install-btn").unwrap();
+    app.wait_for_gone("id:confirm-plugin-install-btn", GONE_TIMEOUT)
+        .unwrap();
+    app.wait_for("Fixture Phone Auth").unwrap();
+
+    // Allow the Phone bottom sheet close transition to settle before tapping the plugin card.
+    std::thread::sleep(Duration::from_millis(300));
+
+    // 3. Regression (#305): tapping `切换音乐源` on plugin_card immediately reacts to active source change.
+    app.wait_for("id:phone-settings-detail >> role:button[切换音乐源]")
+        .unwrap();
+    app.press("id:phone-settings-detail >> role:button[切换音乐源]")
+        .unwrap();
+    app.wait_for_gone(
+        "id:phone-settings-detail >> role:button[切换音乐源]",
+        GONE_TIMEOUT,
+    )
+    .unwrap();
+    app.wait_for("id:phone-settings-detail >> text:已启用")
+        .unwrap();
+
+    // 4. Return to Home -> switch back to `local` via `source-switcher-item-local`, then back to plugin.
+    app.press("id:phone-back-btn").unwrap();
+    app.wait_for("id:tab-home").unwrap();
+    app.press("id:tab-home").unwrap();
+    app.wait_for("id:phone-source-switcher >> text:Fixture Phone Auth")
+        .unwrap();
+    app.wait_for("id:phone-main-viewport >> text:Harbor Echo")
+        .unwrap();
+
+    app.press("id:phone-source-switcher").unwrap();
+    app.wait_for("id:source-switcher-item-local").unwrap();
+    app.wait_for("id:source-switcher-item-fixture-phone-auth")
+        .unwrap();
+    app.press("id:source-switcher-item-local").unwrap();
+    app.wait_for_gone("id:source-switcher-item-local", GONE_TIMEOUT)
+        .unwrap();
+    app.wait_for("id:phone-source-switcher >> text:本地音乐")
+        .unwrap();
+    app.wait_for("还没有音乐").unwrap();
+
+    // Re-open switcher and select the installed plugin by its stable test_id.
+    std::thread::sleep(Duration::from_millis(300));
+    app.press("id:phone-source-switcher").unwrap();
+    app.wait_for("id:source-switcher-item-fixture-phone-auth")
+        .unwrap();
+    app.press("id:source-switcher-item-fixture-phone-auth")
+        .unwrap();
+    app.wait_for_gone("id:source-switcher-item-fixture-phone-auth", GONE_TIMEOUT)
+        .unwrap();
+    app.wait_for("id:phone-source-switcher >> text:Fixture Phone Auth")
+        .unwrap();
+    app.wait_for("id:phone-main-viewport >> text:Harbor Echo")
+        .unwrap();
+}
+
+#[test]
+fn phone_mobile_virtual_compat_toggle_and_plugin_runtime_error_banner() {
+    let mut guard = IsolatedStateGuard::acquire();
+    let plugin_dir = guard.make_temp_dir("phone-virtual-cli-plugin");
+    write_fixture_virtual_cli_plugin(&plugin_dir);
+
+    let mut app = start_viewport(390.0, 844.0, Os::Ios, Idiom::Phone);
+    app.wait_for("id:shell-phone").unwrap();
+
+    // 1. Navigate to Settings -> Plugins and verify the Mobile Virtualization Compatibility switch defaults ON.
+    app.press("id:tab-settings").unwrap();
+    app.wait_for("id:phone-settings-plugins").unwrap();
+    app.press("id:phone-settings-plugins").unwrap();
+    app.wait_for("id:plugins-mobile-virtual-compat-switch")
+        .unwrap();
+    app.wait_for("id:plugins-mobile-virtual-compat-switch >> text:已启用")
+        .unwrap();
+    check_min_bounds(
+        &app,
+        "plugins-mobile-virtual-compat-switch",
+        44.0,
+        MIN_TOUCH_TARGET_PT,
+    )
+    .expect("mobile virtual compat switch touch bounds");
+
+    // 2. Install the yt-dlp fixture plugin; with virtualization ON it displays `移动端虚拟化兼容`.
+    app.press("id:phone-plugins-install-btn").unwrap();
+    app.wait_for("id:install-plugin-pick-folder").unwrap();
+    app.on_pick_paths(vec![plugin_dir]).unwrap();
+    app.press("id:install-plugin-pick-folder").unwrap();
+    app.wait_for("id:confirm-plugin-install-btn").unwrap();
+    app.wait_for("移动端虚拟化兼容").unwrap();
+    app.press("id:confirm-plugin-install-btn").unwrap();
+    app.wait_for_gone("id:confirm-plugin-install-btn", GONE_TIMEOUT)
+        .unwrap();
+    app.wait_for("Fixture Virtual CLI").unwrap();
+    app.wait_for("id:phone-settings-detail >> text:移动端虚拟化兼容")
+        .unwrap();
+    assert!(
+        !app.screen()
+            .matches("id:plugin-runtime-error-fixture-virtual-cli")
+            .unwrap(),
+        "no runtime error banner should be shown while mobile virtualization is enabled"
+    );
+
+    // Activate plugin from Settings -> Plugins while virtualization is ON -> virtual shim succeeds on Home.
+    std::thread::sleep(Duration::from_millis(300));
+    app.press("id:phone-settings-detail >> role:button[切换音乐源]")
+        .unwrap();
+    app.wait_for_gone(
+        "id:phone-settings-detail >> role:button[切换音乐源]",
+        GONE_TIMEOUT,
+    )
+    .unwrap();
+    app.press("id:phone-back-btn").unwrap();
+    app.wait_for("id:tab-home").unwrap();
+    app.press("id:tab-home").unwrap();
+    app.wait_for("id:phone-main-viewport >> text:Virtual Shim Song")
+        .unwrap();
+
+    // 3. Return to Plugins, toggle Mobile Virtualization Compatibility OFF -> persists to settings.json
+    //    and updates compatibility badge to `需要桌面外部程序`.
+    app.press("id:tab-settings").unwrap();
+    app.wait_for("id:phone-settings-plugins").unwrap();
+    app.press("id:phone-settings-plugins").unwrap();
+    app.wait_for("id:plugins-mobile-virtual-compat-switch >> text:已启用")
+        .unwrap();
+    app.press("id:plugins-mobile-virtual-compat-switch")
+        .unwrap();
+    app.wait_for("id:plugins-mobile-virtual-compat-switch >> text:已停用")
+        .unwrap();
+    app.wait_for("id:phone-settings-detail >> text:需要桌面外部程序")
+        .unwrap();
+
+    let raw_settings = fs::read_to_string(AppSettings::default_path())
+        .expect("settings.json should be persisted after toggling mobile_virtual_compat");
+    assert!(
+        raw_settings.contains("\"mobileVirtualCompat\": false"),
+        "persisted settings.json must contain mobileVirtualCompat=false, got:\n{raw_settings}"
+    );
+    assert!(
+        !AppSettings::load()
+            .expect("reload settings.json")
+            .mobile_virtual_compat,
+        "reloaded AppSettings.mobile_virtual_compat must be false"
+    );
+
+    // 4. Refresh Home while virtualization is OFF -> plugin invokes real PATH spawn (missing yt-dlp in
+    //    `/nonexistent-nsh-test-path`), fails, and surfaces `plugin-runtime-error-fixture-virtual-cli`.
+    app.press("id:phone-back-btn").unwrap();
+    app.wait_for("id:tab-home").unwrap();
+    app.press("id:tab-home").unwrap();
+    app.wait_for("id:phone-refresh-btn").unwrap();
+    app.press("id:phone-refresh-btn").unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+
+    app.press("id:tab-settings").unwrap();
+    app.wait_for("id:phone-settings-plugins").unwrap();
+    app.press("id:phone-settings-plugins").unwrap();
+    app.wait_for("id:plugin-runtime-error-fixture-virtual-cli")
+        .unwrap();
+    app.wait_for("id:plugin-runtime-error-fixture-virtual-cli >> text:命令调用失败")
+        .unwrap();
+
+    // 5. Toggle Mobile Virtualization Compatibility back ON -> error banner clears & settings persist true.
+    app.press("id:plugins-mobile-virtual-compat-switch")
+        .unwrap();
+    app.wait_for("id:plugins-mobile-virtual-compat-switch >> text:已启用")
+        .unwrap();
+    app.wait_for_gone("id:plugin-runtime-error-fixture-virtual-cli", GONE_TIMEOUT)
+        .unwrap();
+    app.wait_for("id:phone-settings-detail >> text:移动端虚拟化兼容")
+        .unwrap();
+    assert!(
+        AppSettings::load()
+            .expect("reload settings.json")
+            .mobile_virtual_compat,
+        "reloaded AppSettings.mobile_virtual_compat must be true after re-enabling"
+    );
+}
+
+#[test]
+fn phone_now_playing_more_tab_and_song_more_sheet() {
+    let mut guard = IsolatedStateGuard::acquire();
+    let music_dir = guard.make_temp_dir("phone-np-more-wav");
+    write_fixture_local_wavs(&music_dir);
+
+    let mut app = start_viewport(390.0, 844.0, Os::Ios, Idiom::Phone);
+    app.wait_for("id:shell-phone").unwrap();
+    app.wait_for("还没有音乐").unwrap();
+
+    // 1. Scan local WAV folder and start playback so multiple tracks are in the queue.
+    app.on_pick_paths(vec![music_dir]).unwrap();
+    app.press("role:button[添加音乐文件夹]").unwrap();
+    app.wait_for("id:phone-main-viewport >> text:Acoustic Sunrise")
+        .unwrap();
+    app.press("id:phone-main-viewport >> text:Acoustic Sunrise >> nth=0")
+        .unwrap();
+    app.wait_for("id:phone-mini-player-dock").unwrap();
+    app.wait_for("id:phone-mini-player >> text:Acoustic Sunrise")
+        .unwrap();
+
+    // 2. Open Now Playing overlay on Phone.
+    app.press("id:phone-mini-player").unwrap();
+    app.wait_for("id:now-playing-overlay").unwrap();
+    app.wait_for("id:np-phone-tab-cover").unwrap();
+    app.wait_for("id:np-phone-tab-more").unwrap();
+
+    // 3. Switch to `更多` (`np-phone-tab-more`) -> Queue & Wall subtabs + queue tracks render cleanly.
+    app.press("id:np-phone-tab-more").unwrap();
+    app.wait_for("id:np-more-tab-queue").unwrap();
+    app.wait_for("id:np-more-tab-wall").unwrap();
+    app.wait_for("id:now-playing-overlay >> text:Evening Breeze")
+        .unwrap();
+
+    // 4. Switch to virtualized Cover Wall (`np-more-tab-wall`) -> queue cover tiles render cleanly.
+    app.press("id:np-more-tab-wall").unwrap();
+    app.wait_for("id:now-playing-overlay >> role:button[Evening Breeze]")
+        .unwrap();
+    app.wait_for("id:now-playing-overlay >> role:button[Acoustic Sunrise] >> nth=1")
+        .unwrap();
+    assert!(
+        app.screen()
+            .selected("id:now-playing-overlay >> role:button[Acoustic Sunrise] >> nth=1")
+            .unwrap(),
+        "currently playing track tile must be selected in Cover Wall"
+    );
+
+    // 5. Return to Cover (`np-phone-tab-cover`) and tap lazy `···` (`np-song-more-btn`) ->
+    //    bottom sheet song menu opens cleanly with expected actions.
+    app.press("id:np-phone-tab-cover").unwrap();
+    app.wait_for("id:np-song-more-btn").unwrap();
+    check_min_bounds(
+        &app,
+        "np-song-more-btn",
+        MIN_TOUCH_TARGET_PT,
+        MIN_TOUCH_TARGET_PT,
+    )
+    .expect("np-song-more-btn touch bounds");
+    app.press("id:np-song-more-btn").unwrap();
+    app.wait_for("下一首播放").unwrap();
+    app.wait_for("添加到队列").unwrap();
+    app.wait_for("复制歌名").unwrap();
+}
+
+fn write_fixture_paged_lyrics_plugin(dir: &Path, wav_path: &Path) {
+    fs::write(
+        dir.join("plugin.json"),
+        r#"{
+            "id": "fixture-paged",
+            "name": "Fixture Paged Music",
+            "version": "1.0.0",
+            "author": "Verifier Suite",
+            "description": "Local JS fixture plugin for pagination and structured lyrics tests",
+            "main": "index.js",
+            "permissions": {}
+        }"#,
+    )
+    .expect("write fixture paged plugin.json");
+
+    let wav_escaped = wav_path
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    let js = format!(
+        r#"
+const WAV_PATH = "{wav_escaped}";
+
+const TRACK_A = {{
+    id: "pg-1",
+    name: "Paged Alpha",
+    artists: [{{ id: "ar-1", name: "Synth Unit" }}],
+    album: {{ id: "al-1", name: "Alpha Disc" }},
+    duration: 15000
+}};
+
+const TRACK_B = {{
+    id: "pg-2",
+    name: "Silent Beta",
+    artists: [{{ id: "ar-1", name: "Synth Unit" }}],
+    album: {{ id: "al-1", name: "Alpha Disc" }},
+    duration: 15000
+}};
+
+const SEARCH_T1 = {{
+    id: "sr-1",
+    name: "Search Page One Track",
+    artists: [{{ id: "ar-s", name: "Query Band" }}],
+    album: {{ id: "al-s", name: "Query Vol 1" }},
+    duration: 15000
+}};
+
+const SEARCH_T2 = {{
+    id: "sr-2",
+    name: "Search Page Two Track",
+    artists: [{{ id: "ar-s", name: "Query Band" }}],
+    album: {{ id: "al-s", name: "Query Vol 2" }},
+    duration: 15000
+}};
+
+const LIKED_T1 = {{
+    id: "lk-1",
+    name: "Liked Page One Track",
+    artists: [{{ id: "ar-l", name: "Heart Band" }}],
+    album: {{ id: "al-l", name: "Heart Vol 1" }},
+    duration: 15000
+}};
+
+const LIKED_T2 = {{
+    id: "lk-2",
+    name: "Liked Page Two Track",
+    artists: [{{ id: "ar-l", name: "Heart Band" }}],
+    album: {{ id: "al-l", name: "Heart Vol 2" }},
+    duration: 15000
+}};
+
+export async function home() {{
+    return {{
+        title: "Paged Home",
+        sections: [
+            {{
+                title: "Featured Tracks",
+                tracks: [TRACK_A, TRACK_B]
+            }}
+        ]
+    }};
+}}
+
+export async function search(arg) {{
+    const offset = (arg && arg.offset) || 0;
+    if (offset === 0) {{
+        return {{ tracks: [SEARCH_T1], more: true }};
+    }}
+    return {{ tracks: [SEARCH_T1, SEARCH_T2], more: false }};
+}}
+
+export async function liked(arg) {{
+    const offset = (arg && arg.offset) || 0;
+    if (offset === 0) {{
+        return {{ tracks: [LIKED_T1], more: true }};
+    }}
+    return {{ tracks: [LIKED_T1, LIKED_T2], more: false }};
+}}
+
+export async function savedAlbums(arg) {{
+    const offset = (arg && arg.offset) || 0;
+    if (offset === 0) {{
+        return {{
+            albums: [
+                {{ id: "sa-1", name: "Saved Album One", artists: [{{ id: "ar-a", name: "Disc Artist" }}] }}
+            ],
+            more: true
+        }};
+    }}
+    return {{
+        albums: [
+            {{ id: "sa-1", name: "Saved Album One", artists: [{{ id: "ar-a", name: "Disc Artist" }}] }},
+            {{ id: "sa-2", name: "Saved Album Two", artists: [{{ id: "ar-a", name: "Disc Artist" }}] }}
+        ],
+        more: false
+    }};
+}}
+
+export async function shows() {{
+    return [
+        {{ id: "sh-pg", name: "Paged Podcast Show", publisher: "Audio Lab", episodeCount: 2 }}
+    ];
+}}
+
+export async function show(arg) {{
+    const offset = (arg && arg.offset) || 0;
+    const baseShow = {{ id: "sh-pg", name: "Paged Podcast Show", publisher: "Audio Lab", episodeCount: 2 }};
+    const ep1 = {{
+        id: "ep-1",
+        name: "Episode Page One",
+        duration: 15000,
+        episode: {{ showId: "sh-pg", showName: "Paged Podcast Show" }}
+    }};
+    const ep2 = {{
+        id: "ep-2",
+        name: "Episode Page Two",
+        duration: 15000,
+        episode: {{ showId: "sh-pg", showName: "Paged Podcast Show" }}
+    }};
+    if (offset === 0) {{
+        return {{ show: baseShow, episodes: [ep1], more: true }};
+    }}
+    return {{ show: baseShow, episodes: [ep1, ep2], more: false }};
+}}
+
+export async function comments(arg) {{
+    const trackId = (arg && arg.trackId) || "";
+    const offset = (arg && arg.offset) || 0;
+    if (trackId !== "pg-1") {{
+        return {{ comments: [], total: 0, more: false }};
+    }}
+    const c1 = {{
+        id: "cm-1",
+        author: "Alice",
+        text: "First Page Comment",
+        likes: 12,
+        time: 1730000000
+    }};
+    const c2 = {{
+        id: "cm-2",
+        author: "Bob",
+        text: "Second Page Comment",
+        likes: 7,
+        time: 1730000100
+    }};
+    if (offset === 0) {{
+        return {{ comments: [c1], total: 2, more: true }};
+    }}
+    return {{ comments: [c1, c2], total: 2, more: false }};
+}}
+
+export async function lyrics(arg) {{
+    const id = (arg && arg.id) || "";
+    if (id === "pg-1") {{
+        return {{
+            lrc: "",
+            lines: [
+                {{
+                    start: 0,
+                    end: 4000,
+                    text: "Structured First Line",
+                    translation: "结构化第一行",
+                    words: [
+                        {{ start: 0, end: 1500, text: "Structured " }},
+                        {{ start: 1500, end: 2800, text: "First " }},
+                        {{ start: 2800, end: 4000, text: "Line" }}
+                    ]
+                }},
+                {{
+                    start: 4500,
+                    end: 9000,
+                    text: "Structured Second Line",
+                    translation: "结构化第二行",
+                    words: []
+                }}
+            ]
+        }};
+    }}
+    return {{ lrc: "", lines: [] }};
+}}
+
+export async function stream() {{
+    return {{ url: WAV_PATH, type: "audio/wav" }};
+}}
+"#
+    );
+    fs::write(dir.join("index.js"), js).expect("write fixture paged index.js");
+}
+
+fn install_and_select_paged_plugin_on_pad(app: &mut Headless, plugin_dir: &Path) {
+    app.wait_for("id:shell-pad-landscape").unwrap();
+    app.press("id:pad-nav-settings").unwrap();
+    app.wait_for("id:settings-nav-plugins").unwrap();
+    app.press("id:settings-nav-plugins").unwrap();
+    app.wait_for("id:plugins-btn-github").unwrap();
+    app.press("id:plugins-btn-github").unwrap();
+    app.wait_for("id:install-plugin-input").unwrap();
+    app.type_text("id:install-plugin-input", &plugin_dir.to_string_lossy())
+        .unwrap();
+    app.press("id:install-plugin-submit").unwrap();
+    app.wait_for("id:confirm-plugin-install-btn").unwrap();
+    app.press("id:confirm-plugin-install-btn").unwrap();
+    app.wait_for_gone("id:confirm-plugin-install-btn", GONE_TIMEOUT)
+        .unwrap();
+
+    app.press("id:pad-source-switcher").unwrap();
+    app.wait_for("id:source-switcher-item-fixture-paged")
+        .unwrap();
+    app.press("id:source-switcher-item-fixture-paged").unwrap();
+    app.wait_for_gone("id:source-switcher-item-fixture-paged", GONE_TIMEOUT)
+        .unwrap();
+    app.press("id:pad-nav-home").unwrap();
+    app.wait_for("id:pad-main-viewport >> text:Paged Alpha")
+        .unwrap();
+}
+
+#[test]
+fn pad_pagination_load_more_dedup_and_stop() {
+    let mut guard = IsolatedStateGuard::acquire();
+    let media_dir = guard.make_temp_dir("pad-paged-media");
+    let wav_path = media_dir.join("fixture.wav");
+    write_minimal_wav(&wav_path);
+    let plugin_dir = guard.make_temp_dir("pad-paged-plugin");
+    write_fixture_paged_lyrics_plugin(&plugin_dir, &wav_path);
+
+    let mut app = start_viewport(1024.0, 768.0, Os::Ios, Idiom::Pad);
+    install_and_select_paged_plugin_on_pad(&mut app, &plugin_dir);
+
+    // 1. Search pagination (`load_more_search`): appends deduplicated page 2 and hides button.
+    app.press("id:pad-nav-search").unwrap();
+    app.wait_for("id:search-page-input").unwrap();
+    app.type_text("id:search-page-input", "query").unwrap();
+    app.wait_for("id:pad-main-viewport >> text:Search Page One Track")
+        .unwrap();
+    app.wait_for("id:search-load-more-btn").unwrap();
+    check_min_bounds(
+        &app,
+        "search-load-more-btn",
+        MIN_TOUCH_TARGET_PT,
+        MIN_TOUCH_TARGET_PT,
+    )
+    .expect("search-load-more-btn touch bounds");
+    app.press("id:search-load-more-btn").unwrap();
+    app.wait_for("id:pad-main-viewport >> text:Search Page Two Track")
+        .unwrap();
+    app.wait_for_gone("id:search-load-more-btn", GONE_TIMEOUT)
+        .unwrap();
+    assert_eq!(
+        app.screen()
+            .count("id:pad-main-viewport >> text:Search Page One Track")
+            .unwrap(),
+        1,
+        "overlapping search page-1 track ID must be deduplicated"
+    );
+
+    // 2. Saved Albums pagination (`load_more_saved_albums`).
+    app.press("id:pad-nav-library").unwrap();
+    app.wait_for("id:pad-main-viewport >> text:Saved Album One")
+        .unwrap();
+    app.wait_for("id:saved-albums-load-more-btn").unwrap();
+    check_min_bounds(
+        &app,
+        "saved-albums-load-more-btn",
+        MIN_TOUCH_TARGET_PT,
+        MIN_TOUCH_TARGET_PT,
+    )
+    .expect("saved-albums-load-more-btn touch bounds");
+    app.press("id:saved-albums-load-more-btn").unwrap();
+    app.wait_for("id:pad-main-viewport >> text:Saved Album Two")
+        .unwrap();
+    app.wait_for_gone("id:saved-albums-load-more-btn", GONE_TIMEOUT)
+        .unwrap();
+    assert_eq!(
+        app.screen()
+            .count("id:pad-main-viewport >> text:Saved Album One")
+            .unwrap(),
+        1,
+        "overlapping saved album ID must be deduplicated"
+    );
+
+    // 3. Liked tracks pagination (`load_more_liked`).
+    app.press("id:pad-main-viewport >> role:button[/我喜欢的音乐/]")
+        .unwrap();
+    app.wait_for("id:pad-main-viewport >> text:Liked Page One Track")
+        .unwrap();
+    app.wait_for("id:liked-load-more-btn").unwrap();
+    check_min_bounds(
+        &app,
+        "liked-load-more-btn",
+        MIN_TOUCH_TARGET_PT,
+        MIN_TOUCH_TARGET_PT,
+    )
+    .expect("liked-load-more-btn touch bounds");
+    app.press("id:liked-load-more-btn").unwrap();
+    app.wait_for("id:pad-main-viewport >> text:Liked Page Two Track")
+        .unwrap();
+    app.wait_for_gone("id:liked-load-more-btn", GONE_TIMEOUT)
+        .unwrap();
+    assert_eq!(
+        app.screen()
+            .count("id:pad-main-viewport >> text:Liked Page One Track")
+            .unwrap(),
+        1,
+        "overlapping liked track ID must be deduplicated"
+    );
+
+    // 4. Podcast Show episodes pagination (`load_more_show_episodes`).
+    app.press("id:pad-nav-podcasts").unwrap();
+    app.wait_for("id:pad-main-viewport >> text:Paged Podcast Show")
+        .unwrap();
+    app.press("id:pad-main-viewport >> text:Paged Podcast Show")
+        .unwrap();
+    app.wait_for("id:pad-main-viewport >> text:Episode Page One")
+        .unwrap();
+    app.wait_for("id:show-load-more-btn").unwrap();
+    check_min_bounds(
+        &app,
+        "show-load-more-btn",
+        MIN_TOUCH_TARGET_PT,
+        MIN_TOUCH_TARGET_PT,
+    )
+    .expect("show-load-more-btn touch bounds");
+    app.press("id:show-load-more-btn").unwrap();
+    app.wait_for("id:pad-main-viewport >> text:Episode Page Two")
+        .unwrap();
+    app.wait_for_gone("id:show-load-more-btn", GONE_TIMEOUT)
+        .unwrap();
+    assert_eq!(
+        app.screen()
+            .count("id:pad-main-viewport >> text:Episode Page One")
+            .unwrap(),
+        1,
+        "overlapping episode ID must be deduplicated"
+    );
+
+    // 5. Now Playing comments pagination (`load_more_comments`).
+    app.press("id:pad-nav-home").unwrap();
+    app.wait_for("id:pad-main-viewport >> text:Paged Alpha")
+        .unwrap();
+    app.press("id:pad-main-viewport >> text:Paged Alpha >> nth=0")
+        .unwrap();
+    app.wait_for("id:pad-player-dock >> text:Paged Alpha")
+        .unwrap();
+    app.press("id:pad-now-playing-trigger").unwrap();
+    app.wait_for("id:now-playing-overlay").unwrap();
+    app.press("id:now-playing-overlay >> label:评论").unwrap();
+    app.wait_for("id:now-playing-overlay >> text:First Page Comment")
+        .unwrap();
+    app.wait_for("id:comments-load-more-btn").unwrap();
+    check_min_bounds(
+        &app,
+        "comments-load-more-btn",
+        MIN_TOUCH_TARGET_PT,
+        MIN_TOUCH_TARGET_PT,
+    )
+    .expect("comments-load-more-btn touch bounds");
+    app.press("id:comments-load-more-btn").unwrap();
+    app.wait_for("id:now-playing-overlay >> text:Second Page Comment")
+        .unwrap();
+    app.wait_for_gone("id:comments-load-more-btn", GONE_TIMEOUT)
+        .unwrap();
+    app.wait_for("id:now-playing-overlay >> text:已加载全部评论")
+        .unwrap();
+    assert_eq!(
+        app.screen()
+            .count("id:now-playing-overlay >> text:First Page Comment")
+            .unwrap(),
+        1,
+        "overlapping comment ID must be deduplicated"
+    );
+}
+
+#[test]
+fn pad_structured_lyrics_render_and_stale_clear_on_track_change() {
+    let mut guard = IsolatedStateGuard::acquire();
+    let media_dir = guard.make_temp_dir("pad-lyrics-media");
+    let wav_path = media_dir.join("fixture.wav");
+    write_minimal_wav(&wav_path);
+    let plugin_dir = guard.make_temp_dir("pad-lyrics-plugin");
+    write_fixture_paged_lyrics_plugin(&plugin_dir, &wav_path);
+
+    let mut app = start_viewport(1024.0, 768.0, Os::Ios, Idiom::Pad);
+    install_and_select_paged_plugin_on_pad(&mut app, &plugin_dir);
+
+    // 1. Play Track A (`pg-1`), which returns structured `Lyrics { lines, lrc: "" }`.
+    app.press("id:pad-main-viewport >> text:Paged Alpha >> nth=0")
+        .unwrap();
+    app.wait_for("id:pad-player-dock >> text:Paged Alpha")
+        .unwrap();
+    app.press("id:pad-now-playing-trigger").unwrap();
+    app.wait_for("id:now-playing-overlay").unwrap();
+    app.press("id:now-playing-overlay >> label:歌词").unwrap();
+
+    // Structured lines (with word timings and no raw LRC text) parse & render cleanly.
+    app.wait_for("id:now-playing-overlay >> role:button[Structured First Line]")
+        .unwrap();
+    app.wait_for("id:now-playing-overlay >> text:Structured Second Line")
+        .unwrap();
+
+    // 2. Advance to Track B (`pg-2`, no lyrics) -> stale Track A lyrics clear immediately.
+    app.press("id:now-playing-overlay >> label:下一曲").unwrap();
+    app.wait_for("id:now-playing-overlay >> text:Silent Beta")
+        .unwrap();
+    app.wait_for_gone(
+        "id:now-playing-overlay >> role:button[Structured First Line]",
+        GONE_TIMEOUT,
+    )
+    .unwrap();
+    app.wait_for_gone(
+        "id:now-playing-overlay >> text:Structured Second Line",
+        GONE_TIMEOUT,
+    )
+    .unwrap();
+    app.wait_for("id:now-playing-overlay >> text:暂无歌词，静心聆听。")
+        .unwrap();
+}

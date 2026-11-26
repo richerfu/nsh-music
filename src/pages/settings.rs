@@ -1322,7 +1322,7 @@ fn audio_engine_summary(store: AppStore) -> String {
         };
         engine_parts.push(label);
     }
-    if caps.virtual_ffmpeg_shim {
+    if caps.virtual_ffmpeg_shim && store.settings.with(|s| s.mobile_virtual_compat) {
         engine_parts.push(store.t("plugins.compat_mobile_virtualized").to_string());
     }
     engine_parts.join(" · ")
@@ -1649,17 +1649,25 @@ fn build_about_section(store: AppStore, form: DeviceForm, query: &str) -> Option
 fn build_plugins_section_filtered(store: AppStore, form: DeviceForm, query: &str) -> Option<View> {
     let plugins_title = store.t("settings.section.plugins");
     let install_lbl = store.t("plugins.install");
+    let compat_lbl = store.t("plugins.mobile_virtual_compat");
     let section_hit = matches_filter(
         query,
         &[
             &plugins_title,
             &install_lbl,
+            &compat_lbl,
             "plugin",
             "source",
             "github",
             "zip",
+            "virtual",
+            "path",
+            "ffmpeg",
+            "yt-dlp",
             "插件",
             "音乐源",
+            "虚拟化",
+            "兼容",
         ],
     );
     let has_matching_plugin = store
@@ -1755,6 +1763,59 @@ fn plugins_pane_content(store: AppStore, form: DeviceForm, query: &str) -> View 
         },
     );
 
+    let is_phone = form.is_phone();
+    let virtual_compat_card = Elevated::elevation(
+        view()
+            .w_full()
+            .p(px(if is_phone { 15.0 } else { 18.0 }))
+            .rounded(px(radius::XL))
+            .bg(theme::card)
+            .border_1()
+            .border_color(theme::border),
+        Elevation::Subtle,
+    )
+    .child(
+        view()
+            .w_full()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .flex_wrap()
+            .gap_3()
+            .child(
+                view()
+                    .flex_1()
+                    .min_w(px(if is_phone { 180.0 } else { 220.0 }))
+                    .gap_1()
+                    .child(
+                        text(move || store.t("plugins.mobile_virtual_compat"))
+                            .text_size(px(font_size::BODY))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::fg),
+                    )
+                    .child(
+                        text(move || store.t("plugins.mobile_virtual_compat.desc"))
+                            .text_size(px(font_size::CAPTION))
+                            .text_color(theme::muted_fg),
+                    ),
+            )
+            .child(
+                styled_switch(
+                    move || store.settings.with(|s| s.mobile_virtual_compat),
+                    move || {
+                        if store.settings.with(|s| s.mobile_virtual_compat) {
+                            store.t("common.enabled")
+                        } else {
+                            store.t("common.disabled")
+                        }
+                    },
+                    move |next| store.set_mobile_virtual_compat(next),
+                )
+                .test_id("plugins-mobile-virtual-compat-switch")
+                .min_h(px(form.min_touch_target())),
+            ),
+    );
+
     let installed_section = settings_card(
         move || store.t("settings.section.plugins"),
         Icon::Plugin,
@@ -1762,6 +1823,7 @@ fn plugins_pane_content(store: AppStore, form: DeviceForm, query: &str) -> View 
             let plugins = store.plugins.get();
             let sources = store.sources.get();
             let _loc = store.locale.get();
+            let _virtual_compat = store.settings.with(|s| s.mobile_virtual_compat);
             let q = query_owned.clone();
             untracked(move || {
                 let filtered: Vec<PluginSummary> = plugins
@@ -1827,6 +1889,7 @@ fn plugins_pane_content(store: AppStore, form: DeviceForm, query: &str) -> View 
         .child(import_toolbar(store, form, mobile_ui))
         .child(busy_banner)
         .child(error_banner)
+        .child(virtual_compat_card)
         .child(installed_section)
 }
 
@@ -2107,10 +2170,10 @@ fn plugin_card(
     let external_cmds_str = external_cmds.join(", ");
     let is_granted = plugin.granted;
     let plugin_name_for_remove = plugin.name.clone();
+    let pid_active = pid.clone();
     let pid_switch = pid.clone();
-    let is_active_source = store
-        .active_source_id
-        .with_untracked(|active| active == &pid_switch);
+    let is_active_source =
+        computed(move || store.active_source_id.with(|active| active == &pid_active));
     let has_plugin_settings = !plugin.settings.is_empty();
 
     let is_phone = form.is_phone();
@@ -2303,6 +2366,33 @@ fn plugin_card(
         );
     }
 
+    // Per-plugin runtime / PATH command error banner
+    if let Some(err) = &plugin.runtime_error {
+        let err_text = err.clone();
+        card = card.child(
+            view()
+                .test_id(&format!("plugin-runtime-error-{}", plugin.id))
+                .w_full()
+                .p_3()
+                .gap_1()
+                .rounded(px(radius::CONTROL))
+                .bg(theme::danger_soft)
+                .border_1()
+                .border_color(theme::danger)
+                .child(
+                    text(move || store.t("plugins.runtime_error_title"))
+                        .text_size(px(font_size::CAPTION))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::danger),
+                )
+                .child(
+                    text(err_text)
+                        .text_size(px(font_size::CAPTION))
+                        .text_color(theme::danger),
+                ),
+        );
+    }
+
     // External programs permission warning & Allow Programs / Stop Allowing toggle
     if has_external_programs {
         let warn_msg = store.t_fmt(
@@ -2367,36 +2457,39 @@ fn plugin_card(
         .gap_2();
 
     if plugin.loaded {
-        if is_active_source {
-            actions = actions.child(
-                view()
-                    .min_h(min_h)
-                    .px_3()
-                    .flex_row()
-                    .items_center()
-                    .gap_1p5()
-                    .rounded(px(radius::CONTROL))
-                    .bg(theme::primary_soft)
-                    .child(icon(Icon::Check, 14.0, colors::PRIMARY))
-                    .child(
-                        text(move || store.t("common.enabled"))
-                            .number_of_lines(1)
-                            .text_size(px(font_size::CAPTION))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::primary),
-                    ),
-            );
-        } else {
-            actions = actions.child(
+        actions = actions.child(
+            when(
+                move || is_active_source.get(),
+                move || {
+                    view()
+                        .min_h(min_h)
+                        .px_3()
+                        .flex_row()
+                        .items_center()
+                        .gap_1p5()
+                        .rounded(px(radius::CONTROL))
+                        .bg(theme::primary_soft)
+                        .child(icon(Icon::Check, 14.0, colors::PRIMARY))
+                        .child(
+                            text(move || store.t("common.enabled"))
+                                .number_of_lines(1)
+                                .text_size(px(font_size::CAPTION))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme::primary),
+                        )
+                },
+            )
+            .otherwise(move || {
+                let pid_press = pid_switch.clone();
                 ghost_button(
                     move || store.t("dialog.source_switcher.title"),
                     move || {
-                        store.select_source(&pid_switch);
+                        store.select_source(&pid_press);
                     },
                 )
-                .min_h(min_h),
-            );
-        }
+                .min_h(min_h)
+            }),
+        );
     }
 
     if is_signed_in {
@@ -2606,6 +2699,13 @@ fn plugin_card(
 }
 
 fn compat_badge_meta(store: AppStore, plugin: &PluginSummary) -> (PluginCompatLevel, SharedString) {
+    let virtual_compat = store.settings.with(|s| s.mobile_virtual_compat);
+    if !virtual_compat && plugin.compat.level == PluginCompatLevel::VirtualFfmpeg {
+        return (
+            PluginCompatLevel::DesktopProcessLimited,
+            store.t("compat.desktop_limited"),
+        );
+    }
     match plugin.report.tier {
         CompatTier::MigrationRequired => (
             PluginCompatLevel::DesktopProcessLimited,

@@ -14,7 +14,7 @@ pub mod stations;
 
 use std::rc::Rc;
 
-use nsh_base::{button, context_menu, menu, menu_item, menu_separator};
+use nsh_base::button;
 use nsh_core::prelude::*;
 use nsh_music_core::model::{Artist, Section, Track};
 
@@ -24,7 +24,7 @@ use crate::ui::{
     ContextMenuAction, DeviceForm, Elevated, Elevation, Icon, adaptive_modal, artwork_box,
     compat_badge_text, empty_state, format_duration_ms, ghost_button, heart_button, icon,
     icon_button_sized, media_card, mini_equalizer, motion, primary_button, section_header,
-    shimmer_block, skeleton_card, styled_input, theme,
+    shimmer_block, skeleton_card, styled_input, styled_lazy_context_menu, styled_lazy_menu, theme,
 };
 
 /// Artwork resolution targets matching `egoist/mygo-music` sizing policy.
@@ -416,7 +416,14 @@ fn source_switcher_modal(store: AppStore) -> View {
                 let source_id_active = source_id.clone();
                 let is_active =
                     computed(move || store.active_source_id.with(|id| id == &source_id_active));
-                let compat_level = entry.compat.level;
+                let compat_level = if entry.compat.level
+                    == nsh_music_core::source::PluginCompatLevel::VirtualFfmpeg
+                    && store.settings.with_untracked(|s| !s.mobile_virtual_compat)
+                {
+                    nsh_music_core::source::PluginCompatLevel::DesktopProcessLimited
+                } else {
+                    entry.compat.level
+                };
                 let compat_label = compat_level_label(store, compat_level);
                 let display_name = store.source_display_name(&entry.info);
                 let account_label: Option<SharedString> = entry
@@ -432,6 +439,7 @@ fn source_switcher_modal(store: AppStore) -> View {
                 };
 
                 button()
+                    .test_id(&format!("source-switcher-item-{source_id}"))
                     .on_press(move || {
                         store.select_source(&source_id_press);
                         store.close_modal();
@@ -1195,78 +1203,13 @@ pub(crate) fn build_track_context_menu(
     actions
 }
 
-/// Renders a list of [`ContextMenuAction`] into a `View` of `menu_item`s and
-/// `menu_separator`s. Used inside lazy `dynamic(...)` popups for `menu()` and
-/// `context_menu()` so closed rows allocate zero menu items.
-pub(crate) fn render_lazy_menu_body(actions: Vec<ContextMenuAction>) -> AnyElement {
-    let mut list = view().w_full();
-    for act in actions {
-        if act.separator_before {
-            list = list.child(menu_separator().h(px(1.0)).my_1().bg(theme::border));
-        }
-        let cb = act.on_select;
-        let tint = if act.destructive {
-            colors::DANGER
-        } else {
-            colors::POPOVER_FOREGROUND
-        };
-        list = list.child(
-            menu_item()
-                .disabled(act.disabled)
-                .on_select(move || cb())
-                .min_h(move || {
-                    if theme::detect_device_form().is_touch() {
-                        px(44.0)
-                    } else {
-                        px(32.0)
-                    }
-                })
-                .px_3()
-                .py_1p5()
-                .flex_row()
-                .items_center()
-                .gap_2p5()
-                .rounded(px(radius::SM))
-                .hover(|s| s.bg(theme::accent))
-                .focus(|s| s.bg(theme::accent))
-                .disabled_style(|s| s.opacity(0.45))
-                .children(act.icon.map(|ic| icon(ic, 15.0, tint)))
-                .child(
-                    text(act.label)
-                        .number_of_lines(1)
-                        .text_size(px(font_size::SUBTITLE))
-                        .text_color(tint),
-                ),
-        );
-    }
-    list.into_element()
-}
-
 /// Wraps `trigger` in a right-click / long-press context menu whose items are
 /// evaluated lazily only when the menu actually opens.
 pub(crate) fn lazy_context_menu(
     trigger: impl IntoElement,
     build_actions: impl Fn() -> Vec<ContextMenuAction> + 'static,
 ) -> impl IntoElement {
-    context_menu()
-        .offset(px(4.0))
-        .margin(px(8.0))
-        .backdrop_style(|s| s.bg(theme::scrim))
-        .popup_style(|s| {
-            s.min_w(px(210.0))
-                .p_1p5()
-                .rounded(px(radius::LG))
-                .bg(theme::popover)
-                .border_1()
-                .border_color(theme::border)
-                .elevation(Elevation::Popover)
-                .transition_all()
-                .duration(move || motion::transition_ms(180.0))
-        })
-        .popup_starting_class("opacity-0 scale-95")
-        .popup_ending_class("opacity-0 scale-95")
-        .trigger(trigger)
-        .child(dynamic(move || render_lazy_menu_body(build_actions())))
+    styled_lazy_context_menu(trigger, build_actions)
 }
 
 /// Renders a touch-safe `···` trigger button that opens a lazy dropdown / sheet
@@ -1293,25 +1236,7 @@ pub(crate) fn lazy_more_menu_button(
         .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
         .child(icon(Icon::MoreHorizontal, 16.0, colors::MUTED_FOREGROUND));
 
-    menu()
-        .offset(px(6.0))
-        .margin(px(8.0))
-        .backdrop_style(|s| s.bg(theme::scrim))
-        .popup_style(|s| {
-            s.min_w(px(210.0))
-                .p_1p5()
-                .rounded(px(radius::LG))
-                .bg(theme::popover)
-                .border_1()
-                .border_color(theme::border)
-                .elevation(Elevation::Popover)
-                .transition_all()
-                .duration(move || motion::transition_ms(180.0))
-        })
-        .popup_starting_class("opacity-0 scale-95")
-        .popup_ending_class("opacity-0 scale-95")
-        .trigger(trigger)
-        .child(dynamic(move || render_lazy_menu_body(build_actions())))
+    styled_lazy_menu(trigger, build_actions)
 }
 
 /// Virtualized, cell-recycled track list rendered inside `page_scroll` via
@@ -2483,4 +2408,51 @@ pub(crate) fn refresh_pill_button(
             .font_weight(FontWeight::MEDIUM)
             .text_color(theme::fg),
         )
+}
+
+/// Compact, centered pagination footer rendering a touch-sized `ghost_button`
+/// (`Load More` / `Loading more...`) whenever additional pages exist or are
+/// currently loading, collapsing to an empty container once all items are loaded.
+pub(crate) fn pagination_footer(
+    store: AppStore,
+    form: DeviceForm,
+    test_id: &'static str,
+    has_more: impl Fn() -> bool + Copy + 'static,
+    loading_more: impl Fn() -> bool + Copy + 'static,
+    on_press: impl Fn() + 'static,
+) -> View {
+    let on_press = Rc::new(on_press);
+    let min_h = px(form.min_touch_target());
+    let is_phone = form.is_phone();
+
+    view().w_full().child(when(
+        move || has_more() || loading_more(),
+        move || {
+            let press = Rc::clone(&on_press);
+            view()
+                .w_full()
+                .pt_3()
+                .pb_2()
+                .flex_row()
+                .items_center()
+                .justify_center()
+                .child(
+                    ghost_button(
+                        move || {
+                            if loading_more() {
+                                store.t("common.loading_more")
+                            } else {
+                                store.t("common.load_more")
+                            }
+                        },
+                        move || press(),
+                    )
+                    .test_id(test_id)
+                    .min_w(min_h)
+                    .min_h(min_h)
+                    .disabled(loading_more)
+                    .when(is_phone, |b| b.rounded_full()),
+                )
+        },
+    ))
 }

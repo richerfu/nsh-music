@@ -13,7 +13,7 @@
 use nsh_base::button;
 use nsh_core::{LineHeight, geometry::percentage, prelude::*};
 use nsh_music_core::{
-    lyrics::{ParsedLyricLine, ParsedLyrics},
+    lyrics::{ParsedLyricLine, ParsedLyrics, is_credit_line},
     model::Comment,
 };
 
@@ -45,7 +45,8 @@ pub(crate) struct QuietWindow {
     pub to_ms: i64,
 }
 
-/// Detects intro, interlude, outro, or instrumental quiet passages `>= min_gap_ms`.
+/// Detects intro, interlude, outro, or instrumental quiet passages `>= min_gap_ms`,
+/// ignoring non-sung credit metadata lines (e.g., `作词：...`, `Composer: ...`).
 pub(crate) fn detect_quiet_windows(
     lyrics: &ParsedLyrics,
     duration_ms: i64,
@@ -65,11 +66,25 @@ pub(crate) fn detect_quiet_windows(
         return Vec::new();
     }
 
-    let mut windows = Vec::new();
-    let lines = &lyrics.lines;
+    let vocal_lines: Vec<&ParsedLyricLine> = lyrics
+        .lines
+        .iter()
+        .filter(|line| !line.text.trim().is_empty() && !is_credit_line(&line.text))
+        .collect();
+    if vocal_lines.is_empty() {
+        if duration_ms >= min_gap_ms {
+            return vec![QuietWindow {
+                from_ms: 0,
+                to_ms: duration_ms,
+            }];
+        }
+        return Vec::new();
+    }
 
-    // 1. Intro silence before the first timed lyric line
-    if let Some(first) = lines.first()
+    let mut windows = Vec::new();
+
+    // 1. Intro silence before the first sung vocal line
+    if let Some(first) = vocal_lines.first()
         && first.start_ms >= min_gap_ms
     {
         windows.push(QuietWindow {
@@ -78,10 +93,10 @@ pub(crate) fn detect_quiet_windows(
         });
     }
 
-    // 2. Interludes between consecutive timed lines
-    for pair in lines.windows(2) {
-        let cur = &pair[0];
-        let next = &pair[1];
+    // 2. Interludes between consecutive sung vocal lines
+    for pair in vocal_lines.windows(2) {
+        let cur = pair[0];
+        let next = pair[1];
         if next.start_ms <= cur.start_ms {
             continue;
         }
@@ -100,8 +115,8 @@ pub(crate) fn detect_quiet_windows(
         }
     }
 
-    // 3. Outro silence after the final lyric line
-    if let Some(last) = lines.last() {
+    // 3. Outro silence after the final sung vocal line
+    if let Some(last) = vocal_lines.last() {
         let outro_start = if last.end_ms > last.start_ms {
             last.end_ms
         } else {
@@ -902,4 +917,52 @@ fn lyrics_empty_state(store: AppStore, compact: bool) -> View {
                 .font_weight(FontWeight::BOLD)
                 .text_color(move || theme::np_fg().opacity(0.45)),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line(start_ms: i64, end_ms: i64, text: &str) -> ParsedLyricLine {
+        ParsedLyricLine {
+            start_ms,
+            end_ms,
+            text: text.to_owned(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn detect_quiet_windows_ignores_credit_metadata_lines() {
+        let parsed = ParsedLyrics {
+            synced: true,
+            lines: vec![
+                line(0, 2_000, "作词：林夕"),
+                line(2_000, 4_000, "Composer: Example"),
+                line(18_000, 22_000, "First sung line"),
+                line(36_000, 40_000, "Second sung line"),
+                line(42_000, 44_000, "混音：Studio"),
+            ],
+            ..Default::default()
+        };
+
+        let windows = detect_quiet_windows(&parsed, 55_000, QUIET_LEAST_MS);
+        assert_eq!(
+            windows,
+            vec![
+                QuietWindow {
+                    from_ms: 0,
+                    to_ms: 18_000,
+                },
+                QuietWindow {
+                    from_ms: 22_000,
+                    to_ms: 36_000,
+                },
+                QuietWindow {
+                    from_ms: 40_000,
+                    to_ms: 55_000,
+                },
+            ]
+        );
+    }
 }

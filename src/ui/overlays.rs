@@ -10,7 +10,7 @@ use nsh_base::{
     ToastStackState, ToastTransitionStatus, alert_dialog, context_menu, dialog, menu, menu_item,
     menu_separator, sheet, toast, toast_stack,
 };
-use nsh_core::{prelude::*, time::now};
+use nsh_core::{element::StyleRefinement, prelude::*, time::now};
 
 use super::{
     controls::icon_button_tinted,
@@ -22,7 +22,7 @@ use super::{
 /// Adaptive modal presentation:
 /// - **Desktop**: Centered elevated `dialog` with scrim backdrop (`max_w = 500pt`).
 /// - **Pad**: Floating rounded dialog sheet (`max_w = 540pt`).
-/// - **Phone**: Bottom `sheet` with grabber, swipe-to-dismiss, and safe-area bottom inset.
+/// - **Phone**: Bottom `sheet` with backdrop/back/close dismissal and safe-area bottom inset.
 pub fn adaptive_modal<F, E>(
     open: impl IntoReactive<bool>,
     title: impl IntoReactive<SharedString>,
@@ -55,10 +55,10 @@ where
                 sheet()
                     .open(move || Some(open_rx.get()))
                     .side(Placement::Bottom)
-                    .close_on_swipe(true)
+                    .close_on_swipe(false)
                     .close_on_escape(true)
                     .close_on_backdrop_press(true)
-                    .grabber(true)
+                    .grabber(false)
                     .accessibility_label(move || Some(title_a11y.get()))
                     .on_open_change(move |e: &SheetEvent| {
                         if let SheetEvent::OpenChange(false, _) = e {
@@ -66,15 +66,6 @@ where
                         }
                     })
                     .backdrop_style(|s| s.bg(theme::scrim))
-                    .grabber_style(|s| {
-                        s.w(px(36.0))
-                            .h(px(4.0))
-                            .mt_2()
-                            .mb_1()
-                            .self_center()
-                            .rounded_full()
-                            .bg(theme::border_strong)
-                    })
                     .popup_style(|s| {
                         s.rounded_t(px(radius::SHEET))
                             .bg(theme::card_elevated)
@@ -102,7 +93,7 @@ where
                             .w_full()
                             .max_h(move || px(sheet_metrics().0))
                             .px_4()
-                            .pt_1p5()
+                            .pt_3p5()
                             .pb(move || px(sheet_metrics().1))
                             .gap_3()
                             .child(modal_header(title_rx, close_btn))
@@ -558,6 +549,7 @@ impl ContextMenuAction {
 }
 
 fn render_menu_actions(actions: Vec<ContextMenuAction>) -> Vec<AnyElement> {
+    let is_mobile_os = !os().is_desktop();
     let mut nodes = Vec::with_capacity(actions.len() + 2);
     for act in actions {
         if act.separator_before {
@@ -585,7 +577,7 @@ fn render_menu_actions(actions: Vec<ContextMenuAction>) -> Vec<AnyElement> {
                 .disabled(act.disabled)
                 .on_select(move || cb())
                 .min_h(move || {
-                    if theme::detect_device_form().is_touch() {
+                    if is_mobile_os || theme::detect_device_form().is_touch() {
                         px(44.0)
                     } else {
                         px(32.0)
@@ -613,53 +605,96 @@ fn render_menu_actions(actions: Vec<ContextMenuAction>) -> Vec<AnyElement> {
     nodes
 }
 
+/// Renders menu actions inside a full-width column view for lazy/dynamic menus.
+pub fn render_menu_actions_view(actions: Vec<ContextMenuAction>) -> AnyElement {
+    view()
+        .w_full()
+        .children(render_menu_actions(actions))
+        .into_element()
+}
+
+fn menu_popup_style(s: StyleRefinement, desktop_min_w: f32) -> StyleRefinement {
+    if os().is_desktop() {
+        s.min_w(px(desktop_min_w))
+            .p_1p5()
+            .rounded(px(radius::LG))
+            .bg(theme::popover)
+            .border_1()
+            .border_color(theme::border)
+            .elevation(Elevation::Popover)
+            .transition_all()
+            .duration(move || motion::transition_ms(180.0))
+    } else {
+        s.rounded_t(px(radius::SHEET))
+            .bg(theme::card_elevated)
+            .border_t_1()
+            .border_color(theme::border)
+            .pt_2()
+            .px_2()
+            .pb(move || px(safe_area().bottom.0 + 12.0))
+            .elevation(Elevation::Popover)
+    }
+}
+
+fn configure_context_menu(trigger: impl IntoElement, desktop_min_w: f32) -> ContextMenuElement {
+    let base = context_menu()
+        .offset(px(4.0))
+        .margin(px(8.0))
+        .backdrop_style(|s| s.bg(theme::scrim))
+        .popup_style(move |s| menu_popup_style(s, desktop_min_w))
+        .trigger(trigger);
+    if os().is_desktop() {
+        base.popup_starting_class("opacity-0 scale-95")
+            .popup_ending_class("opacity-0 scale-95")
+    } else {
+        base
+    }
+}
+
+fn configure_menu(trigger: impl IntoElement, desktop_min_w: f32) -> MenuElement {
+    let base = menu()
+        .offset(px(6.0))
+        .margin(px(8.0))
+        .backdrop_style(|s| s.bg(theme::scrim))
+        .popup_style(move |s| menu_popup_style(s, desktop_min_w))
+        .trigger(trigger);
+    if os().is_desktop() {
+        base.popup_starting_class("opacity-0 scale-95")
+            .popup_ending_class("opacity-0 scale-95")
+    } else {
+        base
+    }
+}
+
 /// Styled right-click / long-press context menu wrapping `nsh_base::context_menu`.
 pub fn styled_context_menu(
     trigger: impl IntoElement,
     actions: Vec<ContextMenuAction>,
 ) -> ContextMenuElement {
-    let items = render_menu_actions(actions);
-    context_menu()
-        .offset(px(4.0))
-        .margin(px(8.0))
-        .backdrop_style(|s| s.bg(theme::scrim))
-        .popup_style(|s| {
-            s.min_w(px(196.0))
-                .p_1p5()
-                .rounded(px(radius::LG))
-                .bg(theme::popover)
-                .border_1()
-                .border_color(theme::border)
-                .elevation(Elevation::Popover)
-                .transition_all()
-                .duration(move || motion::transition_ms(180.0))
-        })
-        .popup_starting_class("opacity-0 scale-95")
-        .popup_ending_class("opacity-0 scale-95")
-        .trigger(trigger)
-        .children(items)
+    configure_context_menu(trigger, 196.0).children(render_menu_actions(actions))
 }
 
 /// Styled trigger-opened dropdown/sheet menu wrapping `nsh_base::menu`.
 pub fn styled_menu(trigger: impl IntoElement, actions: Vec<ContextMenuAction>) -> MenuElement {
-    let items = render_menu_actions(actions);
-    menu()
-        .offset(px(6.0))
-        .margin(px(8.0))
-        .backdrop_style(|s| s.bg(theme::scrim))
-        .popup_style(|s| {
-            s.min_w(px(196.0))
-                .p_1p5()
-                .rounded(px(radius::LG))
-                .bg(theme::popover)
-                .border_1()
-                .border_color(theme::border)
-                .elevation(Elevation::Popover)
-                .transition_all()
-                .duration(move || motion::transition_ms(180.0))
-        })
-        .popup_starting_class("opacity-0 scale-95")
-        .popup_ending_class("opacity-0 scale-95")
-        .trigger(trigger)
-        .children(items)
+    configure_menu(trigger, 196.0).children(render_menu_actions(actions))
+}
+
+/// Lazily-built styled context menu whose actions are only materialized when rendered.
+pub fn styled_lazy_context_menu<F>(
+    trigger: impl IntoElement,
+    build_actions: F,
+) -> ContextMenuElement
+where
+    F: Fn() -> Vec<ContextMenuAction> + 'static,
+{
+    configure_context_menu(trigger, 210.0)
+        .child(dynamic(move || render_menu_actions_view(build_actions())))
+}
+
+/// Lazily-built styled dropdown/sheet menu whose actions are only materialized when rendered.
+pub fn styled_lazy_menu<F>(trigger: impl IntoElement, build_actions: F) -> MenuElement
+where
+    F: Fn() -> Vec<ContextMenuAction> + 'static,
+{
+    configure_menu(trigger, 210.0).child(dynamic(move || render_menu_actions_view(build_actions())))
 }

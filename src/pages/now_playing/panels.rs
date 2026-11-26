@@ -182,22 +182,142 @@ pub fn queue_panel(store: AppStore, form: DeviceForm) -> View {
 fn queue_row_cell(store: AppStore, at: Position, touch: bool, is_phone: bool) -> View {
     let track_memo = computed(move || store.queue.with(|q| q.get(at.index()).cloned()));
     let is_current = computed(move || store.current_index.get() == Some(at.index()));
-    let hovered = signal(false);
 
     let row_min_h = if touch { 60.0 } else { 58.0 };
     let cover_thumb = queue_cover_thumb(track_memo, is_phone);
 
-    view()
-        .w_full()
-        .min_h(px(row_min_h))
-        .px(px(if is_phone { 8.0 } else { 10.0 }))
+    let main_btn = button()
+        .accessibility_label(move || {
+            track_memo.with(|t| t.as_ref().map(|tr| SharedString::from(tr.name.clone())))
+        })
+        .on_press(move || {
+            if !is_current.get_untracked() {
+                store.play_from_queue(at.index());
+            }
+        })
+        .flex_1()
+        .min_w(px(0.0))
+        .min_h(px(if touch { 56.0 } else { 48.0 }))
         .flex_row()
         .items_center()
         .gap(px(if is_phone { 12.0 } else { 14.0 }))
+        .active(|s| s.opacity(0.78))
+        .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
+        // Cover thumbnail (`44x44` Phone, `42x42` Desktop)
+        .child(cover_thumb)
+        // Title (`14.5pt` Phone / `14pt` Desktop) & Artist (`12.5pt` `white 0.58`)
+        .child(
+            view()
+                .flex_1()
+                .min_w(px(0.0))
+                .gap_0p5()
+                .child(
+                    text(move || {
+                        track_memo.with(|t| {
+                            t.as_ref()
+                                .map(|tr| SharedString::from(tr.name.clone()))
+                                .unwrap_or_default()
+                        })
+                    })
+                    .number_of_lines(1)
+                    .text_size(px(if is_phone { 14.5 } else { 14.0 }))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(move || {
+                        if is_current.get() && is_phone {
+                            AdaptiveColor::from(theme::artwork_np_accent(
+                                store.current_accent.get(),
+                            ))
+                        } else {
+                            theme::np_fg()
+                        }
+                    }),
+                )
+                .child(
+                    text(move || {
+                        let fallback_artist = store.t("track.unknown_artist");
+                        track_memo.with(|t| {
+                            t.as_ref()
+                                .map(|tr| {
+                                    let names = tr.artist_names();
+                                    if names.is_empty() {
+                                        fallback_artist.clone()
+                                    } else {
+                                        SharedString::from(names)
+                                    }
+                                })
+                                .unwrap_or(fallback_artist)
+                        })
+                    })
+                    .number_of_lines(1)
+                    .text_size(px(12.5))
+                    .text_color(move || theme::np_fg().opacity(0.58)),
+                ),
+        )
+        // Duration (`12pt` tabular, `white 0.44`)
+        .child(
+            text(move || {
+                track_memo.with(|t| {
+                    t.as_ref()
+                        .map(|tr| SharedString::from(format_duration_ms(tr.duration)))
+                        .unwrap_or_default()
+                })
+            })
+            .tabular_nums()
+            .text_size(px(12.0))
+            .text_color(move || theme::np_fg().opacity(0.44)),
+        );
+
+    let make_remove_btn = move || {
+        button()
+            .accessibility_label(move || Some(store.t("common.remove")))
+            .on_press(move || store.remove_from_queue(at.index()))
+            .size(px(if touch { 44.0 } else { 28.0 }))
+            .flex_shrink_0()
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .bg(colors::TRANSPARENT)
+            .hover(|s| s.bg(move || theme::np_fg().opacity(0.12)))
+            .active(|s| s.scale(motion::press_scale))
+            .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
+            .child(icon(Icon::Close, 13.0, colors::NP_FG).opacity(0.55))
+    };
+
+    if touch {
+        // Mobile fast-path: skip desktop hover signal, mouse listeners, color transitions,
+        // and reactive `when` wrapper around the always-visible touch remove button.
+        return view()
+            .w_full()
+            .min_h(px(row_min_h))
+            .px(px(if is_phone { 8.0 } else { 10.0 }))
+            .flex_row()
+            .items_center()
+            .gap(px(if is_phone { 12.0 } else { 14.0 }))
+            .rounded(px(12.0))
+            .bg(move || {
+                if is_current.get() {
+                    theme::np_fg().opacity(if is_phone { 0.14 } else { 0.12 })
+                } else {
+                    colors::TRANSPARENT
+                }
+            })
+            .child(main_btn)
+            .child(make_remove_btn());
+    }
+
+    let hovered = signal(false);
+
+    view()
+        .w_full()
+        .min_h(px(row_min_h))
+        .px(px(10.0))
+        .flex_row()
+        .items_center()
+        .gap(px(14.0))
         .rounded(px(12.0))
         .bg(move || {
             if is_current.get() {
-                theme::np_fg().opacity(if is_phone { 0.14 } else { 0.12 })
+                theme::np_fg().opacity(0.12)
             } else if hovered.get() {
                 theme::np_fg().opacity(0.08)
             } else {
@@ -208,111 +328,13 @@ fn queue_row_cell(store: AppStore, at: Position, touch: bool, is_phone: bool) ->
         .duration(move || motion::transition_ms(120.0))
         .on_mouse_enter(move |_: &MouseEvent| hovered.set(true))
         .on_mouse_leave(move |_: &MouseEvent| hovered.set(false))
-        .child(
-            button()
-                .accessibility_label(move || {
-                    track_memo.with(|t| t.as_ref().map(|tr| SharedString::from(tr.name.clone())))
-                })
-                .on_press(move || {
-                    if !is_current.get_untracked() {
-                        store.play_from_queue(at.index());
-                    }
-                })
-                .flex_1()
-                .min_w(px(0.0))
-                .min_h(px(if touch { 56.0 } else { 48.0 }))
-                .flex_row()
-                .items_center()
-                .gap(px(if is_phone { 12.0 } else { 14.0 }))
-                .active(|s| s.opacity(0.78))
-                .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
-                // Cover thumbnail (`44x44` Phone, `42x42` Desktop)
-                .child(cover_thumb)
-                // Title (`14.5pt` Phone / `14pt` Desktop) & Artist (`12.5pt` `white 0.58`)
-                .child(
-                    view()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .gap_0p5()
-                        .child(
-                            text(move || {
-                                track_memo.with(|t| {
-                                    t.as_ref()
-                                        .map(|tr| SharedString::from(tr.name.clone()))
-                                        .unwrap_or_default()
-                                })
-                            })
-                            .number_of_lines(1)
-                            .text_size(px(if is_phone { 14.5 } else { 14.0 }))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(move || {
-                                if is_current.get() && is_phone {
-                                    AdaptiveColor::from(theme::artwork_np_accent(
-                                        store.current_accent.get(),
-                                    ))
-                                } else {
-                                    theme::np_fg()
-                                }
-                            }),
-                        )
-                        .child(
-                            text(move || {
-                                let fallback_artist = store.t("track.unknown_artist");
-                                track_memo.with(|t| {
-                                    t.as_ref()
-                                        .map(|tr| {
-                                            let names = tr.artist_names();
-                                            if names.is_empty() {
-                                                fallback_artist.clone()
-                                            } else {
-                                                SharedString::from(names)
-                                            }
-                                        })
-                                        .unwrap_or(fallback_artist)
-                                })
-                            })
-                            .number_of_lines(1)
-                            .text_size(px(12.5))
-                            .text_color(move || theme::np_fg().opacity(0.58)),
-                        ),
-                )
-                // Duration (`12pt` tabular, `white 0.44`)
-                .child(
-                    text(move || {
-                        track_memo.with(|t| {
-                            t.as_ref()
-                                .map(|tr| SharedString::from(format_duration_ms(tr.duration)))
-                                .unwrap_or_default()
-                        })
-                    })
-                    .tabular_nums()
-                    .text_size(px(12.0))
-                    .text_color(move || theme::np_fg().opacity(0.44)),
-                ),
-        )
-        // Subtle remove item button (always visible on touch >= 44pt, hover-revealed on desktop)
-        .child(when(
-            move || touch || hovered.get(),
-            move || {
-                button()
-                    .accessibility_label(move || Some(store.t("common.remove")))
-                    .on_press(move || store.remove_from_queue(at.index()))
-                    .size(px(if touch { 44.0 } else { 28.0 }))
-                    .flex_shrink_0()
-                    .items_center()
-                    .justify_center()
-                    .rounded_full()
-                    .bg(colors::TRANSPARENT)
-                    .hover(|s| s.bg(move || theme::np_fg().opacity(0.12)))
-                    .active(|s| s.scale(motion::press_scale))
-                    .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
-                    .child(icon(Icon::Close, 13.0, colors::NP_FG).opacity(0.55))
-            },
-        ))
+        .child(main_btn)
+        // Hover-revealed remove button on desktop
+        .child(when(hovered, make_remove_btn))
 }
 
 fn queue_cover_thumb(track_memo: Memo<Option<Track>>, is_phone: bool) -> View {
-    let cover_uri = move || {
+    let cover_uri = computed(move || {
         track_memo.with(|t| {
             t.as_ref()
                 .map(|tr| {
@@ -329,8 +351,8 @@ fn queue_cover_thumb(track_memo: Memo<Option<Track>>, is_phone: bool) -> View {
                 })
                 .unwrap_or_default()
         })
-    };
-    let has_img = move || !cover_uri().is_empty();
+    });
+    let has_img = computed(move || cover_uri.with(|u| !u.is_empty()));
     let thumb_size = if is_phone { 44.0 } else { 42.0 };
 
     view()
@@ -342,11 +364,11 @@ fn queue_cover_thumb(track_memo: Memo<Option<Track>>, is_phone: bool) -> View {
         .items_center()
         .justify_center()
         .child(when(
-            move || !has_img(),
+            move || !has_img.get(),
             || icon(Icon::Disc, 16.0, colors::NP_FG).opacity(0.35),
         ))
         .child(when(has_img, move || {
-            image(cover_uri)
+            image(move || cover_uri.get())
                 .object_fit(ResizeMode::Cover)
                 .absolute()
                 .inset_0()
@@ -479,17 +501,73 @@ pub fn comments_panel(store: AppStore, form: DeviceForm) -> View {
                                 computed(move || at.index() >= store.comments.with(Vec::len));
                             view().w_full().child(
                                 when(is_footer, move || {
+                                    let show_load_more = computed(move || {
+                                        store.comments_more.get()
+                                            || store.comments_loading_more.get()
+                                    });
                                     view()
                                         .w_full()
-                                        .h(px(56.0))
+                                        .min_h(px(56.0))
+                                        .py_2()
                                         .items_center()
                                         .justify_center()
                                         .child(
-                                            text(move || {
-                                                store.t("now_playing.comments.all_loaded")
+                                            when(show_load_more, move || {
+                                                button()
+                                                    .test_id("comments-load-more-btn")
+                                                    .disabled(move || {
+                                                        store.comments_loading_more.get()
+                                                    })
+                                                    .accessibility_label(move || {
+                                                        Some(if store.comments_loading_more.get() {
+                                                            store.t("common.loading_more")
+                                                        } else {
+                                                            store.t("common.load_more")
+                                                        })
+                                                    })
+                                                    .on_press(move || store.load_more_comments())
+                                                    .min_h(px(if touch { 44.0 } else { 32.0 }))
+                                                    .px_4()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .rounded_full()
+                                                    .bg(move || theme::np_fg().opacity(0.14))
+                                                    .border_1()
+                                                    .border_color(move || {
+                                                        theme::np_fg().opacity(0.14)
+                                                    })
+                                                    .transition_colors()
+                                                    .duration(move || motion::transition_ms(120.0))
+                                                    .hover(|s| {
+                                                        s.bg(move || theme::np_fg().opacity(0.22))
+                                                    })
+                                                    .active(|s| s.scale(motion::press_scale))
+                                                    .disabled_style(|s| s.opacity(0.45))
+                                                    .focus_visible(|s| {
+                                                        s.outline(px(2.0))
+                                                            .outline_color(theme::ring)
+                                                    })
+                                                    .child(
+                                                        text(move || {
+                                                            if store.comments_loading_more.get() {
+                                                                store.t("common.loading_more")
+                                                            } else {
+                                                                store.t("common.load_more")
+                                                            }
+                                                        })
+                                                        .number_of_lines(1)
+                                                        .text_size(px(12.5))
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .text_color(theme::np_fg),
+                                                    )
                                             })
-                                            .text_size(px(12.0))
-                                            .text_color(move || theme::np_fg().opacity(0.35)),
+                                            .otherwise(move || {
+                                                text(move || {
+                                                    store.t("now_playing.comments.all_loaded")
+                                                })
+                                                .text_size(px(12.0))
+                                                .text_color(move || theme::np_fg().opacity(0.35))
+                                            }),
                                         )
                                 })
                                 .otherwise(move || comment_row_cell(store, at, touch, is_phone)),

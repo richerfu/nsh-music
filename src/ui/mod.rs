@@ -26,7 +26,8 @@ pub use motion::{
 };
 pub use overlays::{
     ContextMenuAction, ToastController, ToastKind, ToastPayload, adaptive_modal,
-    confirm_destructive, styled_context_menu, styled_menu, toast_overlay,
+    confirm_destructive, render_menu_actions_view, styled_context_menu, styled_lazy_context_menu,
+    styled_lazy_menu, styled_menu, toast_overlay,
 };
 pub use scrubber::{Scrubber, scrubber};
 pub use theme::{

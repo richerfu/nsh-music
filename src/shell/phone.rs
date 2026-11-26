@@ -4,7 +4,7 @@
 //!   - Root tabs (`Home`, `Browse`, `Library`): bold tab title + single compact source capsule + contextual Refresh (`Home`/`Browse`) + Search (zero back/duplicate settings buttons)
 //!   - Root `Settings` tab: clean header title only
 //!   - Level-2 pushed screens: `<` Back button + centered dynamic route title + contextual `+` Install (`Plugins`) or Refresh (`Browse`/`Radio`/`Podcasts`)
-//! - Floating `58pt` mini-player dock expanding full-screen Now Playing on tap (respects `safe_area().bottom` when tabs are hidden)
+//! - Floating `64pt` artwork-tinted frosted mini-player dock expanding full-screen Now Playing on tap (respects `safe_area().bottom` when tabs are hidden)
 //! - Bottom 4-tab bar (`Home`, `Browse`, `Library`, `Settings`) visible only on root tabs, switching via `store.switch_tab(...)`
 //! - `on_back_press` closing modal -> Now Playing -> drawer -> `store.go_back()`
 
@@ -16,16 +16,14 @@ use crate::{
     pages,
     state::{ActiveModal, AppStore, Route, SettingsSection},
     ui::{
-        controls::{
-            artwork_box, icon_button, icon_button_tinted, play_pause_button_buffering, source_pill,
-        },
+        controls::{artwork_box, icon_button, icon_button_tinted, source_pill},
         icons::{Icon, icon_reactive},
         loading_spinner, motion,
-        theme::{self, DeviceForm, Elevated, Elevation, colors, font_size, radius},
+        theme::{self, DeviceForm, Elevated, Elevation, colors, radius},
     },
 };
 
-const MINI_PLAYER_HEIGHT: f32 = 58.0;
+const MINI_PLAYER_HEIGHT: f32 = 64.0;
 
 /// Renders the compact mobile Phone shell (`w < 600pt`, including `390×844` tests).
 pub fn phone_shell(store: AppStore) -> View {
@@ -291,21 +289,45 @@ fn phone_mini_player(store: AppStore) -> impl IntoElement {
 
         let is_loading = computed(move || store.playback_status.with(PlaybackStatus::is_loading));
 
+        let initial_playing = untracked(|| store.is_playing.get());
+        let play_morph = animated_value(if initial_playing { 1.0 } else { 0.0 });
+        let prev_playing = stored(initial_playing);
+        effect(move || {
+            let now = store.is_playing.get();
+            if prev_playing.replace(now) != now {
+                motion::animate_spring(
+                    &play_morph,
+                    if now { 1.0 } else { 0.0 },
+                    motion::spring_settle(),
+                );
+            }
+        });
+
         let progress_ratio = computed(move || {
             let dur = store.duration_ms.get();
             if dur == 0 {
                 0.0_f32
             } else {
                 let raw = (store.position_ms.get() as f32 / dur as f32).clamp(0.0, 1.0);
-                (raw * 320.0).round() / 320.0
+                (raw * 1000.0).round() / 1000.0
+            }
+        });
+
+        let buffered_ratio = computed(move || {
+            let dur = store.duration_ms.get();
+            if dur == 0 {
+                0.0_f32
+            } else {
+                let raw = (store.buffered_ms.get() as f32 / dur as f32).clamp(0.0, 1.0);
+                (raw * 200.0).round() / 200.0
             }
         });
 
         view()
             .w_full()
-            .pl(move || px(safe_area().left.0 + 14.0))
-            .pr(move || px(safe_area().right.0 + 14.0))
-            .pt_1p5()
+            .pl(move || px(safe_area().left.0 + 12.0))
+            .pr(move || px(safe_area().right.0 + 12.0))
+            .pt_1()
             .pb(move || {
                 if store.route.with(AppStore::is_phone_secondary_route) {
                     px(safe_area().bottom.0 + 10.0)
@@ -321,17 +343,23 @@ fn phone_mini_player(store: AppStore) -> impl IntoElement {
                         .w_full()
                         .h(px(MINI_PLAYER_HEIGHT))
                         .rounded(px(radius::XL))
-                        .bg(theme::card_elevated)
+                        .overflow_hidden()
+                        .bg(move || theme::mini_player_surface(store.current_accent.get()))
+                        .style_when(
+                            move || !store.now_playing_open.get(),
+                            |s| s.backdrop_blur(px(20.0)),
+                        )
                         .border_1()
-                        .border_color(theme::border)
-                        .overflow_hidden(),
+                        .border_color(move || theme::mini_player_border(store.current_accent.get()))
+                        .transition_colors()
+                        .duration(move || motion::transition_ms(220.0)),
                     Elevation::Floating,
                 )
                 .child(
                     view()
                         .flex_1()
                         .w_full()
-                        .pl_2()
+                        .pl_2p5()
                         .pr_1p5()
                         .flex_row()
                         .items_center()
@@ -350,17 +378,36 @@ fn phone_mini_player(store: AppStore) -> impl IntoElement {
                                 .gap_2p5()
                                 .active(|s| s.opacity(0.78))
                                 .focus_visible(|s| s.outline(px(2.0)).outline_color(theme::ring))
-                                .child(dynamic(move || {
-                                    let seed = track_seed.get();
-                                    untracked(move || {
-                                        artwork_box(
-                                            store.current_artwork_uri,
-                                            seed,
-                                            42.0,
-                                            radius::CONTROL,
-                                        )
-                                    })
-                                }))
+                                .child(
+                                    Elevated::elevation(
+                                        view()
+                                            .size(px(44.0))
+                                            .rounded(px(radius::CONTROL))
+                                            .overflow_hidden()
+                                            .flex_shrink_0(),
+                                        Elevation::Subtle,
+                                    )
+                                    .child(dynamic(move || {
+                                        let seed = track_seed.get();
+                                        untracked(move || {
+                                            artwork_box(
+                                                store.current_artwork_uri,
+                                                seed,
+                                                44.0,
+                                                radius::CONTROL,
+                                            )
+                                        })
+                                    }))
+                                    .child(
+                                        view()
+                                            .absolute()
+                                            .inset_0()
+                                            .rounded(px(radius::CONTROL))
+                                            .border_1()
+                                            .border_color(theme::glass_rim)
+                                            .pointer_events(PointerEvents::None),
+                                    ),
+                                )
                                 .child(
                                     view()
                                         .flex_1()
@@ -374,8 +421,9 @@ fn phone_mini_player(store: AppStore) -> impl IntoElement {
                                                 })
                                             })
                                             .number_of_lines(1)
-                                            .text_size(px(font_size::BODY))
+                                            .text_size(px(14.5))
                                             .font_weight(FontWeight::SEMIBOLD)
+                                            .letter_spacing(px(-0.15))
                                             .text_color(theme::fg),
                                         )
                                         .child(
@@ -416,7 +464,7 @@ fn phone_mini_player(store: AppStore) -> impl IntoElement {
                                                     .flex_1()
                                                     .min_w(px(0.0))
                                                     .number_of_lines(1)
-                                                    .text_size(px(font_size::CAPTION))
+                                                    .text_size(px(12.0))
                                                     .text_color(move || {
                                                         if matches!(
                                                             store.playback_status.get(),
@@ -437,24 +485,135 @@ fn phone_mini_player(store: AppStore) -> impl IntoElement {
                                 .items_center()
                                 .gap_0p5()
                                 .flex_shrink_0()
-                                .child(play_pause_button_buffering(
-                                    store.is_playing,
-                                    is_loading,
-                                    44.0,
-                                    move || {
-                                        if is_loading.get() {
-                                            store.t("player.buffering")
-                                        } else if store.is_playing.get() {
-                                            store.t("player.pause")
-                                        } else {
-                                            store.t("player.play")
-                                        }
-                                    },
-                                    move || store.toggle_play(),
-                                ))
                                 .child(
-                                    icon_button(
+                                    button()
+                                        .test_id("phone-play-pause-btn")
+                                        .accessibility_label(move || {
+                                            Some(if is_loading.get() {
+                                                store.t("player.buffering")
+                                            } else if store.is_playing.get() {
+                                                store.t("player.pause")
+                                            } else {
+                                                store.t("player.play")
+                                            })
+                                        })
+                                        .on_press(move || store.toggle_play())
+                                        .min_w(px(44.0))
+                                        .min_h(px(44.0))
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_full()
+                                        .bg(colors::TRANSPARENT)
+                                        .transition_transform()
+                                        .duration(move || motion::transition_ms(140.0))
+                                        .active(|s| s.scale(motion::press_scale))
+                                        .focus_visible(|s| {
+                                            s.outline(px(2.0)).outline_color(theme::ring)
+                                        })
+                                        .child(
+                                            view()
+                                                .size(px(36.0))
+                                                .rounded_full()
+                                                .items_center()
+                                                .justify_center()
+                                                .bg(move || {
+                                                    theme::mini_player_play_bg(
+                                                        store.current_accent.get(),
+                                                    )
+                                                })
+                                                .border_1()
+                                                .border_color(move || {
+                                                    theme::mini_player_accent(
+                                                        store.current_accent.get(),
+                                                    )
+                                                    .opacity(0.18)
+                                                })
+                                                .transition_colors()
+                                                .duration(move || motion::transition_ms(200.0))
+                                                .pointer_events(PointerEvents::None)
+                                                .child(
+                                                    when(is_loading, move || {
+                                                        loading_spinner(16.0, move || {
+                                                            theme::mini_player_accent(
+                                                                store.current_accent.get(),
+                                                            )
+                                                        })
+                                                    })
+                                                    .otherwise(move || {
+                                                        view()
+                                                            .size(px(19.0))
+                                                            .items_center()
+                                                            .justify_center()
+                                                            .pointer_events(PointerEvents::None)
+                                                            .child(
+                                                                view()
+                                                                    .absolute()
+                                                                    .inset_0()
+                                                                    .pl(px(1.5))
+                                                                    .items_center()
+                                                                    .justify_center()
+                                                                    .bind_opacity(
+                                                                        &play_morph.interpolate(
+                                                                            &[0.0, 1.0],
+                                                                            &[1.0, 0.0],
+                                                                        ),
+                                                                    )
+                                                                    .bind_scale(
+                                                                        &play_morph.interpolate(
+                                                                            &[0.0, 1.0],
+                                                                            &[1.0, 0.72],
+                                                                        ),
+                                                                    )
+                                                                    .child(icon_reactive(
+                                                                        Icon::Play,
+                                                                        17.0,
+                                                                        move || {
+                                                                            theme::mini_player_accent(
+                                                                                store
+                                                                                    .current_accent
+                                                                                    .get(),
+                                                                            )
+                                                                        },
+                                                                    )),
+                                                            )
+                                                            .child(
+                                                                view()
+                                                                    .absolute()
+                                                                    .inset_0()
+                                                                    .items_center()
+                                                                    .justify_center()
+                                                                    .bind_opacity(
+                                                                        &play_morph.interpolate(
+                                                                            &[0.0, 1.0],
+                                                                            &[0.0, 1.0],
+                                                                        ),
+                                                                    )
+                                                                    .bind_scale(
+                                                                        &play_morph.interpolate(
+                                                                            &[0.0, 1.0],
+                                                                            &[0.72, 1.0],
+                                                                        ),
+                                                                    )
+                                                                    .child(icon_reactive(
+                                                                        Icon::Pause,
+                                                                        17.0,
+                                                                        move || {
+                                                                            theme::mini_player_accent(
+                                                                                store
+                                                                                    .current_accent
+                                                                                    .get(),
+                                                                            )
+                                                                        },
+                                                                    )),
+                                                            )
+                                                    }),
+                                                ),
+                                        ),
+                                )
+                                .child(
+                                    icon_button_tinted(
                                         Icon::Next,
+                                        move || theme::fg().opacity(0.84),
                                         move || store.t("player.next"),
                                         move || store.next_track(),
                                     )
@@ -463,21 +622,28 @@ fn phone_mini_player(store: AppStore) -> impl IntoElement {
                         ),
                 )
                 .child(
-                    view().w_full().px_3().pb(px(2.0)).child(
-                        view()
-                            .w_full()
-                            .h(px(2.0))
-                            .rounded_full()
-                            .overflow_hidden()
-                            .bg(theme::track_rail)
-                            .child(
-                                view()
-                                    .h_full()
-                                    .w(move || relative(progress_ratio.get()))
-                                    .rounded_full()
-                                    .bg(theme::primary),
-                            ),
-                    ),
+                    view()
+                        .w_full()
+                        .h(px(2.5))
+                        .bg(move || theme::track_rail().opacity(0.65))
+                        .child(
+                            view()
+                                .absolute()
+                                .top_0()
+                                .bottom_0()
+                                .left_0()
+                                .w(move || relative(buffered_ratio.get()))
+                                .bg(move || theme::track_buffered().opacity(0.55)),
+                        )
+                        .child(
+                            view()
+                                .absolute()
+                                .top_0()
+                                .bottom_0()
+                                .left_0()
+                                .w(move || relative(progress_ratio.get()))
+                                .bg(move || theme::mini_player_accent(store.current_accent.get())),
+                        ),
                 ),
             )
     })

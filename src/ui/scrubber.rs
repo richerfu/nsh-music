@@ -47,6 +47,7 @@ pub struct Scrubber {
     on_dark_stage: bool,
     disabled: Reactive<bool>,
     on_seek: Option<Rc<dyn Fn(u64)>>,
+    on_preview: Option<Rc<dyn Fn(Option<u64>)>>,
 }
 
 /// Convenience constructor for [`Scrubber`].
@@ -72,6 +73,7 @@ impl Scrubber {
             on_dark_stage: false,
             disabled: Reactive::Static(false),
             on_seek: None,
+            on_preview: None,
         }
     }
 
@@ -127,6 +129,11 @@ impl Scrubber {
         self.on_seek = Some(Rc::new(f));
         self
     }
+
+    pub fn on_preview(mut self, f: impl Fn(Option<u64>) + 'static) -> Self {
+        self.on_preview = Some(Rc::new(f));
+        self
+    }
 }
 
 impl IntoElement for Scrubber {
@@ -144,6 +151,7 @@ impl IntoElement for Scrubber {
             on_dark_stage,
             disabled,
             on_seek,
+            on_preview,
         } = self;
 
         // Holds live drag position so the elapsed time preview follows the
@@ -293,6 +301,8 @@ impl IntoElement for Scrubber {
         };
 
         let seek_cb = on_seek.clone();
+        let preview_cb = on_preview.clone();
+        let preview_end_cb = on_preview;
         let buffered_rx = buffered_ratio;
         let acc_rx = accent;
         let spec_rx = spectrum;
@@ -450,7 +460,13 @@ impl IntoElement for Scrubber {
                     .absolute()
                     .left_0()
                     .right_0()
-                    .h(px(4.0))
+                    .h(move || {
+                        if theme::detect_device_form().is_touch() && drag_preview.get().is_some() {
+                            px(6.0)
+                        } else {
+                            px(4.0)
+                        }
+                    })
                     .rounded_full()
                     .overflow_hidden()
                     .transition_all()
@@ -474,20 +490,29 @@ impl IntoElement for Scrubber {
                     .disabled(disabled)
                     .accessibility_label("Seek position")
                     .on_change(move |v: &SliderValue| {
-                        drag_preview.set(Some(v.start().max(0.0) as u64));
+                        let target = v.start().max(0.0) as u64;
+                        drag_preview.set(Some(target));
+                        if let Some(p) = &preview_cb {
+                            p(Some(target));
+                        }
                     })
                     .on_change_end(move |v: &SliderValue| {
                         let target = v.start().max(0.0) as u64;
-                        drag_preview.set(None);
-                        if let Some(cb) = &seek_cb {
-                            cb(target);
-                        }
+                        batch(|| {
+                            if let Some(cb) = &seek_cb {
+                                cb(target);
+                            }
+                            drag_preview.set(None);
+                            if let Some(p) = &preview_end_cb {
+                                p(None);
+                            }
+                        });
                     })
                     .track_style(|s| {
                         s.w_full()
                             .h(move || {
                                 if theme::detect_device_form().is_touch() {
-                                    px(36.0)
+                                    px(44.0)
                                 } else {
                                     px(20.0)
                                 }
@@ -496,7 +521,15 @@ impl IntoElement for Scrubber {
                     })
                     .indicator_style(move |s| {
                         s.w_full()
-                            .h(px(4.0))
+                            .h(move || {
+                                if theme::detect_device_form().is_touch()
+                                    && drag_preview.get().is_some()
+                                {
+                                    px(6.0)
+                                } else {
+                                    px(4.0)
+                                }
+                            })
                             .rounded_full()
                             .bg(rail_color)
                             .transition_all()
@@ -510,7 +543,13 @@ impl IntoElement for Scrubber {
                     })
                     .thumb_class("active:opacity-100 active:scale-125 focus-visible:opacity-100 focus-visible:outline-2 focus-visible:outline-ring")
                     .thumb_style(move |s| {
-                        s.size(px(12.0))
+                        s.size(move || {
+                            if theme::detect_device_form().is_touch() {
+                                px(14.0)
+                            } else {
+                                px(12.0)
+                            }
+                        })
                             .rounded_full()
                             .bg(if on_dark_stage {
                                 colors::NP_FG
@@ -527,7 +566,11 @@ impl IntoElement for Scrubber {
                                     0.0_f32
                                 }
                             })
-                            .transition_all()
+                            .style_when(
+                                move || drag_preview.get().is_some() && !reduce_motion(),
+                                |s| s.scale(1.2),
+                            )
+                            .transition_opacity()
                             .duration(move || motion::transition_ms(140.0))
                             .group_hover(|s| s.opacity(1.0).scale(1.15))
                     }),

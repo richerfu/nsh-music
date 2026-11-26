@@ -14,7 +14,10 @@ use std::f32::consts::TAU;
 use nsh_base::button;
 use nsh_core::{LineHeight, canvas::LineCap, prelude::*};
 use nsh_music_audio::PlaybackStatus;
-use nsh_music_core::{lyrics::ParsedLyricLine, model::LyricWord};
+use nsh_music_core::{
+    lyrics::{ParsedLyricLine, spread_words},
+    model::LyricWord,
+};
 
 use super::{
     buffering_badge, clickable_artist_links, lyrics_view, phone_scrubber_meta_row,
@@ -261,79 +264,6 @@ fn line_random(seed: f64, offset: f64) -> f32 {
     (x - x.floor()) as f32
 }
 
-/// Splits a lyric line into display words: uses real `line.words` when word-synced,
-/// or synthesizes evenly-timed phrase words from `line.text` so line-synced tracks
-/// animate cleanly on Stage too.
-fn line_display_words(line: &ParsedLyricLine, next_start_ms: Option<i64>) -> Vec<LyricWord> {
-    if !line.words.is_empty() {
-        return line.words.clone();
-    }
-    let trimmed = line.text.trim();
-    if trimmed.is_empty() {
-        return Vec::new();
-    }
-
-    let tokens: Vec<String> = if trimmed.contains(char::is_whitespace) {
-        let split: Vec<&str> = trimmed.split_whitespace().collect();
-        split
-            .iter()
-            .enumerate()
-            .map(|(i, tok)| {
-                if i + 1 < split.len() {
-                    format!("{tok} ")
-                } else {
-                    (*tok).to_owned()
-                }
-            })
-            .collect()
-    } else {
-        // CJK / unspaced scripts: group into readable 2-4 character visual clusters
-        let chars: Vec<char> = trimmed.chars().collect();
-        let chunk = if chars.len() <= 6 {
-            2
-        } else if chars.len() <= 14 {
-            3
-        } else {
-            4
-        };
-        chars
-            .chunks(chunk)
-            .map(|ch| ch.iter().collect::<String>())
-            .collect()
-    };
-
-    let end_ms = if line.end_ms > line.start_ms {
-        line.end_ms
-    } else if let Some(ns) = next_start_ms
-        && ns > line.start_ms
-    {
-        (line.start_ms + 4_500).min(ns)
-    } else {
-        line.start_ms + 3_200
-    };
-    let span = (end_ms - line.start_ms).max(400);
-    let count = tokens.len().max(1) as i64;
-    let step = (span / count).max(120);
-
-    tokens
-        .into_iter()
-        .enumerate()
-        .map(|(i, text)| {
-            let s = line.start_ms + i as i64 * step;
-            let e = if i + 1 == count as usize {
-                end_ms.max(s + 150)
-            } else {
-                (s + step).min(end_ms).max(s + 150)
-            };
-            LyricWord {
-                start: s,
-                end: e,
-                text,
-            }
-        })
-        .collect()
-}
-
 /// Full-window Stage lyric visualizer panel + slim `stageBar` along the foot.
 pub fn stage_panel(store: AppStore, form: DeviceForm) -> View {
     let is_phone = form.is_phone();
@@ -554,7 +484,7 @@ fn stage_active_line_host(
                 let Some(line) = line_opt else {
                     return view().key("stage-empty-line");
                 };
-                let words = line_display_words(&line, next_start);
+                let words = spread_words(&line, next_start);
                 if words.is_empty() {
                     return view().key("stage-blank-line");
                 }

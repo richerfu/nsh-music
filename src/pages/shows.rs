@@ -15,7 +15,7 @@ use nsh_music_core::model::Track;
 use crate::pages::{
     ARTWORK_SIZE_CARD, ARTWORK_SIZE_THUMB, PagesOwner, build_track_context_menu, card_grid,
     detail_hero_custom_subtitle, hero_play_shuffle_buttons, inline_nav_link, lazy_context_menu,
-    lazy_more_menu_button, page_scroll, refresh_pill_button, shimmer_card_grid,
+    lazy_more_menu_button, page_scroll, pagination_footer, refresh_pill_button, shimmer_card_grid,
     shimmer_detail_hero, shimmer_track_list, sized_artwork_url, sized_track_cover,
 };
 use crate::state::{AppStore, Route};
@@ -330,6 +330,18 @@ pub fn show_detail_page(store: AppStore, form: DeviceForm, id: String) -> View {
                         None,
                     ))
                     .child(list)
+                    .child(pagination_footer(
+                        store,
+                        form,
+                        "show-load-more-btn",
+                        move || {
+                            store
+                                .active_show
+                                .with(|p| p.as_ref().is_some_and(|s| s.more))
+                        },
+                        move || store.show_episodes_loading_more.get(),
+                        move || store.load_more_show_episodes(),
+                    ))
             };
 
             view()
