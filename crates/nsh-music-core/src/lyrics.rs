@@ -187,6 +187,216 @@ impl ParsedLyrics {
                 .collect(),
         }
     }
+
+    /// Serializes parsed lyrics into an LRC string (`[mm:ss.xx]text` when synced,
+    /// or newline-delimited plain text when unsynced), skipping empty lines.
+    pub fn to_lrc_string(&self) -> String {
+        let mut out = Vec::with_capacity(self.lines.len());
+        for line in &self.lines {
+            let text = line.text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            if self.synced {
+                let ms = line.start_ms.max(0);
+                let min = ms / 60_000;
+                let sec = (ms % 60_000) / 1_000;
+                let cs = (ms % 1_000) / 10;
+                out.push(format!("[{min:02}:{sec:02}.{cs:02}]{text}"));
+            } else {
+                out.push(text.to_owned());
+            }
+        }
+        out.join("\n")
+    }
+}
+
+/// Synthesizes approximate per-word timings across 85% of a line's duration when
+/// a synced line lacks native word timestamps (matching upstream `SpreadWords`).
+pub fn spread_words(line: &ParsedLyricLine, next_start_ms: Option<i64>) -> Vec<LyricWord> {
+    if !line.words.is_empty() {
+        return line.words.clone();
+    }
+
+    let trimmed = line.text.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    let tokens = tokenize_lyric_words(trimmed);
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+
+    let start_ms = line.start_ms;
+    let end_ms = if line.end_ms > start_ms {
+        line.end_ms
+    } else if let Some(next) = next_start_ms.filter(|&n| n > start_ms) {
+        next.min(start_ms.saturating_add(5_000))
+    } else {
+        start_ms.saturating_add(3_200)
+    };
+
+    let span_ms = (((end_ms - start_ms).max(400)) as f64 * 0.85).round() as i64;
+    let span_ms = span_ms.max(1);
+    let total_weight: i64 = tokens
+        .iter()
+        .map(|tok| tok.trim().chars().count().max(1) as i64)
+        .sum::<i64>()
+        .max(1);
+
+    let len = tokens.len();
+    let mut out = Vec::with_capacity(len);
+    let mut at = start_ms;
+    let target_end = start_ms.saturating_add(span_ms);
+    for (i, tok) in tokens.into_iter().enumerate() {
+        let weight = tok.trim().chars().count().max(1) as i64;
+        let word_end = if i + 1 == len {
+            target_end.max(at)
+        } else {
+            let dur = (span_ms.saturating_mul(weight)) / total_weight;
+            at.saturating_add(dur).min(target_end)
+        };
+        out.push(LyricWord {
+            start: at,
+            end: word_end,
+            text: tok,
+        });
+        at = word_end;
+    }
+
+    out
+}
+
+fn tokenize_lyric_words(text: &str) -> Vec<String> {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut cur = String::new();
+
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            if !cur.is_empty() {
+                cur.push(' ');
+                tokens.push(std::mem::take(&mut cur));
+            } else if let Some(last) = tokens.last_mut()
+                && !last.ends_with(' ')
+            {
+                last.push(' ');
+            }
+        } else if is_cjk_or_kana_or_hangul(ch) {
+            if !cur.is_empty() {
+                tokens.push(std::mem::take(&mut cur));
+            }
+            tokens.push(ch.to_string());
+        } else {
+            cur.push(ch);
+        }
+    }
+    if !cur.is_empty() {
+        tokens.push(cur);
+    }
+    if let Some(last) = tokens.last_mut()
+        && last.ends_with(' ')
+    {
+        *last = last.trim_end().to_owned();
+    }
+    tokens.retain(|t| !t.is_empty());
+    tokens
+}
+
+fn is_cjk_or_kana_or_hangul(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{1100}'..='\u{11FF}'
+            | '\u{3040}'..='\u{309F}'
+            | '\u{30A0}'..='\u{30FF}'
+            | '\u{3130}'..='\u{318F}'
+            | '\u{31F0}'..='\u{31FF}'
+            | '\u{3400}'..='\u{4DBF}'
+            | '\u{4E00}'..='\u{9FFF}'
+            | '\u{AC00}'..='\u{D7AF}'
+            | '\u{F900}'..='\u{FAFF}'
+            | '\u{FF66}'..='\u{FF9D}'
+            | '\u{20000}'..='\u{2A6DF}'
+    )
+}
+
+/// Detects whether lyric lines are predominantly Japanese (`"ja"` when `>= 3`
+/// Hiragana/Katakana characters appear across the lines, else `""`).
+pub fn detect_lang(lines: &[ParsedLyricLine]) -> &'static str {
+    let mut kana_count = 0usize;
+    for line in lines {
+        for ch in line.text.chars() {
+            if is_japanese_kana(ch) {
+                kana_count += 1;
+                if kana_count >= 3 {
+                    return "ja";
+                }
+            }
+        }
+    }
+    ""
+}
+
+fn is_japanese_kana(ch: char) -> bool {
+    ch != 'ー'
+        && ch != '・'
+        && matches!(
+            ch,
+            '\u{3040}'..='\u{309F}' | '\u{30A0}'..='\u{30FF}' | '\u{31F0}'..='\u{31FF}'
+        )
+}
+
+/// Detects common CJK/English credit metadata lines (e.g., `作词：...`, `Composer: ...`)
+/// so quiet-part and interlude detection can ignore non-sung credit headers.
+pub fn is_credit_line(text: &str) -> bool {
+    let trimmed = text.trim();
+    let Some(sep_idx) = trimmed.find([':', '：']) else {
+        return false;
+    };
+    let head = trimmed[..sep_idx].trim();
+    if head.is_empty() || head.chars().count() > 16 {
+        return false;
+    }
+
+    if matches!(head, "词" | "曲") {
+        return true;
+    }
+
+    const CJK_PREFIXES: &[&str] = &[
+        "作词", "作曲", "编曲", "制作", "监制", "混音", "录音", "母带", "和声", "吉他", "贝斯",
+        "鼓", "键盘", "弦乐", "出品", "发行", "演唱", "原唱", "翻唱", "策划", "统筹", "后期",
+        "文案", "封面", "词曲", "人声",
+    ];
+    if CJK_PREFIXES.iter().any(|p| head.starts_with(p)) {
+        return true;
+    }
+
+    let lower = head.to_ascii_lowercase();
+    if matches!(lower.as_str(), "op" | "sp" | "op/sp" | "sp/op") {
+        return true;
+    }
+
+    const EN_PREFIXES: &[&str] = &[
+        "lyricist",
+        "lyrics",
+        "composer",
+        "music",
+        "arranger",
+        "arranged by",
+        "producer",
+        "produced by",
+        "vocal",
+        "vocals",
+        "mixing",
+        "mixed by",
+        "mastering",
+        "mastered by",
+        "recorded by",
+        "written by",
+    ];
+    EN_PREFIXES.iter().any(|p| {
+        lower == *p || lower.starts_with(&format!("{p} ")) || lower.starts_with(&format!("{p}/"))
+    })
 }
 
 /// Binary-searches the active line index directly on a slice of model [`LyricLine`]s.
@@ -276,9 +486,21 @@ pub fn parse_lyrics(raw: &Lyrics) -> ParsedLyrics {
         let mut lines: Vec<ParsedLyricLine> = raw
             .lines
             .iter()
-            .map(ParsedLyricLine::from_model_line)
+            .map(|src_line| {
+                let mut line = ParsedLyricLine::from_model_line(src_line);
+                if line.text.trim().is_empty() && !line.words.is_empty() {
+                    line.text = line
+                        .words
+                        .iter()
+                        .map(|w| w.text.as_str())
+                        .collect::<String>();
+                }
+                line
+            })
             .collect();
-        let synced = lines.iter().any(|l| l.start_ms > 0 || l.end_ms > 0);
+        let synced = lines.iter().any(|l| {
+            l.start_ms > 0 || l.end_ms > 0 || l.words.iter().any(|w| w.start > 0 || w.end > 0)
+        });
         if synced {
             lines.sort_by_key(|l| l.start_ms);
             infer_end_times(&mut lines, &[]);
@@ -1229,5 +1451,199 @@ mod tests {
         assert_eq!(model.lines[0].translation, "你好");
         assert_eq!(find_active_line(&model.lines, 7_500), Some(0));
         assert!((line_progress(&model.lines[0], 7_500) - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn parse_lyrics_synthesizes_text_from_words_and_backfills_end_times() {
+        let raw = Lyrics {
+            lrc: String::new(),
+            translation: String::new(),
+            lines: vec![
+                LyricLine {
+                    start: 1_000,
+                    end: 0,
+                    text: "   ".into(),
+                    translation: String::new(),
+                    words: vec![
+                        LyricWord {
+                            start: 1_000,
+                            end: 1_400,
+                            text: "Hello ".into(),
+                        },
+                        LyricWord {
+                            start: 1_400,
+                            end: 1_900,
+                            text: "world".into(),
+                        },
+                    ],
+                },
+                LyricLine {
+                    start: 4_000,
+                    end: 0,
+                    text: "Second line".into(),
+                    translation: String::new(),
+                    words: Vec::new(),
+                },
+                LyricLine {
+                    start: 7_500,
+                    end: 0,
+                    text: "Final line".into(),
+                    translation: String::new(),
+                    words: Vec::new(),
+                },
+            ],
+        };
+        let parsed = parse_lyrics(&raw);
+        assert!(parsed.synced);
+        assert!(parsed.word_synced);
+        assert_eq!(parsed.lines[0].text, "Hello world");
+        assert_eq!(parsed.lines[0].end_ms, 1_900);
+        assert_eq!(parsed.lines[1].end_ms, 7_500);
+        assert_eq!(parsed.lines[2].end_ms, 12_500);
+    }
+
+    #[test]
+    fn to_lrc_string_serializes_synced_and_unsynced_lines() {
+        let synced = parse_lyrics(&Lyrics {
+            lrc: String::new(),
+            translation: String::new(),
+            lines: vec![
+                LyricLine {
+                    start: 0,
+                    end: 2_000,
+                    text: "   ".into(),
+                    translation: String::new(),
+                    words: Vec::new(),
+                },
+                LyricLine {
+                    start: 12_340,
+                    end: 15_000,
+                    text: "First line".into(),
+                    translation: String::new(),
+                    words: Vec::new(),
+                },
+                LyricLine {
+                    start: 65_090,
+                    end: 70_000,
+                    text: "Second line".into(),
+                    translation: String::new(),
+                    words: Vec::new(),
+                },
+            ],
+        });
+        assert_eq!(
+            synced.to_lrc_string(),
+            "[00:12.34]First line\n[01:05.09]Second line"
+        );
+
+        let unsynced = parse_lrc("Plain line one\n\nPlain line two\n");
+        assert_eq!(unsynced.to_lrc_string(), "Plain line one\nPlain line two");
+    }
+
+    #[test]
+    fn spread_words_handles_existing_words_latin_cjk_and_mixed() {
+        let with_words = ParsedLyricLine {
+            start_ms: 1_000,
+            end_ms: 2_000,
+            text: "Keep me".into(),
+            words: vec![LyricWord {
+                start: 1_000,
+                end: 1_500,
+                text: "Keep ".into(),
+            }],
+            ..ParsedLyricLine::default()
+        };
+        assert_eq!(spread_words(&with_words, Some(3_000)), with_words.words);
+
+        let latin = ParsedLyricLine {
+            start_ms: 10_000,
+            end_ms: 0,
+            text: "Hello world".into(),
+            ..ParsedLyricLine::default()
+        };
+        let latin_words = spread_words(&latin, Some(14_000));
+        assert_eq!(latin_words.len(), 2);
+        assert_eq!(latin_words[0].text, "Hello ");
+        assert_eq!(latin_words[1].text, "world");
+        assert_eq!(latin_words[0].start, 10_000);
+        // 85% of 4000ms = 3400ms
+        assert_eq!(latin_words[1].end, 13_400);
+        assert_eq!(latin_words[0].end, latin_words[1].start);
+
+        let mixed = ParsedLyricLine {
+            start_ms: 0,
+            end_ms: 0,
+            text: "夜空の star light".into(),
+            ..ParsedLyricLine::default()
+        };
+        let mixed_words = spread_words(&mixed, Some(20_000));
+        // Capped at +5_000ms -> 85% = 4_250ms
+        assert_eq!(
+            mixed_words
+                .iter()
+                .map(|w| w.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["夜", "空", "の ", "star ", "light"]
+        );
+        assert_eq!(mixed_words.first().unwrap().start, 0);
+        assert_eq!(mixed_words.last().unwrap().end, 4_250);
+
+        let no_next = ParsedLyricLine {
+            start_ms: 5_000,
+            end_ms: 0,
+            text: "星光".into(),
+            ..ParsedLyricLine::default()
+        };
+        let no_next_words = spread_words(&no_next, None);
+        // Default 3_200ms -> 85% = 2_720ms
+        assert_eq!(no_next_words.len(), 2);
+        assert_eq!(no_next_words[0].start, 5_000);
+        assert_eq!(no_next_words[1].end, 7_720);
+    }
+
+    #[test]
+    fn detect_lang_and_is_credit_line_cover_edge_cases() {
+        let ja_lines = parse_lrc("[00:01.00]夜空に光る星\n[00:04.00]君の声が響く\n").lines;
+        assert_eq!(detect_lang(&ja_lines), "ja");
+
+        let zh_lines = parse_lrc("[00:01.00]星河漫漫\n[00:04.00]长夜未央\n").lines;
+        assert_eq!(detect_lang(&zh_lines), "");
+
+        let two_kana = parse_lrc("[00:01.00]星の夢\n[00:04.00]のー・\n").lines;
+        assert_eq!(detect_lang(&two_kana), "");
+
+        for credit in [
+            "作词：林夕",
+            "作曲: 周杰伦",
+            "编曲: 钟兴民",
+            "制作人: 张亚东",
+            "混音：赵靖",
+            "母带：Randy",
+            "词：方文山",
+            "曲：周杰伦",
+            "词: Foo",
+            "曲: Bar",
+            "Lyricist: Alice",
+            "Composer: Bob",
+            "Arranger: Carol",
+            "Producer: Dave",
+            "Vocal: Eve",
+            "OP: Sony Music",
+        ] {
+            assert!(is_credit_line(credit), "expected credit line: {credit}");
+        }
+
+        for non_credit in [
+            "夜空に光る星",
+            "Hello: world",
+            "Open: the door",
+            "这是一段很长很长超过限制的普通歌词句子：不要误判",
+            "普通句子没有冒号",
+        ] {
+            assert!(
+                !is_credit_line(non_credit),
+                "unexpected credit line: {non_credit}"
+            );
+        }
     }
 }

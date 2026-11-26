@@ -75,6 +75,7 @@ pub struct AppSettings {
     pub enabled_plugins: Vec<String>,
     pub disabled_plugins: Vec<String>,
     pub plugin_configs: BTreeMap<String, serde_json::Value>,
+    pub mobile_virtual_compat: bool,
     pub ffmpeg_path: Option<PathBuf>,
     pub local_folders: Vec<PathBuf>,
 }
@@ -101,6 +102,7 @@ impl Default for AppSettings {
             enabled_plugins: Vec::new(),
             disabled_plugins: Vec::new(),
             plugin_configs: BTreeMap::new(),
+            mobile_virtual_compat: true,
             ffmpeg_path: None,
             local_folders: Vec::new(),
         }
@@ -328,5 +330,20 @@ mod tests {
         assert!(leftover_tmps.is_empty());
 
         let _ = fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn mobile_virtual_compat_defaults_true_and_deserializes_camel_case() {
+        assert!(AppSettings::default().mobile_virtual_compat);
+
+        let from_empty: AppSettings = serde_json::from_str("{}").expect("empty object");
+        assert!(from_empty.mobile_virtual_compat);
+
+        let disabled: AppSettings =
+            serde_json::from_str(r#"{"mobileVirtualCompat": false}"#).expect("camelCase false");
+        assert!(!disabled.mobile_virtual_compat);
+
+        let serialized = serde_json::to_string(&disabled).expect("serialize");
+        assert!(serialized.contains(r#""mobileVirtualCompat":false"#));
     }
 }

@@ -695,6 +695,25 @@ impl MusicSource for LocalMusicSource {
         let guard = self.state.read().expect("local library lock poisoned");
 
         if let Some(track) = guard.local_tracks.iter().find(|t| t.id == id) {
+            // Prioritize sidecar `.lrc` / `.LRC` files before embedded tags (matching upstream mygo-music).
+            if !track.local_path.is_empty() {
+                let track_path = Path::new(&track.local_path);
+                for ext in ["lrc", "LRC"] {
+                    let sidecar = track_path.with_extension(ext);
+                    if let Ok(content) = fs::read_to_string(&sidecar)
+                        && !content.trim().is_empty()
+                    {
+                        let mut raw = Lyrics {
+                            lrc: content,
+                            translation: String::new(),
+                            lines: Vec::new(),
+                        };
+                        raw.lines = parse_lyrics(&raw).to_model_lyrics().lines;
+                        return Ok(raw);
+                    }
+                }
+            }
+
             if let Some(embedded) = guard
                 .local_meta
                 .get(id)
@@ -708,19 +727,6 @@ impl MusicSource for LocalMusicSource {
                 };
                 raw.lines = parse_lyrics(&raw).to_model_lyrics().lines;
                 return Ok(raw);
-            }
-
-            if !track.local_path.is_empty() {
-                let sidecar = Path::new(&track.local_path).with_extension("lrc");
-                if let Ok(content) = fs::read_to_string(&sidecar) {
-                    let mut raw = Lyrics {
-                        lrc: content,
-                        translation: String::new(),
-                        lines: Vec::new(),
-                    };
-                    raw.lines = parse_lyrics(&raw).to_model_lyrics().lines;
-                    return Ok(raw);
-                }
             }
         }
 
@@ -1325,5 +1331,70 @@ mod tests {
         let _ = fs::remove_dir_all(&music_dir);
         let _ = fs::remove_dir_all(&cover_dir);
         let _ = fs::remove_dir_all(&lib_dir);
+    }
+
+    #[test]
+    fn sidecar_lrc_and_uppercase_lrc_take_precedence_over_embedded_lyrics() {
+        let music_dir = temp_dir("lyrics-priority");
+        let cover_dir = temp_dir("lyrics-priority-covers");
+
+        let wav_lower = music_dir.join("song_lower.wav");
+        let wav_upper = music_dir.join("song_upper.wav");
+        let wav_embedded = music_dir.join("song_embedded.wav");
+        create_minimal_wav(&wav_lower);
+        create_minimal_wav(&wav_upper);
+        create_minimal_wav(&wav_embedded);
+
+        for (path, title) in [
+            (&wav_lower, "Lower Sidecar Song"),
+            (&wav_upper, "Upper Sidecar Song"),
+            (&wav_embedded, "Embedded Only Song"),
+        ] {
+            let mut tag = Tag::new(TagType::Id3v2);
+            tag.set_title(title.to_owned());
+            tag.insert_text(ItemKey::Lyrics, "[00:01.00]From embedded tag".to_owned());
+            tag.save_to_path(path, lofty::config::WriteOptions::default())
+                .expect("save embedded lyrics tag");
+        }
+
+        fs::write(
+            music_dir.join("song_lower.lrc"),
+            "[00:01.00]From lowercase sidecar\n",
+        )
+        .expect("write .lrc");
+        fs::write(
+            music_dir.join("song_upper.LRC"),
+            "[00:01.00]From uppercase sidecar\n",
+        )
+        .expect("write .LRC");
+
+        let src = LocalMusicSource::with_storage(vec![music_dir.clone()], cover_dir.clone(), None);
+        let tracks = src.all_tracks();
+        let find_id = |name: &str| {
+            tracks
+                .iter()
+                .find(|t| t.name == name)
+                .expect("track found")
+                .id
+                .clone()
+        };
+
+        let lower_lyrics = src
+            .lyrics(&find_id("Lower Sidecar Song"))
+            .expect("lower sidecar");
+        assert_eq!(lower_lyrics.lines[0].text, "From lowercase sidecar");
+
+        let upper_lyrics = src
+            .lyrics(&find_id("Upper Sidecar Song"))
+            .expect("upper sidecar");
+        assert_eq!(upper_lyrics.lines[0].text, "From uppercase sidecar");
+
+        let embedded_lyrics = src
+            .lyrics(&find_id("Embedded Only Song"))
+            .expect("embedded fallback");
+        assert_eq!(embedded_lyrics.lines[0].text, "From embedded tag");
+
+        let _ = fs::remove_dir_all(&music_dir);
+        let _ = fs::remove_dir_all(&cover_dir);
     }
 }
