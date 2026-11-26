@@ -1,15 +1,16 @@
-//! In-process pure-Rust `yt-dlp` virtualization shim (`VirtualYtdlpShim` / `YtdlpVirtualShim`).
+//! In-process `yt-dlp` virtualization shim (`VirtualYtdlpShim` / `YtdlpVirtualShim`) powered by
+//! embedded upstream `LuanRT/YouTube.js` (`youtubei.js@18.3.0`, MIT) + `yt-dlp/ejs` (`0.8.0`).
 //!
 //! Enables `mygo-music` plugins calling `host.spawn("yt-dlp", ...)` (including `youtube-music`)
 //! to work seamlessly on iOS, Android, HarmonyOS, and desktops without an external `yt-dlp` / Python
 //! installation. On Desktop when `Allow Programs` is granted and a real `yt-dlp` binary exists,
 //! the real binary is preferred; otherwise (or on Mobile) `VirtualYtdlpShim` runs in-process
-//! using `reqwest` (`rustls-tls`) and pure-Rust SHA-1 `SAPISIDHASH` authentication.
+//! using `YouTube.js` + `yt-dlp/ejs` inside `quickjs-jit` bridged to Rust `reqwest`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -20,28 +21,25 @@ use crate::mobile_compat::{
     VirtualProcessShim, VirtualSpawnResult, resolve_real_binary, resolve_relative_command,
     with_default_cwd,
 };
-use crate::yt_clients::{
-    InnerTubeClientSpec, WEB_REMIX_UA, compute_youtube_auth_header, lookup_client,
-    resolve_requested_clients,
-};
 use crate::yt_ejs;
 use crate::yt_format_selector::{
     CandidateFormatMeta, FormatSelector, PoTokenContext, YoutubeExtractorArgs,
 };
+use crate::yt_youtubejs::{
+    RESILIENT_FALLBACK_CLIENTS, YtJsClientSpec, YtJsExtractRequest, YtJsExtractResponse,
+    extract_via_youtubejs, lookup_ytjs_client, resolve_requested_ytjs_clients,
+};
 
 const DEFAULT_INNERTUBE_ORIGIN: &str = "https://music.youtube.com";
-const WEB_YOUTUBE_ORIGIN: &str = "https://www.youtube.com";
-const VISITOR_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
-const VISITOR_HTTP_TIMEOUT: Duration = Duration::from_secs(4);
-const PLAYER_HTTP_TIMEOUT: Duration = Duration::from_secs(7);
+const PLAYER_HTTP_TIMEOUT: Duration = Duration::from_secs(12);
 const PREFLIGHT_HTTP_TIMEOUT: Duration = Duration::from_secs(6);
 const HLS_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(10);
-const DEFAULT_CASCADE_BUDGET: Duration = Duration::from_secs(22);
+const DEFAULT_CASCADE_BUDGET: Duration = Duration::from_secs(24);
 const CLIENT_WINNER_TTL: Duration = Duration::from_secs(15 * 60);
 const CLIENT_FAILURE_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// Synthetic `--version` banner emitted by [`VirtualYtdlpShim`].
-pub const VIRTUAL_YTDLP_VERSION_BANNER: &str = "2026.03.01 (nsh-virtual-ytdlp)\n";
+pub const VIRTUAL_YTDLP_VERSION_BANNER: &str = "2026.03.01 (nsh-youtubejs-18.3.0+ejs-0.8.0)\n";
 
 /// Returns `true` if `cmd` targets a `yt-dlp` executable (bare name, path, or `.exe`).
 pub fn is_ytdlp_command(cmd: &str) -> bool {
@@ -545,105 +543,6 @@ pub struct ResolvedAudioStream {
     pub formats_json: Vec<Value>,
 }
 
-fn visitor_cache() -> &'static Mutex<HashMap<String, (String, Instant)>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, (String, Instant)>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-async fn fetch_or_cached_visitor_data(
-    client: &reqwest::Client,
-    base: &str,
-    timeout: Duration,
-) -> String {
-    if let Ok(guard) = visitor_cache().lock()
-        && let Some((v, at)) = guard.get(base)
-        && at.elapsed() < VISITOR_CACHE_TTL
-    {
-        return v.clone();
-    }
-
-    let req_timeout = timeout.min(VISITOR_HTTP_TIMEOUT);
-    if req_timeout.is_zero() {
-        return String::new();
-    }
-
-    // 1. Primary: POST /youtubei/v1/visitor_id?prettyPrint=false
-    let visitor_url = format!("{base}/youtubei/v1/visitor_id?prettyPrint=false");
-    let body = json!({
-        "context": {
-            "client": {
-                "clientName": "WEB_REMIX",
-                "clientVersion": "1.20260301.01.00",
-                "hl": "en"
-            }
-        }
-    });
-    if let Ok(Ok(resp)) = tokio::time::timeout(
-        req_timeout,
-        client
-            .post(&visitor_url)
-            .header("content-type", "application/json")
-            .header("user-agent", WEB_REMIX_UA)
-            .header("origin", base)
-            .header("x-origin", base)
-            .json(&body)
-            .timeout(req_timeout)
-            .send(),
-    )
-    .await
-        && resp.status().is_success()
-        && let Ok(Ok(val)) = tokio::time::timeout(req_timeout, resp.json::<Value>()).await
-        && let Some(vd) = val
-            .pointer("/responseContext/visitorData")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-    {
-        cache_visitor_data(base, vd);
-        return vd.to_owned();
-    }
-
-    // 2. Fallback: scrape `"VISITOR_DATA":"..."` / `"visitorData":"..."` from homepage HTML.
-    if let Ok(Ok(resp)) = tokio::time::timeout(
-        req_timeout,
-        client
-            .get(format!("{base}/"))
-            .header("user-agent", WEB_REMIX_UA)
-            .timeout(req_timeout)
-            .send(),
-    )
-    .await
-        && resp.status().is_success()
-        && let Ok(Ok(html)) = tokio::time::timeout(req_timeout, resp.text()).await
-        && let Some(vd) = scrape_visitor_data_from_html(&html)
-    {
-        cache_visitor_data(base, &vd);
-        return vd;
-    }
-
-    String::new()
-}
-
-fn cache_visitor_data(base: &str, visitor: &str) {
-    if let Ok(mut guard) = visitor_cache().lock() {
-        guard.insert(base.to_owned(), (visitor.to_owned(), Instant::now()));
-    }
-}
-
-fn scrape_visitor_data_from_html(html: &str) -> Option<String> {
-    for needle in ["\"VISITOR_DATA\":\"", "\"visitorData\":\""] {
-        if let Some(pos) = html.find(needle) {
-            let rest = &html[pos + needle.len()..];
-            if let Some(end) = rest.find('"') {
-                let candidate = &rest[..end];
-                if !candidate.is_empty() && candidate.len() < 256 {
-                    return Some(candidate.to_owned());
-                }
-            }
-        }
-    }
-    None
-}
-
 /// Decodes the 2-letter uppercase GeoIP country code (e.g. `"US"`, `"CN"`, `"HK"`)
 /// embedded in a YouTube `visitorData` protobuf payload (field `6` -> nested field `1`).
 pub fn decode_visitor_data_geo(visitor_data: &str) -> Option<String> {
@@ -930,29 +829,19 @@ fn record_client_health_failure(has_cookie: bool, client_key: &'static str) {
 
 #[derive(Clone)]
 struct CascadeStep {
-    spec: &'static InnerTubeClientSpec,
-    origin: String,
+    spec: &'static YtJsClientSpec,
+    loopback_origin: Option<String>,
     send_auth: bool,
     is_explicit: bool,
 }
 
-const RESILIENT_FALLBACK_CLIENTS: &[&str] = &[
-    "tv_samsung",
-    "android_vr",
-    "visionos",
-    "web_music",
-    "web_creator",
-    "android",
-    "ios",
-];
-
 fn apply_client_health_ordering(
-    chosen: Vec<(&'static InnerTubeClientSpec, bool)>,
+    chosen: Vec<(&'static YtJsClientSpec, bool)>,
     explicit_requested: bool,
     has_cookie: bool,
     cache: &ClientHealthCache,
     now: Instant,
-) -> Vec<(&'static InnerTubeClientSpec, bool)> {
+) -> Vec<(&'static YtJsClientSpec, bool)> {
     let winner = cache.healthy_winner_at(has_cookie, now);
 
     if !explicit_requested {
@@ -1002,11 +891,11 @@ fn apply_client_health_ordering(
     let winner_differs_from_explicit =
         winner.is_some_and(|w| !explicits.iter().any(|(s, _)| s.key == w));
 
-    let mut winner_entry: Option<(&'static InnerTubeClientSpec, bool)> = None;
+    let mut winner_entry: Option<(&'static YtJsClientSpec, bool)> = None;
     if winner_differs_from_explicit && let Some(w) = winner {
         if let Some(pos) = healthy_fallbacks.iter().position(|(s, _)| s.key == w) {
             winner_entry = Some(healthy_fallbacks.remove(pos));
-        } else if let Some(spec) = lookup_client(w) {
+        } else if let Some(spec) = lookup_ytjs_client(w) {
             winner_entry = Some((spec, false));
         }
     }
@@ -1029,7 +918,6 @@ fn apply_client_health_ordering(
 
 fn build_cascade_steps(
     primary: &str,
-    secondary: Option<&str>,
     has_cookie: bool,
     ext_args: &YoutubeExtractorArgs,
 ) -> Vec<CascadeStep> {
@@ -1037,7 +925,6 @@ fn build_cascade_steps(
     if loopback {
         return build_cascade_steps_inner(
             primary,
-            secondary,
             has_cookie,
             ext_args,
             false,
@@ -1047,23 +934,14 @@ fn build_cascade_steps(
     }
     let now = Instant::now();
     if let Ok(cache) = client_health_cache().lock() {
-        build_cascade_steps_inner(
-            primary,
-            secondary,
-            has_cookie,
-            ext_args,
-            true,
-            Some(&cache),
-            now,
-        )
+        build_cascade_steps_inner(primary, has_cookie, ext_args, true, Some(&cache), now)
     } else {
-        build_cascade_steps_inner(primary, secondary, has_cookie, ext_args, true, None, now)
+        build_cascade_steps_inner(primary, has_cookie, ext_args, true, None, now)
     }
 }
 
 fn build_cascade_steps_inner(
     primary: &str,
-    secondary: Option<&str>,
     has_cookie: bool,
     ext_args: &YoutubeExtractorArgs,
     append_fallbacks: bool,
@@ -1071,44 +949,33 @@ fn build_cascade_steps_inner(
     now: Instant,
 ) -> Vec<CascadeStep> {
     let loopback = is_loopback_origin(primary);
-    let mut steps: Vec<CascadeStep> = Vec::with_capacity(12);
+    let loopback_origin = loopback.then(|| primary.trim_end_matches('/').to_owned());
+    let mut steps: Vec<CascadeStep> = Vec::with_capacity(14);
 
     if loopback && ext_args.player_client.is_empty() && !append_fallbacks {
-        // Keep default loopback unit-test cascade identical (anonymous mobile clients against loopback).
-        let push_loopback = |steps: &mut Vec<CascadeStep>, key: &str, origin: &str| {
-            if let Some(spec) = lookup_client(key) {
+        for key in ["visionos", "android", "android_vr", "ios"] {
+            if let Some(spec) = lookup_ytjs_client(key) {
                 steps.push(CascadeStep {
                     spec,
-                    origin: origin.to_owned(),
+                    loopback_origin: loopback_origin.clone(),
                     send_auth: false,
                     is_explicit: false,
                 });
             }
-        };
-        push_loopback(&mut steps, "visionos", primary);
-        if let Some(sec) = secondary {
-            push_loopback(&mut steps, "visionos", sec);
         }
-        push_loopback(&mut steps, "android", primary);
-        if let Some(sec) = secondary {
-            push_loopback(&mut steps, "android", sec);
-        }
-        push_loopback(&mut steps, "android_vr", primary);
-        push_loopback(&mut steps, "ios", primary);
         return steps;
     }
 
     let explicit_requested = !ext_args.player_client.is_empty();
-    let mut chosen: Vec<(&'static InnerTubeClientSpec, bool)> =
-        resolve_requested_clients(&ext_args.player_client, has_cookie)
+    let mut chosen: Vec<(&'static YtJsClientSpec, bool)> =
+        resolve_requested_ytjs_clients(&ext_args.player_client, has_cookie)
             .into_iter()
             .map(|spec| (spec, explicit_requested))
             .collect();
 
     if explicit_requested && append_fallbacks {
-        // Resilient fallback if all explicitly requested client(s) fail on live YouTube.
         for &fallback_key in RESILIENT_FALLBACK_CLIENTS {
-            if let Some(spec) = lookup_client(fallback_key)
+            if let Some(spec) = lookup_ytjs_client(fallback_key)
                 && !chosen.iter().any(|(c, _)| c.key == spec.key)
             {
                 chosen.push((spec, false));
@@ -1121,21 +988,28 @@ fn build_cascade_steps_inner(
     }
 
     for (spec, is_explicit) in chosen {
-        let origin = if loopback || (spec.key == "web_music" && primary == DEFAULT_INNERTUBE_ORIGIN)
-        {
-            primary.to_owned()
-        } else if spec.host == "www.youtube.com" {
-            secondary.unwrap_or(WEB_YOUTUBE_ORIGIN).to_owned()
-        } else {
-            spec.default_origin()
-        };
         let send_auth = spec.supports_cookies && has_cookie;
         steps.push(CascadeStep {
             spec,
-            origin,
+            loopback_origin: loopback_origin.clone(),
             send_auth,
             is_explicit,
         });
+    }
+
+    if has_cookie && !loopback {
+        for anon_key in ["web_music", "tv"] {
+            if let Some(spec) = lookup_ytjs_client(anon_key)
+                && !steps.iter().any(|s| s.spec.key == spec.key && !s.send_auth)
+            {
+                steps.push(CascadeStep {
+                    spec,
+                    loopback_origin: None,
+                    send_auth: false,
+                    is_explicit: false,
+                });
+            }
+        }
     }
 
     steps
@@ -1173,7 +1047,7 @@ fn sanitize_url_for_log(raw: &str) -> String {
 }
 
 /// Synchronous helper for `PluginSource::stream` rescue fallback, resolving a YouTube
-/// stream via the official 2026 InnerTube + `yt-dlp-ejs` cascade with preflight enabled.
+/// stream via embedded `YouTube.js` (`youtubei.js@18.3.0`) + `yt-dlp/ejs` (`0.8.0`) with preflight.
 pub(crate) fn resolve_youtube_stream_blocking(
     http_client: reqwest::Client,
     video_id: &str,
@@ -1197,8 +1071,8 @@ pub(crate) fn resolve_youtube_stream_blocking(
     ))
 }
 
-/// Runs the pure-Rust InnerTube `/youtubei/v1/player` cascade with stream-URL preflight
-/// enabled automatically for non-loopback origins.
+/// Runs the `YouTube.js` + `yt-dlp/ejs` stream extraction cascade with preflight enabled
+/// automatically for non-loopback origins.
 pub async fn resolve_innertube_stream(
     client: &reqwest::Client,
     base_origin: &str,
@@ -1219,14 +1093,7 @@ pub async fn resolve_innertube_stream(
     .await
 }
 
-/// Runs the pure-Rust InnerTube `/youtubei/v1/player` cascade with explicit stream-URL
-/// preflight control:
-/// - When `cookie` is non-empty on a non-loopback origin, tries authenticated official 2026
-///   web clients (`WEB_REMIX`, `WEB_SAFARI`, `WEB_CREATOR`, `WEB`) with `tv-player-ias.js`
-///   `signatureTimestamp` and in-process `yt-dlp-ejs` 0.8.0 challenge solving (`signatureCipher`,
-///   `n`, and HLS variant `/n/`), then falls back to anonymous mobile clients (`VISIONOS`,
-///   `ANDROID`, `ANDROID_VR`, `IOS`) without sending browser cookies/SAPISIDHASH to mobile clients.
-/// - When `cookie` is absent or `base_origin` is loopback, runs the clean anonymous mobile cascade.
+/// Runs the `YouTube.js` + `yt-dlp/ejs` stream extraction cascade with explicit preflight control.
 pub async fn resolve_innertube_stream_with_options(
     client: &reqwest::Client,
     base_origin: &str,
@@ -1250,7 +1117,8 @@ pub async fn resolve_innertube_stream_with_options(
 }
 
 /// Same as [`resolve_innertube_stream_with_options`] with an optional disk `cache_dir`
-/// for persisting preprocessed player JS (`<cache_dir>/yt-ejs-player.json`).
+/// for persisting `YouTube.js` session/player caches (`<cache_dir>/youtubejs_cache/`)
+/// and `yt-dlp/ejs` preprocessed player caches (`<cache_dir>/yt-ejs-player.json`).
 #[allow(clippy::too_many_arguments)]
 pub async fn resolve_innertube_stream_with_cache(
     client: &reqwest::Client,
@@ -1290,11 +1158,9 @@ async fn resolve_innertube_stream_with_extractor_args(
     cache_dir: Option<&Path>,
 ) -> Result<ResolvedAudioStream, String> {
     let primary = base_origin.trim_end_matches('/');
-    let secondary = (primary == DEFAULT_INNERTUBE_ORIGIN).then_some(WEB_YOUTUBE_ORIGIN);
     resolve_innertube_stream_inner(
         client,
         primary,
-        secondary,
         video_id,
         cookie,
         format_expr,
@@ -1311,7 +1177,6 @@ async fn resolve_innertube_stream_with_extractor_args(
 async fn resolve_innertube_stream_inner(
     client: &reqwest::Client,
     primary_origin: &str,
-    secondary_origin: Option<&str>,
     video_id: &str,
     cookie: Option<&str>,
     format_expr: Option<&str>,
@@ -1322,10 +1187,9 @@ async fn resolve_innertube_stream_inner(
     cache_dir: Option<&Path>,
 ) -> Result<ResolvedAudioStream, String> {
     let primary = primary_origin.trim_end_matches('/');
-    let secondary = secondary_origin.map(|s| s.trim_end_matches('/'));
     let trimmed_cookie = cookie.map(str::trim).filter(|s| !s.is_empty());
     let has_cookie = trimmed_cookie.is_some();
-    let steps = build_cascade_steps(primary, secondary, has_cookie, ext_args);
+    let steps = build_cascade_steps(primary, has_cookie, ext_args);
     let track_health = !is_loopback_origin(primary);
     resolve_innertube_stream_with_steps(
         client,
@@ -1389,12 +1253,12 @@ async fn resolve_innertube_stream_with_steps(
 ) -> Result<ResolvedAudioStream, String> {
     let has_cookie = trimmed_cookie.is_some();
     let selector = FormatSelector::parse(format_expr.unwrap_or(""));
-    let hl = ext_args.lang.as_deref().unwrap_or("en");
-    let gl = "US";
 
     let deadline = Instant::now() + total_budget;
-    let mut visitor_by_origin: HashMap<String, String> = HashMap::new();
-    let mut detected_geo: Option<String> = None;
+    let mut detected_geo: Option<String> = ext_args
+        .visitor_data
+        .as_deref()
+        .and_then(decode_visitor_data_geo);
     let mut tv_bundle: Option<yt_ejs::TvPlayerBundle> = None;
     let mut tv_bundle_failed = false;
 
@@ -1403,7 +1267,6 @@ async fn resolve_innertube_stream_with_steps(
 
     for step in steps {
         let spec = step.spec;
-        let step_origin = step.origin.as_str();
         let Some(rem) = deadline
             .checked_duration_since(Instant::now())
             .filter(|d| !d.is_zero())
@@ -1417,202 +1280,39 @@ async fn resolve_innertube_stream_with_steps(
             break;
         };
 
-        let origin_label = sanitize_url_for_log(step_origin);
         let client_tag = if step.send_auth {
-            format!("{}(auth@{origin_label})", spec.key)
+            format!("{}(auth/{})", spec.key, spec.ytjs_client)
         } else {
-            format!("{}(anon@{origin_label})", spec.key)
+            format!("{}(anon/{})", spec.key, spec.ytjs_client)
         };
 
-        // Ensure player JS bundle (with `sts`) is loaded for non-jsless clients on real YouTube.
-        if !spec.jsless
-            && !is_loopback_origin(step_origin)
-            && tv_bundle.is_none()
-            && !tv_bundle_failed
-        {
-            match yt_ejs::fetch_or_cached_tv_player_with_options(
-                client,
-                cache_dir,
-                rem.min(Duration::from_secs(15)),
-                ext_args.player_js_variant.as_deref(),
-                ext_args.player_js_version.as_deref(),
-                Some(video_id),
-            )
-            .await
-            {
-                Ok(bundle) => {
-                    tv_bundle = Some(bundle);
-                }
-                Err(e) => {
-                    log::warn!(
-                        target: "nsh_music_plugin",
-                        "virtual yt-dlp video={video_id} failed to fetch player JS: {e}"
-                    );
-                    tv_bundle_failed = true;
-                }
-            }
-        }
-
-        let Some(rem_visitor) = deadline
-            .checked_duration_since(Instant::now())
-            .filter(|d| !d.is_zero())
-        else {
-            log::warn!(
-                target: "nsh_music_plugin",
-                "virtual yt-dlp video={video_id} exceeded cascade budget ({:?})",
-                total_budget
-            );
-            errors.push(format!("cascade budget ({:?}) exceeded", total_budget));
-            break;
+        let player_pot = ext_args
+            .find_po_token(spec.key, PoTokenContext::Player)
+            .map(str::to_owned);
+        let extract_req = YtJsExtractRequest {
+            video_id: video_id.to_owned(),
+            ytjs_client: spec.ytjs_client.to_owned(),
+            cookie: step
+                .send_auth
+                .then_some(trimmed_cookie)
+                .flatten()
+                .map(str::to_owned),
+            lang: ext_args.lang.clone(),
+            visitor_data: ext_args.visitor_data.clone(),
+            po_token: player_pot,
+            user_agent_override: spec.user_agent_override.map(str::to_owned),
+            skip_hls: ext_args.skip_hls,
+            loopback_origin: step.loopback_origin.clone(),
+            cache_dir: cache_dir.map(Path::to_path_buf),
+            timeout: rem.min(PLAYER_HTTP_TIMEOUT),
         };
 
-        let visitor = if let Some(ref explicit_vd) = ext_args.visitor_data {
-            if detected_geo.is_none()
-                && let Some(cc) = decode_visitor_data_geo(explicit_vd)
-            {
-                detected_geo = Some(cc);
-            }
-            explicit_vd.clone()
-        } else if let Some(cached) = visitor_by_origin.get(step_origin) {
-            cached.clone()
-        } else {
-            let fetched = fetch_or_cached_visitor_data(
-                client,
-                step_origin,
-                rem_visitor.min(VISITOR_HTTP_TIMEOUT),
-            )
-            .await;
-            let geo_opt = decode_visitor_data_geo(&fetched);
-            log::info!(
-                target: "nsh_music_plugin",
-                "virtual yt-dlp video={video_id} origin={origin_label} visitor_len={} geo={}",
-                fetched.len(),
-                geo_opt.as_deref().unwrap_or("unknown"),
-            );
-            if detected_geo.is_none()
-                && let Some(cc) = geo_opt
-            {
-                detected_geo = Some(cc);
-            }
-            visitor_by_origin.insert(step_origin.to_owned(), fetched.clone());
-            fetched
-        };
-        let geo_label = detected_geo.as_deref().unwrap_or("unknown");
-
-        let Some(rem_after_visitor) = deadline
-            .checked_duration_since(Instant::now())
-            .filter(|d| !d.is_zero())
-        else {
-            log::warn!(
-                target: "nsh_music_plugin",
-                "virtual yt-dlp video={video_id} exceeded cascade budget ({:?})",
-                total_budget
-            );
-            errors.push(format!("cascade budget ({:?}) exceeded", total_budget));
-            break;
-        };
-        let req_timeout = rem_after_visitor.min(PLAYER_HTTP_TIMEOUT);
-
-        let player_url = format!("{step_origin}/youtubei/v1/player?prettyPrint=false");
-        let ctx_val = spec.build_context(&visitor, hl, gl);
-        let mut body = json!({
-            "context": ctx_val,
-            "videoId": video_id,
-            "contentCheckOk": true,
-            "racyCheckOk": true
-        });
-        if !spec.jsless
-            && let Some(ref bundle) = tv_bundle
-            && let Some(obj) = body.as_object_mut()
-        {
-            obj.insert(
-                "playbackContext".to_owned(),
-                json!({
-                    "contentPlaybackContext": {
-                        "signatureTimestamp": bundle.sts
-                    }
-                }),
-            );
-        }
-        if let Some(player_pot) = ext_args.find_po_token(spec.key, PoTokenContext::Player)
-            && let Some(obj) = body.as_object_mut()
-        {
-            obj.insert(
-                "serviceIntegrityDimensions".to_owned(),
-                json!({ "poToken": player_pot }),
-            );
-        }
-
-        let auth_header = if step.send_auth
-            && let Some(c) = trimmed_cookie
-        {
-            let now_secs = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            compute_youtube_auth_header(c, step_origin, now_secs)
-        } else {
-            None
-        };
-
-        let build_player_req = |timeout: Duration| {
-            let mut req = client
-                .post(&player_url)
-                .header("content-type", "application/json")
-                .header("user-agent", spec.user_agent)
-                .header("origin", step_origin)
-                .header("x-origin", step_origin)
-                .header("x-youtube-client-name", spec.client_id)
-                .header("x-youtube-client-version", spec.client_version)
-                .json(&body)
-                .timeout(timeout);
-            if !visitor.is_empty() {
-                req = req.header("x-goog-visitor-id", &visitor);
-            }
-            if step.send_auth
-                && let Some(c) = trimmed_cookie
-            {
-                req = req.header("cookie", c);
-                req = req.header("x-youtube-bootstrap-logged-in", "true");
-                if let Some(ref auth) = auth_header {
-                    req = req.header("authorization", auth.as_str());
-                    req = req.header("x-goog-authuser", "0");
-                }
-            }
-            req
-        };
-
-        let mut send_res =
-            tokio::time::timeout(req_timeout, build_player_req(req_timeout).send()).await;
-        if let Ok(Err(ref e)) = send_res
-            && !e.is_timeout()
-            && (e.is_connect() || e.is_request() || e.is_body())
-            && deadline
-                .checked_duration_since(Instant::now())
-                .is_some_and(|r| r >= Duration::from_secs(2))
-        {
-            log::warn!(
-                target: "nsh_music_plugin",
-                "virtual yt-dlp video={video_id} client={client_tag} transient transport error ({e}); retrying once after 150ms"
-            );
-            tokio::time::sleep(Duration::from_millis(150)).await;
-            if let Some(retry_rem) = deadline
-                .checked_duration_since(Instant::now())
-                .filter(|d| !d.is_zero())
-            {
-                let retry_timeout = retry_rem.min(PLAYER_HTTP_TIMEOUT);
-                send_res =
-                    tokio::time::timeout(retry_timeout, build_player_req(retry_timeout).send())
-                        .await;
-            }
-        }
-
-        let resp = match send_res {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
+        let resp = match extract_via_youtubejs(client, extract_req).await {
+            Ok(r) => r,
+            Err(e) => {
                 log::warn!(
                     target: "nsh_music_plugin",
-                    "virtual yt-dlp video={video_id} client={client_tag} request error: {e}"
+                    "virtual yt-dlp video={video_id} client={client_tag} YouTube.js error: {e}"
                 );
                 errors.push(format!("{client_tag}: {e}"));
                 if track_health {
@@ -1620,128 +1320,69 @@ async fn resolve_innertube_stream_with_steps(
                 }
                 continue;
             }
-            Err(_) => {
-                log::warn!(
-                    target: "nsh_music_plugin",
-                    "virtual yt-dlp video={video_id} client={client_tag} request timed out after {:?}",
-                    req_timeout
-                );
-                errors.push(format!("{client_tag}: request timed out"));
-                if track_health {
-                    record_client_health_failure(has_cookie, spec.key);
-                }
-                continue;
-            }
         };
-        if !resp.status().is_success() {
-            let status = resp.status();
+
+        if detected_geo.is_none()
+            && let Some(cc) = decode_visitor_data_geo(&resp.visitor_data)
+        {
+            detected_geo = Some(cc);
+        }
+        let geo_label = detected_geo.as_deref().unwrap_or("unknown");
+
+        if !resp.ok {
+            let reason = if !resp.playability_reason.is_empty() {
+                resp.playability_reason.clone()
+            } else if let Some(ref e) = resp.error {
+                e.clone()
+            } else if !resp.playability_status.is_empty() {
+                format!("video {}", resp.playability_status)
+            } else {
+                "extraction failed".to_owned()
+            };
             log::warn!(
                 target: "nsh_music_plugin",
-                "virtual yt-dlp video={video_id} client={client_tag} player HTTP {status}"
+                "virtual yt-dlp video={video_id} client={client_tag} geo={geo_label} playability={}: {reason}",
+                if resp.playability_status.is_empty() {
+                    "ERR"
+                } else {
+                    &resp.playability_status
+                }
             );
-            errors.push(format!("{client_tag}: HTTP {status}"));
+            if !resp.playability_status.is_empty() {
+                last_playability_reason = Some(reason.clone());
+            }
+            errors.push(format!("{client_tag}: {reason}"));
             if track_health {
                 record_client_health_failure(has_cookie, spec.key);
             }
             continue;
         }
-        let json_timeout = deadline
-            .checked_duration_since(Instant::now())
-            .unwrap_or_default()
-            .min(PLAYER_HTTP_TIMEOUT);
-        let payload: Value = match tokio::time::timeout(json_timeout, resp.json()).await {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => {
-                log::warn!(
-                    target: "nsh_music_plugin",
-                    "virtual yt-dlp video={video_id} client={client_tag} invalid JSON: {e}"
-                );
-                errors.push(format!("{client_tag}: invalid JSON ({e})"));
-                if track_health {
-                    record_client_health_failure(has_cookie, spec.key);
-                }
-                continue;
-            }
-            Err(_) => {
-                log::warn!(
-                    target: "nsh_music_plugin",
-                    "virtual yt-dlp video={video_id} client={client_tag} body timed out"
-                );
-                errors.push(format!("{client_tag}: body timed out"));
-                if track_health {
-                    record_client_health_failure(has_cookie, spec.key);
-                }
-                continue;
-            }
-        };
 
-        let extracted = match extract_raw_player_candidates(
-            &payload,
-            video_id,
-            spec.user_agent,
-            ext_args.skip_hls,
-        ) {
-            Ok(e) => e,
-            Err(SelectionError::Playability { status, reason }) => {
-                let msg = if reason.is_empty() {
-                    format!("video {status}")
-                } else {
-                    reason
-                };
-                log::warn!(
-                    target: "nsh_music_plugin",
-                    "virtual yt-dlp video={video_id} client={client_tag} geo={geo_label} playability={status}: {msg}"
-                );
-                last_playability_reason = Some(msg.clone());
-                errors.push(format!("{client_tag}: {msg}"));
-                if track_health {
-                    record_client_health_failure(has_cookie, spec.key);
-                }
-                continue;
-            }
-            Err(SelectionError::NoFormat(why)) => {
-                log::warn!(
-                    target: "nsh_music_plugin",
-                    "virtual yt-dlp video={video_id} client={client_tag} no audio candidates: {why}"
-                );
-                errors.push(format!("{client_tag}: {why}"));
-                if track_health {
-                    record_client_health_failure(has_cookie, spec.key);
-                }
-                continue;
-            }
-        };
+        let (video_meta, mut all_candidates) = candidates_from_youtubejs(video_id, &resp);
 
-        // Expand `hlsManifestUrl` master playlist into individual variant `AudioCandidate` entries
-        // BEFORE running `FormatSelector`, so selectors like `bestaudio[protocol^=m3u8]/93/94/92/95/91`
-        // operate directly on real HLS variants (with format_id `93`, `94`, `234`, etc.).
-        let mut all_candidates = extracted.candidates;
-        if let Some(ref hls_url) = extracted.hls_manifest_url
+        if let Some(ref hls_url) = resp.hls_manifest_url
             && !ext_args.skip_hls
         {
             let mut expanded = Vec::new();
-            if (!spec.jsless || verify_stream_url)
+            if (step.loopback_origin.is_none() || verify_stream_url)
                 && let Some(hls_rem) = deadline
                     .checked_duration_since(Instant::now())
                     .filter(|d| !d.is_zero())
             {
                 let hls_timeout = hls_rem.min(PREFLIGHT_HTTP_TIMEOUT);
                 if let Ok(text) =
-                    fetch_text_prefix(client, hls_url, spec.user_agent, hls_timeout, 256 * 1024)
+                    fetch_text_prefix(client, hls_url, &resp.user_agent, hls_timeout, 256 * 1024)
                         .await
                 {
-                    expanded = expand_hls_master_variants(
-                        hls_url,
-                        &text,
-                        &extracted.video_meta,
-                        spec.user_agent,
-                    );
+                    expanded =
+                        expand_hls_master_variants(hls_url, &text, &video_meta, &resp.user_agent);
                 }
             }
             if !expanded.is_empty() {
                 all_candidates.extend(expanded);
             } else {
-                // Already a media playlist (or unexpanded fallback): expose as a single HLS audio candidate.
+                let needs_ejs = extract_path_n_param(hls_url).is_some()
+                    || extract_query_n_param(hls_url).is_some();
                 all_candidates.push(AudioCandidate {
                     stream: build_hls_stream(
                         hls_url,
@@ -1750,8 +1391,8 @@ async fn resolve_innertube_stream_with_steps(
                         "none",
                         None,
                         None,
-                        &extracted.video_meta,
-                        spec.user_agent,
+                        &video_meta,
+                        &resp.user_agent,
                     ),
                     meta: CandidateFormatMeta {
                         format_id: "hls".to_owned(),
@@ -1772,6 +1413,7 @@ async fn resolve_innertube_stream_with_steps(
                     },
                     cipher_s: None,
                     cipher_sp: "signature".to_owned(),
+                    deciphered_by_ytjs: !needs_ejs,
                 });
             }
         }
@@ -1832,9 +1474,10 @@ async fn resolve_innertube_stream_with_steps(
             })
             .collect();
 
-        // Batch-solve all unique `s` (signatureCipher/cipher) and `n` challenges across selected candidates.
         let (sig_challenges, n_challenges) = collect_unique_challenges(&raw_selected);
-        let solved = if !sig_challenges.is_empty() || !n_challenges.is_empty() {
+        let solved = if (!sig_challenges.is_empty() || !n_challenges.is_empty())
+            && step.loopback_origin.is_none()
+        {
             if tv_bundle.is_none() && !tv_bundle_failed {
                 let fetch_rem = deadline
                     .checked_duration_since(Instant::now())
@@ -1846,7 +1489,10 @@ async fn resolve_innertube_stream_with_steps(
                         cache_dir,
                         fetch_rem,
                         ext_args.player_js_variant.as_deref(),
-                        ext_args.player_js_version.as_deref(),
+                        ext_args
+                            .player_js_version
+                            .as_deref()
+                            .or(resp.player_id.as_deref()),
                         Some(video_id),
                     )
                     .await
@@ -1855,7 +1501,7 @@ async fn resolve_innertube_stream_with_steps(
                         Err(e) => {
                             log::warn!(
                                 target: "nsh_music_plugin",
-                                "virtual yt-dlp video={video_id} failed to fetch player JS: {e}"
+                                "virtual yt-dlp video={video_id} yt-ejs failed to fetch player JS: {e}"
                             );
                             tv_bundle_failed = true;
                         }
@@ -2299,60 +1945,6 @@ async fn verify_candidate_stream_url_with_ejs(
     Ok(())
 }
 
-enum SelectionError {
-    Playability { status: String, reason: String },
-    NoFormat(String),
-}
-
-fn extract_yt_text(val: &Value) -> Option<String> {
-    if let Some(s) = val.get("simpleText").and_then(|v| v.as_str()) {
-        let trimmed = s.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_owned());
-        }
-    }
-    if let Some(runs) = val.get("runs").and_then(|v| v.as_array()) {
-        let joined: String = runs
-            .iter()
-            .filter_map(|r| r.get("text").and_then(|t| t.as_str()))
-            .collect();
-        let trimmed = joined.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_owned());
-        }
-    }
-    if let Some(s) = val.as_str() {
-        let trimmed = s.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_owned());
-        }
-    }
-    None
-}
-
-fn extract_playability_reason(payload: &Value) -> String {
-    let mut reason = payload
-        .pointer("/playabilityStatus/reason")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .trim()
-        .to_owned();
-    if let Some(sub) = payload
-        .pointer("/playabilityStatus/errorScreen/playerErrorMessageRenderer/subreason")
-        .and_then(extract_yt_text)
-    {
-        if reason.is_empty() {
-            reason = sub;
-        } else if !reason
-            .to_ascii_lowercase()
-            .contains(&sub.to_ascii_lowercase())
-        {
-            reason = format!("{reason} ({sub})");
-        }
-    }
-    reason
-}
-
 #[derive(Debug, Clone)]
 struct VideoMeta {
     video_id: String,
@@ -2369,12 +1961,7 @@ struct AudioCandidate {
     meta: CandidateFormatMeta,
     cipher_s: Option<String>,
     cipher_sp: String,
-}
-
-struct ExtractedPlayerFormats {
-    video_meta: VideoMeta,
-    candidates: Vec<AudioCandidate>,
-    hls_manifest_url: Option<String>,
+    deciphered_by_ytjs: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2384,23 +1971,10 @@ struct ParsedFormatUrl {
     sp: String,
 }
 
-fn parse_format_url(fmt: &Value) -> Option<ParsedFormatUrl> {
-    if let Some(url) = fmt
-        .get("url")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-    {
-        return Some(ParsedFormatUrl {
-            base_url: url.to_owned(),
-            s: None,
-            sp: "signature".to_owned(),
-        });
+fn parse_cipher_query(sc: &str) -> Option<ParsedFormatUrl> {
+    if sc.is_empty() {
+        return None;
     }
-    let sc = fmt
-        .get("signatureCipher")
-        .or_else(|| fmt.get("cipher"))
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())?;
     let mut base_url: Option<String> = None;
     let mut s_val: Option<String> = None;
     let mut sp_val = "signature".to_owned();
@@ -2418,6 +1992,27 @@ fn parse_format_url(fmt: &Value) -> Option<ParsedFormatUrl> {
         s: s_val,
         sp: sp_val,
     })
+}
+
+#[cfg(test)]
+fn parse_format_url(fmt: &Value) -> Option<ParsedFormatUrl> {
+    if let Some(url) = fmt
+        .get("url")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        return Some(ParsedFormatUrl {
+            base_url: url.to_owned(),
+            s: None,
+            sp: "signature".to_owned(),
+        });
+    }
+    let sc = fmt
+        .get("signatureCipher")
+        .or_else(|| fmt.get("cipher"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?;
+    parse_cipher_query(sc)
 }
 
 fn percent_encode_component(val: &str) -> String {
@@ -2539,6 +2134,9 @@ fn collect_unique_challenges(candidates: &[AudioCandidate]) -> (Vec<String>, Vec
     let mut n_list = Vec::new();
 
     for cand in candidates {
+        if cand.deciphered_by_ytjs {
+            continue;
+        }
         if let Some(ref s) = cand.cipher_s
             && sig_seen.insert(s.clone())
         {
@@ -2569,13 +2167,18 @@ fn finalize_solved_candidates(
 
     let mut out = Vec::with_capacity(raw_candidates.len());
     for mut cand in raw_candidates {
-        if let Some(mut final_url) = apply_solved_sig_and_n(
-            &cand.stream.url,
-            cand.cipher_s.as_deref(),
-            &cand.cipher_sp,
-            sigs,
-            ns,
-        ) {
+        let maybe_url = if cand.deciphered_by_ytjs {
+            Some(cand.stream.url.clone())
+        } else {
+            apply_solved_sig_and_n(
+                &cand.stream.url,
+                cand.cipher_s.as_deref(),
+                &cand.cipher_sp,
+                sigs,
+                ns,
+            )
+        };
+        if let Some(mut final_url) = maybe_url {
             if let Some(pot) = gvs_po_token {
                 final_url = replace_query_param_preserve_order(&final_url, "pot", pot);
             }
@@ -2858,6 +2461,8 @@ fn expand_hls_master_variants(
                 .unwrap_or_default()
                 .to_ascii_lowercase();
             let is_drc = name_lower.contains("drc");
+            let needs_ejs = extract_path_n_param(&resolved).is_some()
+                || extract_query_n_param(&resolved).is_some();
             let stream = build_hls_stream(
                 &resolved, &format_id, &acodec, "none", abr, abr, meta, user_agent,
             );
@@ -2882,6 +2487,7 @@ fn expand_hls_master_variants(
                 stream,
                 cipher_s: None,
                 cipher_sp: "signature".to_owned(),
+                deciphered_by_ytjs: !needs_ejs,
             });
         }
     }
@@ -2924,6 +2530,8 @@ fn expand_hls_master_variants(
                                 _ => tbr,
                             }
                         };
+                        let needs_ejs = extract_path_n_param(&resolved).is_some()
+                            || extract_query_n_param(&resolved).is_some();
                         let stream = build_hls_stream(
                             &resolved, &format_id, &acodec, &vcodec, abr, tbr, meta, user_agent,
                         );
@@ -2948,6 +2556,7 @@ fn expand_hls_master_variants(
                             stream,
                             cipher_s: None,
                             cipher_sp: "signature".to_owned(),
+                            deciphered_by_ytjs: !needs_ejs,
                         });
                     }
                 }
@@ -3028,156 +2637,80 @@ fn infer_direct_ext_and_codecs(mime_lower: &str, is_muxed: bool) -> (String, Str
     (ext.to_owned(), acodec, vcodec)
 }
 
-fn extract_raw_player_candidates(
-    payload: &Value,
+fn candidates_from_youtubejs(
     video_id: &str,
-    user_agent: &str,
-    skip_hls: bool,
-) -> Result<ExtractedPlayerFormats, SelectionError> {
-    let status = payload
-        .pointer("/playabilityStatus/status")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    if status != "OK" {
-        let reason = extract_playability_reason(payload);
-        return Err(SelectionError::Playability {
-            status: status.to_owned(),
-            reason,
-        });
-    }
-
-    let title = payload
-        .pointer("/videoDetails/title")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_owned();
-    let duration_secs = payload
-        .pointer("/videoDetails/lengthSeconds")
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.parse::<u64>().ok());
-    let uploader = payload
-        .pointer("/videoDetails/author")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_owned();
-    let channel_id = payload
-        .pointer("/videoDetails/channelId")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_owned();
-    let thumbnail = payload
-        .pointer("/videoDetails/thumbnail/thumbnails")
-        .and_then(|v| v.as_array())
-        .and_then(|arr| arr.last())
-        .and_then(|t| t.get("url"))
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_owned();
-
+    resp: &YtJsExtractResponse,
+) -> (VideoMeta, Vec<AudioCandidate>) {
     let video_meta = VideoMeta {
         video_id: video_id.to_owned(),
-        title,
-        duration_secs,
-        uploader,
-        channel_id,
-        thumbnail,
+        title: resp.title.clone(),
+        duration_secs: resp.duration_secs,
+        uploader: resp.uploader.clone(),
+        channel_id: resp.channel_id.clone(),
+        thumbnail: resp.thumbnail.clone(),
     };
-
-    let mut raw_entries: Vec<(&Value, bool)> = Vec::new();
-    if let Some(arr) = payload
-        .pointer("/streamingData/adaptiveFormats")
-        .and_then(|v| v.as_array())
-    {
-        raw_entries.extend(arr.iter().map(|v| (v, false)));
-    }
-    if let Some(arr) = payload
-        .pointer("/streamingData/formats")
-        .and_then(|v| v.as_array())
-    {
-        raw_entries.extend(arr.iter().map(|v| (v, true)));
-    }
 
     let mut candidates = Vec::new();
     let mut seen_urls = HashSet::new();
 
-    for (fmt, from_muxed_list) in raw_entries {
-        let Some(parsed_url) = parse_format_url(fmt) else {
-            continue;
-        };
-        let mime = fmt
-            .get("mimeType")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        let mime_lower = mime.to_ascii_lowercase();
-        let is_audio_mime = mime_lower.starts_with("audio/");
-        let has_audio_meta = is_audio_mime
-            || from_muxed_list
-            || fmt.get("audioQuality").is_some()
-            || fmt.get("audioChannels").is_some();
-        if !has_audio_meta {
+    for fmt in &resp.formats {
+        if !fmt.has_audio {
             continue;
         }
-        let is_muxed = !is_audio_mime;
+        let (base_url, cipher_s, cipher_sp, deciphered_by_ytjs) = if fmt.deciphered_by_ytjs
+            && let Some(ref u) = fmt.url
+            && !u.is_empty()
+        {
+            (u.clone(), None, "signature".to_owned(), true)
+        } else if let Some(parsed) = fmt
+            .signature_cipher
+            .as_deref()
+            .or(fmt.cipher.as_deref())
+            .and_then(parse_cipher_query)
+        {
+            (parsed.base_url, parsed.s, parsed.sp, false)
+        } else if let Some(u) = fmt
+            .url
+            .as_deref()
+            .or(fmt.raw_url.as_deref())
+            .filter(|s| !s.is_empty())
+        {
+            (
+                u.to_owned(),
+                None,
+                "signature".to_owned(),
+                fmt.deciphered_by_ytjs,
+            )
+        } else {
+            continue;
+        };
+
+        let mime_lower = fmt.mime_type.to_ascii_lowercase();
+        let is_muxed = fmt.is_muxed || !mime_lower.starts_with("audio/");
         let (ext, acodec, vcodec) = infer_direct_ext_and_codecs(&mime_lower, is_muxed);
         if acodec == "none" {
             continue;
         }
 
-        if !seen_urls.insert(parsed_url.base_url.clone()) {
+        if !seen_urls.insert(base_url.clone()) {
             continue;
         }
 
-        let is_drc = fmt.get("isDrc").and_then(|v| v.as_bool()) == Some(true);
-        let (is_default_audio_track, is_original_audio_track) =
-            if let Some(track) = fmt.get("audioTrack") {
-                let is_def = track
-                    .get("audioIsDefault")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
-                let id_str = track.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                let name_lower = track
-                    .get("displayName")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_ascii_lowercase();
-                let is_orig = is_def || id_str.contains(".4") || name_lower.contains("original");
-                (is_def, is_orig)
-            } else {
-                (true, true)
-            };
-
-        let bitrate = fmt
-            .get("averageBitrate")
-            .and_then(|v| v.as_u64())
-            .or_else(|| fmt.get("bitrate").and_then(|v| v.as_u64()))
-            .unwrap_or(0);
+        let bitrate = fmt.average_bitrate.unwrap_or(fmt.bitrate);
         let kbps = (bitrate > 0).then(|| (bitrate as f64) / 1000.0);
         let abr = if is_muxed { None } else { kbps };
         let tbr = kbps;
-        let asr = fmt.get("audioSampleRate").and_then(|v| {
-            v.as_u64()
-                .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
-        });
-        let audio_channels = fmt
-            .get("audioChannels")
-            .and_then(|v| v.as_u64())
-            .and_then(|n| u32::try_from(n).ok());
-        let filesize = fmt.get("contentLength").and_then(|v| {
-            v.as_u64()
-                .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
-        });
-        let itag = fmt.get("itag").and_then(|v| v.as_u64()).unwrap_or(0);
-        let format_id = if is_drc && itag > 0 {
-            format!("{itag}-drc")
+        let format_id = if fmt.is_drc && fmt.itag > 0 {
+            format!("{}-drc", fmt.itag)
         } else {
-            itag.to_string()
+            fmt.itag.to_string()
         };
 
         let stream = ResolvedAudioStream {
             video_id: video_meta.video_id.clone(),
             title: video_meta.title.clone(),
-            url: parsed_url.base_url,
-            mime_type: mime.to_owned(),
+            url: base_url,
+            mime_type: fmt.mime_type.clone(),
             ext: ext.clone(),
             acodec: acodec.clone(),
             vcodec: vcodec.clone(),
@@ -3185,15 +2718,15 @@ fn extract_raw_player_candidates(
             bitrate,
             abr,
             tbr,
-            asr,
-            audio_channels,
-            filesize,
+            asr: fmt.audio_sample_rate,
+            audio_channels: fmt.audio_channels,
+            filesize: fmt.content_length,
             duration_secs: video_meta.duration_secs,
             protocol: "https".to_owned(),
             uploader: video_meta.uploader.clone(),
             channel_id: video_meta.channel_id.clone(),
             thumbnail: video_meta.thumbnail.clone(),
-            user_agent: user_agent.to_owned(),
+            user_agent: resp.user_agent.clone(),
             is_hls: false,
             formats_json: Vec::new(),
         };
@@ -3208,69 +2741,22 @@ fn extract_raw_player_candidates(
                 vcodec,
                 abr,
                 tbr,
-                asr,
-                audio_channels,
-                filesize,
-                is_drc,
-                is_default_audio_track,
-                is_original_audio_track,
+                asr: fmt.audio_sample_rate,
+                audio_channels: fmt.audio_channels,
+                filesize: fmt.content_length,
+                is_drc: fmt.is_drc,
+                is_default_audio_track: fmt.is_default_audio_track,
+                is_original_audio_track: fmt.is_original_audio_track,
                 is_hls: false,
                 is_muxed,
             },
-            cipher_s: parsed_url.s,
-            cipher_sp: parsed_url.sp,
+            cipher_s,
+            cipher_sp,
+            deciphered_by_ytjs,
         });
     }
 
-    let hls_manifest_url = if skip_hls {
-        None
-    } else {
-        payload
-            .pointer("/streamingData/hlsManifestUrl")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-    };
-
-    if candidates.is_empty() && hls_manifest_url.is_none() {
-        return Err(SelectionError::NoFormat(
-            "no audio stream listed in streamingData".to_owned(),
-        ));
-    }
-
-    Ok(ExtractedPlayerFormats {
-        video_meta,
-        candidates,
-        hls_manifest_url,
-    })
-}
-
-#[cfg(test)]
-fn collect_audio_candidates(
-    payload: &Value,
-    video_id: &str,
-    user_agent: &str,
-    format_expr: Option<&str>,
-    prefer_mobile_aac: bool,
-) -> Result<Vec<AudioCandidate>, SelectionError> {
-    let extracted = extract_raw_player_candidates(payload, video_id, user_agent, false)?;
-    let selector = FormatSelector::parse(format_expr.unwrap_or(""));
-    let metas: Vec<CandidateFormatMeta> = extracted
-        .candidates
-        .iter()
-        .map(|c| c.meta.clone())
-        .collect();
-    let indices = selector.select_indices(&metas, prefer_mobile_aac);
-    let ordered: Vec<AudioCandidate> = indices
-        .into_iter()
-        .map(|i| extracted.candidates[i].clone())
-        .collect();
-    if ordered.is_empty() {
-        return Err(SelectionError::NoFormat(
-            "no audio stream matched format selector".to_owned(),
-        ));
-    }
-    Ok(ordered)
+    (video_meta, candidates)
 }
 
 type YtdlpExhaustedTracker = Arc<Mutex<Option<(String, Instant)>>>;
@@ -3554,7 +3040,7 @@ fn format_ytdlp_output(stream: &ResolvedAudioStream, parsed: &YtdlpParsedArgs) -
     // Always advertise the winning InnerTube client's User-Agent so googlevideo.com
     // accepts the stream URL even when the plugin passed a desktop browser UA on stdin.
     let ua = if stream.user_agent.is_empty() {
-        find_header(&parsed.headers, "User-Agent").unwrap_or(WEB_REMIX_UA)
+        find_header(&parsed.headers, "User-Agent").unwrap_or("Mozilla/5.0")
     } else {
         &stream.user_agent
     };
@@ -3648,7 +3134,7 @@ impl VirtualProcessShim for YtdlpVirtualShim {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::yt_clients::{ANDROID_UA, WEB_SAFARI_UA};
+    use crate::yt_youtubejs::SAFARI_WEB_UA;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -3721,7 +3207,7 @@ mod tests {
         assert_eq!(ver_pipe.stdout(), VIRTUAL_YTDLP_VERSION_BANNER);
         assert_eq!(
             ver_pipe.read_line_blocking().as_deref(),
-            Some("2026.03.01 (nsh-virtual-ytdlp)")
+            Some("2026.03.01 (nsh-youtubejs-18.3.0+ejs-0.8.0)")
         );
         assert_eq!(ver_pipe.read_line_blocking(), None);
 
@@ -3939,7 +3425,9 @@ mod tests {
                             continue;
                         }
                         if first_line.starts_with("GET /stream/ok206") {
-                            if req_lower.contains("range: bytes=0-63") && req.contains(ANDROID_UA) {
+                            if req_lower.contains("range: bytes=0-63")
+                                && req.contains("com.google.android.youtube/")
+                            {
                                 saw_range_srv.store(true, Ordering::SeqCst);
                             }
                             let payload = vec![0x41u8; 64];
@@ -4073,7 +3561,11 @@ mod tests {
             ))
             .expect("should fall back from 403 client #1 to 206 client #2");
         assert_eq!(resolved.url, format!("{origin}/stream/ok206"));
-        assert_eq!(resolved.user_agent, ANDROID_UA);
+        assert!(
+            resolved.user_agent.contains("com.google.android.youtube/"),
+            "expected YouTube.js ANDROID UA, got {}",
+            resolved.user_agent
+        );
         assert!(
             saw_range_206.load(Ordering::SeqCst),
             "preflight should send Range: bytes=0-63 with client User-Agent"
@@ -4111,7 +3603,7 @@ mod tests {
                 "VISIONOS:anon",
                 "ANDROID:anon",
                 "ANDROID_VR:anon",
-                "IOS:anon",
+                "iOS:anon",
             ]
         );
 
@@ -4131,7 +3623,7 @@ mod tests {
                 "VISIONOS:anon",
                 "ANDROID:anon",
                 "ANDROID_VR:anon",
-                "IOS:anon",
+                "iOS:anon",
             ]
         );
 
@@ -4140,108 +3632,62 @@ mod tests {
     }
 
     #[test]
-    fn dual_origin_fallback_uses_secondary_origin_without_mobile_auth_and_respects_budget() {
-        // Server 1 acts as primary (`music.youtube.com`): always rejects with UNPLAYABLE.
-        let primary_listener = TcpListener::bind("127.0.0.1:0").expect("bind primary mock");
-        let primary_port = primary_listener.local_addr().unwrap().port();
-        let primary_origin = format!("http://127.0.0.1:{primary_port}");
-        let _ = primary_listener.set_nonblocking(true);
-
-        // Server 2 acts as secondary (`www.youtube.com`): accepts anonymous ANDROID
-        // with matching Origin / X-Origin headers and NO SAPISIDHASH / Cookie headers.
-        let secondary_listener = TcpListener::bind("127.0.0.1:0").expect("bind secondary mock");
-        let secondary_port = secondary_listener.local_addr().unwrap().port();
-        let secondary_origin = format!("http://127.0.0.1:{secondary_port}");
-        let secondary_origin_srv = secondary_origin.clone();
-        let _ = secondary_listener.set_nonblocking(true);
+    fn authenticated_fallback_to_anonymous_mobile_and_respects_budget() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fallback mock");
+        let port = listener.local_addr().unwrap().port();
+        let origin = format!("http://127.0.0.1:{port}");
+        let _ = listener.set_nonblocking(true);
 
         let stop = Arc::new(AtomicBool::new(false));
-        let stop_p = Arc::clone(&stop);
-        let stop_s = Arc::clone(&stop);
-        let saw_secondary_origin_header = Arc::new(AtomicBool::new(false));
-        let saw_sec_hdr_srv = Arc::clone(&saw_secondary_origin_header);
+        let stop_srv = Arc::clone(&stop);
+        let saw_auth_on_web_music = Arc::new(AtomicBool::new(false));
+        let saw_auth_web_srv = Arc::clone(&saw_auth_on_web_music);
         let saw_mobile_auth_header = Arc::new(AtomicBool::new(false));
-        let saw_sec_auth_srv = Arc::clone(&saw_mobile_auth_header);
+        let saw_mob_auth_srv = Arc::clone(&saw_mobile_auth_header);
 
-        let primary_srv = std::thread::spawn(move || {
-            while !stop_p.load(Ordering::Relaxed) {
-                match primary_listener.accept() {
+        let srv = std::thread::spawn(move || {
+            while !stop_srv.load(Ordering::Relaxed) {
+                match listener.accept() {
                     Ok((mut stream, _)) => {
                         let req = read_http_request(&mut stream);
-                        let body = if req.contains("/youtubei/v1/visitor_id") {
-                            r#"{"responseContext":{"visitorData":"VIS_PRIMARY"}}"#.to_owned()
-                        } else if req.contains("SLOW_BUDGET") {
+                        let req_lower = req.to_ascii_lowercase();
+                        let client_name = extract_json_client_name(&req);
+                        let has_auth_or_cookie = req_lower.contains("\r\nauthorization:")
+                            || req_lower.contains("\r\ncookie:");
+
+                        if client_name == "WEB_REMIX" && has_auth_or_cookie {
+                            saw_auth_web_srv.store(true, Ordering::SeqCst);
+                        }
+                        if matches!(
+                            client_name.as_str(),
+                            "ANDROID" | "ANDROID_VR" | "iOS" | "VISIONOS"
+                        ) && has_auth_or_cookie
+                        {
+                            saw_mob_auth_srv.store(true, Ordering::SeqCst);
+                        }
+
+                        let body = if req.contains("SLOW_BUDGET") {
                             std::thread::sleep(Duration::from_millis(250));
                             r#"{"playabilityStatus":{"status":"UNPLAYABLE","reason":"slow"}}"#
                                 .to_owned()
-                        } else {
-                            r#"{"playabilityStatus":{"status":"UNPLAYABLE","reason":"This video is not available"}}"#
-                                .to_owned()
-                        };
-                        let resp = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                            body.len(),
-                            body
-                        );
-                        let _ = stream.write_all(resp.as_bytes());
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-
-        let secondary_srv = std::thread::spawn(move || {
-            while !stop_s.load(Ordering::Relaxed) {
-                match secondary_listener.accept() {
-                    Ok((mut stream, _)) => {
-                        let req = read_http_request(&mut stream);
-
-                        let mut origin_hdr = None;
-                        let mut x_origin_hdr = None;
-                        for line in req.lines() {
-                            if let Some((k, v)) = line.split_once(':') {
-                                if k.eq_ignore_ascii_case("origin") {
-                                    origin_hdr = Some(v.trim().to_owned());
-                                } else if k.eq_ignore_ascii_case("x-origin") {
-                                    x_origin_hdr = Some(v.trim().to_owned());
-                                } else if k.eq_ignore_ascii_case("authorization")
-                                    || k.eq_ignore_ascii_case("cookie")
-                                {
-                                    saw_sec_auth_srv.store(true, Ordering::SeqCst);
-                                }
-                            }
-                        }
-
-                        let body = if req.contains("/youtubei/v1/visitor_id") {
-                            r#"{"responseContext":{"visitorData":"VIS_SECONDARY"}}"#.to_owned()
-                        } else if req.contains("DUAL_ORIGIN_OK")
-                            && req.contains("\"clientName\":\"ANDROID\"")
-                        {
-                            if origin_hdr.as_deref() == Some(secondary_origin_srv.as_str())
-                                && x_origin_hdr.as_deref() == Some(secondary_origin_srv.as_str())
-                            {
-                                saw_sec_hdr_srv.store(true, Ordering::SeqCst);
-                            }
+                        } else if req.contains("AUTH_TO_ANON_OK") && client_name == "ANDROID_VR" {
                             json!({
                                 "playabilityStatus": { "status": "OK" },
-                                "videoDetails": { "title": "Dual Origin Track", "lengthSeconds": "200" },
+                                "videoDetails": { "title": "Anon Fallback Track", "lengthSeconds": "200" },
                                 "streamingData": {
                                     "adaptiveFormats": [
                                         {
                                             "itag": 140,
                                             "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"",
                                             "bitrate": 128000,
-                                            "url": "https://cdn.example.test/www_android140.m4a"
+                                            "url": "https://cdn.example.test/vr_anon140.m4a"
                                         }
                                     ]
                                 }
                             })
                             .to_string()
                         } else {
-                            r#"{"playabilityStatus":{"status":"UNPLAYABLE","reason":"rejected"}}"#
+                            r#"{"playabilityStatus":{"status":"LOGIN_REQUIRED","reason":"Sign in required"}}"#
                                 .to_owned()
                         };
                         let resp = format!(
@@ -4265,41 +3711,41 @@ mod tests {
             .expect("tokio runtime");
         let client = reqwest::Client::new();
 
-        // 1. Primary (`music.youtube.com`) fails -> falls back to secondary (`www.youtube.com`)
-        //    ANDROID(anon) with matching Origin/X-Origin and NO SAPISIDHASH / Cookie headers.
-        let default_ext = YoutubeExtractorArgs::default();
+        // 1. Authenticated `web_music` fails with LOGIN_REQUIRED -> falls back to anonymous
+        //    `android_vr` with ZERO Cookie / Authorization headers leaked.
+        let ext_auth =
+            YoutubeExtractorArgs::parse(&["youtube:player_client=web_music,android_vr".to_owned()]);
         let resolved = rt
             .block_on(resolve_innertube_stream_inner(
                 &client,
-                &primary_origin,
-                Some(&secondary_origin),
-                "DUAL_ORIGIN_OK",
+                &origin,
+                "AUTH_TO_ANON_OK",
                 Some("SAPISID=dual_origin_secret"),
                 None,
-                &default_ext,
+                &ext_auth,
                 true,
                 false,
                 Duration::from_secs(10),
                 None,
             ))
-            .expect("should resolve via secondary origin ANDROID(anon)");
-        assert_eq!(resolved.url, "https://cdn.example.test/www_android140.m4a");
+            .expect("should fall back from auth web_music to anon android_vr");
+        assert_eq!(resolved.url, "https://cdn.example.test/vr_anon140.m4a");
         assert!(
-            saw_secondary_origin_header.load(Ordering::SeqCst),
-            "secondary origin request must carry matching Origin and X-Origin headers"
+            saw_auth_on_web_music.load(Ordering::SeqCst),
+            "cookie-supporting YTMUSIC client should carry auth/cookie headers"
         );
         assert!(
             !saw_mobile_auth_header.load(Ordering::SeqCst),
-            "native mobile InnerTube clients must NOT send SAPISIDHASH or Cookie headers"
+            "native mobile/VR clients must NOT receive Cookie or Authorization headers"
         );
 
         // 2. Cascade enforces total time budget cleanly instead of running every slow step.
+        let default_ext = YoutubeExtractorArgs::default();
         let started = Instant::now();
         let err = rt
             .block_on(resolve_innertube_stream_inner(
                 &client,
-                &primary_origin,
-                None,
+                &origin,
                 "SLOW_BUDGET",
                 Some("SAPISID=dual_origin_secret"),
                 None,
@@ -4317,8 +3763,7 @@ mod tests {
         );
 
         stop.store(true, Ordering::Relaxed);
-        let _ = primary_srv.join();
-        let _ = secondary_srv.join();
+        let _ = srv.join();
     }
 
     fn build_test_visitor_data_for_geo(cc: &str) -> String {
@@ -4375,52 +3820,8 @@ mod tests {
             None
         );
 
-        // 2. Subreason extraction (simpleText, runs[].text, dedup, empty reason).
-        let simple_payload = json!({
-            "playabilityStatus": {
-                "status": "UNPLAYABLE",
-                "reason": "Video unavailable",
-                "errorScreen": {
-                    "playerErrorMessageRenderer": {
-                        "subreason": { "simpleText": "The uploader has not made this video available in your country" }
-                    }
-                }
-            }
-        });
-        match collect_audio_candidates(&simple_payload, "vid1", ANDROID_UA, None, true) {
-            Err(SelectionError::Playability { status, reason }) => {
-                assert_eq!(status, "UNPLAYABLE");
-                assert_eq!(
-                    reason,
-                    "Video unavailable (The uploader has not made this video available in your country)"
-                );
-            }
-            _ => panic!("expected Playability error"),
-        }
-
-        let runs_payload = json!({
-            "playabilityStatus": {
-                "status": "UNPLAYABLE",
-                "errorScreen": {
-                    "playerErrorMessageRenderer": {
-                        "subreason": {
-                            "runs": [
-                                { "text": "Not available " },
-                                { "text": "in your region" }
-                            ]
-                        }
-                    }
-                }
-            }
-        });
-        match collect_audio_candidates(&runs_payload, "vid2", ANDROID_UA, None, true) {
-            Err(SelectionError::Playability { reason, .. }) => {
-                assert_eq!(reason, "Not available in your region");
-            }
-            _ => panic!("expected Playability error"),
-        }
-
-        // 3. End-to-end mock server returning CN visitorData + UNPLAYABLE -> annotates `YouTube geo=CN; switch proxy/VPN region`.
+        // 2. End-to-end mock server returning CN visitorData + UNPLAYABLE (with simpleText & runs
+        //    subreasons) -> YouTube.js surfaces subreason and annotates `YouTube geo=CN; switch proxy/VPN region`.
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind geo mock");
         let port = listener.local_addr().unwrap().port();
         let origin = format!("http://127.0.0.1:{port}");
@@ -4434,10 +3835,27 @@ mod tests {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         let req = read_http_request(&mut stream);
-                        let body = if req.contains("/youtubei/v1/visitor_id") {
-                            json!({ "responseContext": { "visitorData": cn_vd_srv } }).to_string()
+                        let body = if req.contains("RUNSBLOCK01") {
+                            json!({
+                                "responseContext": { "visitorData": cn_vd_srv },
+                                "playabilityStatus": {
+                                    "status": "UNPLAYABLE",
+                                    "errorScreen": {
+                                        "playerErrorMessageRenderer": {
+                                            "subreason": {
+                                                "runs": [
+                                                    { "text": "Not available " },
+                                                    { "text": "in your region" }
+                                                ]
+                                            }
+                                        }
+                                    }
+                                }
+                            })
+                            .to_string()
                         } else {
                             json!({
+                                "responseContext": { "visitorData": cn_vd_srv },
                                 "playabilityStatus": {
                                     "status": "UNPLAYABLE",
                                     "reason": "This video is not available",
@@ -4484,6 +3902,22 @@ mod tests {
         assert_eq!(
             err,
             "This video is not available (Blocked in your region) (YouTube geo=CN; switch proxy/VPN region)"
+        );
+
+        let runs_err = rt
+            .block_on(resolve_innertube_stream_with_options(
+                &client,
+                &origin,
+                "RUNSBLOCK01",
+                None,
+                None,
+                true,
+                false,
+            ))
+            .expect_err("runs subreason must be extracted");
+        assert_eq!(
+            runs_err,
+            "Not available in your region (YouTube geo=CN; switch proxy/VPN region)"
         );
 
         stop.store(true, Ordering::Relaxed);
@@ -4660,7 +4094,7 @@ https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/94/n/hlsN001/ind
             uploader: String::new(),
             channel_id: String::new(),
             thumbnail: String::new(),
-            user_agent: WEB_SAFARI_UA.to_owned(),
+            user_agent: SAFARI_WEB_UA.to_owned(),
             is_hls: true,
             formats_json: Vec::new(),
         };
@@ -4817,7 +4251,7 @@ https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/94/n/n94/index.m
             "https://manifest.googlevideo.com/master.m3u8",
             master,
             &meta,
-            WEB_SAFARI_UA,
+            SAFARI_WEB_UA,
         );
         assert_eq!(expanded.len(), 4);
         let metas: Vec<CandidateFormatMeta> = expanded.iter().map(|c| c.meta.clone()).collect();
@@ -5007,7 +4441,7 @@ https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/94/n/n94/index.m
             resolved_url.contains("pot=GVS_TOK_77"),
             "GVS po_token should be appended to URL: {resolved_url}"
         );
-        assert_eq!(parsed["http_headers"]["User-Agent"], WEB_SAFARI_UA);
+        assert_eq!(parsed["http_headers"]["User-Agent"], SAFARI_WEB_UA);
         assert!(saw_bootstrap_logged_in.load(Ordering::SeqCst));
         assert!(saw_multi_sapisid.load(Ordering::SeqCst));
         assert!(saw_player_pot_and_lang.load(Ordering::SeqCst));
@@ -5044,9 +4478,7 @@ https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/94/n/n94/index.m
                             continue;
                         }
 
-                        let body = if req.contains("/youtubei/v1/visitor_id") {
-                            r#"{"responseContext":{"visitorData":"MOCK_VISITOR_RELAX"}}"#.to_owned()
-                        } else if req.contains(WEB_SAFARI_UA) {
+                        let body = if req.contains(SAFARI_WEB_UA) {
                             // Explicit `web_safari` returns only direct HTTPS itag 140 (no HLS/93).
                             // Because it is explicit, it must NOT relax `bestaudio[protocol^=m3u8]/93/...`.
                             json!({
@@ -5065,7 +4497,7 @@ https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/94/n/n94/index.m
                             })
                             .to_string()
                         } else {
-                            // Fallback client (`tv_samsung`) returns direct HTTPS itag 140.
+                            // Fallback client (`web_music` / `YTMUSIC`) returns direct HTTPS itag 140.
                             // Because `!step.is_explicit`, the m3u8 selector relaxes to `bestaudio/best`.
                             json!({
                                 "playabilityStatus": { "status": "OK" },
@@ -5108,13 +4540,13 @@ https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/94/n/n94/index.m
         let m3u8_selector = Some("bestaudio[protocol^=m3u8]/93/94/92/95/91");
 
         // 1. With fallback steps appended (`append_fallbacks = true`), `web_safari` (explicit)
-        //    misses the m3u8 selector and falls through to `tv_samsung` (fallback), which relaxes
+        //    misses the m3u8 selector and falls through to `web_music` (fallback), which relaxes
         //    to `bestaudio/best` and succeeds with direct HTTPS itag=140.
         let steps_with_fallback =
-            build_cascade_steps_inner(&origin, None, true, &ext_args, true, None, Instant::now());
+            build_cascade_steps_inner(&origin, true, &ext_args, true, None, Instant::now());
         assert_eq!(steps_with_fallback[0].spec.key, "web_safari");
         assert!(steps_with_fallback[0].is_explicit);
-        assert_eq!(steps_with_fallback[1].spec.key, "tv_samsung");
+        assert_eq!(steps_with_fallback[1].spec.key, "web_music");
         assert!(!steps_with_fallback[1].is_explicit);
 
         let ok = rt
@@ -5143,7 +4575,7 @@ https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/94/n/n94/index.m
         // 2. Without fallback steps (`append_fallbacks = false`), the explicit `web_safari` step
         //    MUST honor the strict m3u8 selector and fail rather than relaxing.
         let explicit_only_steps =
-            build_cascade_steps_inner(&origin, None, true, &ext_args, false, None, Instant::now());
+            build_cascade_steps_inner(&origin, true, &ext_args, false, None, Instant::now());
         assert_eq!(explicit_only_steps.len(), 1);
         let err = rt
             .block_on(resolve_innertube_stream_with_steps(
@@ -5293,14 +4725,14 @@ https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/94/n/n94/index.m
         let ext_args = YoutubeExtractorArgs::default();
         let steps = vec![
             CascadeStep {
-                spec: lookup_client("tv_samsung").unwrap(),
-                origin: origin.clone(),
+                spec: lookup_ytjs_client("tv").unwrap(),
+                loopback_origin: Some(origin.clone()),
                 send_auth: false,
                 is_explicit: false,
             },
             CascadeStep {
-                spec: lookup_client("android_vr").unwrap(),
-                origin: origin.clone(),
+                spec: lookup_ytjs_client("android_vr").unwrap(),
+                loopback_origin: Some(origin.clone()),
                 send_auth: false,
                 is_explicit: false,
             },
@@ -5502,14 +4934,14 @@ https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/94/n/n94/index.m
         let ext_args = YoutubeExtractorArgs::default();
         let steps = vec![
             CascadeStep {
-                spec: lookup_client("tv_samsung").unwrap(),
-                origin: origin.clone(),
+                spec: lookup_ytjs_client("tv").unwrap(),
+                loopback_origin: Some(origin.clone()),
                 send_auth: false,
                 is_explicit: false,
             },
             CascadeStep {
-                spec: lookup_client("android_vr").unwrap(),
-                origin: origin.clone(),
+                spec: lookup_ytjs_client("android_vr").unwrap(),
+                loopback_origin: Some(origin.clone()),
                 send_auth: false,
                 is_explicit: false,
             },
@@ -5554,10 +4986,9 @@ https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/94/n/n94/index.m
         let explicit_safari =
             YoutubeExtractorArgs::parse(&["youtube:player_client=web_safari".to_owned()]);
 
-        // 1. Baseline logged-in order starts with `web_music`, `web_safari`, `tv_samsung`, `android_vr`.
+        // 1. Baseline logged-in order starts with `web_music`, `web_safari`, `tv`, `android_vr`.
         let base_keys: Vec<&str> = build_cascade_steps_inner(
             DEFAULT_INNERTUBE_ORIGIN,
-            Some(WEB_YOUTUBE_ORIGIN),
             true,
             &empty_ext,
             true,
@@ -5569,17 +5000,16 @@ https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/94/n/n94/index.m
         .collect();
         assert_eq!(
             &base_keys[..4],
-            &["web_music", "web_safari", "tv_samsung", "android_vr"]
+            &["web_music", "web_safari", "tv", "android_vr"]
         );
 
-        // 2. Recording a winner promotes it to index 0; >=2 failures demotes that client to the tail.
+        // 2. Recording a winner promotes it to index 0; >=2 failures demotes that client behind healthy ones.
         cache.record_success_at(true, "android_vr", t0);
         cache.record_failure_at(true, "web_safari", t0);
         cache.record_failure_at(true, "web_safari", t0);
 
         let reordered_keys: Vec<&str> = build_cascade_steps_inner(
             DEFAULT_INNERTUBE_ORIGIN,
-            Some(WEB_YOUTUBE_ORIGIN),
             true,
             &empty_ext,
             true,
@@ -5590,13 +5020,20 @@ https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/94/n/n94/index.m
         .map(|s| s.spec.key)
         .collect();
         assert_eq!(reordered_keys[0], "android_vr");
-        assert_eq!(reordered_keys.last().copied(), Some("web_safari"));
+        let safari_pos = reordered_keys
+            .iter()
+            .position(|k| *k == "web_safari")
+            .unwrap();
+        let android_pos = reordered_keys.iter().position(|k| *k == "android").unwrap();
+        assert!(
+            safari_pos > android_pos,
+            "failing web_safari should be demoted behind healthy clients: {reordered_keys:?}"
+        );
 
         // 3. Explicit `player_client=web_safari`: because `web_safari` has fail_streak >= 2 and a
         //    different healthy winner (`android_vr`) exists, promote `android_vr` ahead of `web_safari`.
         let explicit_demoted: Vec<&str> = build_cascade_steps_inner(
             DEFAULT_INNERTUBE_ORIGIN,
-            Some(WEB_YOUTUBE_ORIGIN),
             true,
             &explicit_safari,
             true,
@@ -5614,7 +5051,6 @@ https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/94/n/n94/index.m
         let after_fail_ttl = t0 + CLIENT_FAILURE_TTL + Duration::from_secs(1);
         let explicit_recovered: Vec<&str> = build_cascade_steps_inner(
             DEFAULT_INNERTUBE_ORIGIN,
-            Some(WEB_YOUTUBE_ORIGIN),
             true,
             &explicit_safari,
             true,
@@ -5630,7 +5066,6 @@ https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/94/n/n94/index.m
         // 5. Cookie-mode isolation: `has_cookie = false` bucket is unaffected by logged-in history.
         let anon_keys: Vec<&str> = build_cascade_steps_inner(
             DEFAULT_INNERTUBE_ORIGIN,
-            Some(WEB_YOUTUBE_ORIGIN),
             false,
             &empty_ext,
             true,
@@ -5646,7 +5081,6 @@ https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/94/n/n94/index.m
         let after_winner_ttl = t0 + CLIENT_WINNER_TTL + Duration::from_secs(1);
         let expired_keys: Vec<&str> = build_cascade_steps_inner(
             DEFAULT_INNERTUBE_ORIGIN,
-            Some(WEB_YOUTUBE_ORIGIN),
             true,
             &empty_ext,
             true,
@@ -5657,6 +5091,78 @@ https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/94/n/n94/index.m
         .map(|s| s.spec.key)
         .collect();
         assert_eq!(expired_keys[0], "web_music");
+    }
+
+    #[test]
+    #[ignore = "live network test verifying YouTube.js 18.3.0 + yt-dlp/ejs 0.8.0 resolves dQw4w9WgXcQ, WMOPURvS_3s, trxuXrVJxy4 with HTTP 200/206 audio bytes"]
+    fn live_youtubejs_plus_ejs_resolves_real_streams_http_206() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .pool_idle_timeout(Some(Duration::from_secs(30)))
+            .tcp_keepalive(Some(Duration::from_secs(30)))
+            .tcp_nodelay(true)
+            .build()
+            .expect("reqwest client");
+        let cache_dir =
+            std::env::temp_dir().join(format!("nsh-live-youtubejs-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache_dir);
+
+        for video_id in ["dQw4w9WgXcQ", "WMOPURvS_3s", "trxuXrVJxy4"] {
+            let t0 = Instant::now();
+            let resolved = rt
+                .block_on(resolve_innertube_stream_with_cache(
+                    &client,
+                    DEFAULT_INNERTUBE_ORIGIN,
+                    video_id,
+                    None,
+                    None,
+                    true,
+                    true,
+                    Some(&cache_dir),
+                ))
+                .unwrap_or_else(|e| panic!("YouTube.js+EJS failed for {video_id}: {e}"));
+            let elapsed_ms = t0.elapsed().as_millis();
+
+            let (status, ct, nbytes) = rt.block_on(async {
+                let mut req = client
+                    .get(&resolved.url)
+                    .header("user-agent", &resolved.user_agent)
+                    .timeout(Duration::from_secs(10));
+                if !resolved.is_hls {
+                    req = req.header("range", "bytes=0-1023");
+                }
+                let resp = req.send().await.expect("stream fetch");
+                let status = resp.status();
+                let ct = resp
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_owned();
+                let bytes = resp.bytes().await.expect("read bytes");
+                (status, ct, bytes.len())
+            });
+
+            println!(
+                "LIVE YouTube.js+EJS video={video_id} elapsed={elapsed_ms}ms format={} ext={} hls={} HTTP={} ct={ct} bytes={nbytes} title={:?}",
+                resolved.format_id,
+                resolved.ext,
+                resolved.is_hls,
+                status.as_u16(),
+                resolved.title,
+            );
+            assert!(
+                status == reqwest::StatusCode::OK || status == reqwest::StatusCode::PARTIAL_CONTENT,
+                "expected HTTP 200/206 for {video_id}, got {status}"
+            );
+            assert!(nbytes > 0, "expected non-empty audio bytes for {video_id}");
+        }
+
+        let _ = std::fs::remove_dir_all(&cache_dir);
     }
 
     fn load_local_mac_ytm_cookie() -> Option<String> {

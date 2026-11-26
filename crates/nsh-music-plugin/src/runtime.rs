@@ -828,6 +828,39 @@ impl PluginSource {
             Err(e) => return Some(Err(e)),
         };
 
+        Some(self.finish_youtube_stream_rescue(&video_id, quality, resolved))
+    }
+
+    fn finish_youtube_stream_rescue(
+        &self,
+        video_id: &str,
+        quality: Quality,
+        resolved: crate::virtual_ytdlp::ResolvedAudioStream,
+    ) -> Result<StreamInfo, String> {
+        // Direct non-HLS streams (`m4a`, `webm`, etc.) already passed preflight in `VirtualYtdlpShim`:
+        // return the resolved URL + headers directly so `AudioEngine`'s `ProgressiveCache` streams
+        // natively without spawning a redundant cold `VirtualFfmpegShim` loopback relay.
+        if !resolved.is_hls {
+            let mut headers = HashMap::new();
+            if !resolved.user_agent.is_empty() {
+                headers.insert("User-Agent".to_owned(), resolved.user_agent.clone());
+            }
+            for (k, v) in self.request_headers_for(&resolved.url, RequestKind::Audio) {
+                let exists = headers.keys().any(|ek| ek.eq_ignore_ascii_case(&k));
+                if !exists {
+                    headers.insert(k, v);
+                }
+            }
+            return Ok(StreamInfo {
+                url: resolved.url,
+                media_type: resolved.mime_type,
+                quality: quality.as_str().to_owned(),
+                bit_rate: resolved.bitrate as i64,
+                headers,
+                ..StreamInfo::default()
+            });
+        }
+
         let ffmpeg_args = vec![
             "-nostdin".to_owned(),
             "-hide_banner".to_owned(),
@@ -852,11 +885,11 @@ impl PluginSource {
 
         let vhandle = match VirtualFfmpegShim::spawn(&ffmpeg_args) {
             Ok(h) => h,
-            Err(e) => return Some(Err(format!("VirtualFfmpegShim spawn failed: {e}"))),
+            Err(e) => return Err(format!("VirtualFfmpegShim spawn failed: {e}")),
         };
 
         let mut ready = false;
-        let deadline = Instant::now() + Duration::from_secs(8);
+        let deadline = Instant::now() + Duration::from_secs(18);
         while Instant::now() < deadline {
             if vhandle.error_output().contains("Input #0") {
                 ready = true;
@@ -870,35 +903,39 @@ impl PluginSource {
 
         if !ready {
             let err_out = vhandle.error_output();
+            let running = vhandle.is_running();
             vhandle.kill();
             let detail = err_out.trim();
-            return Some(Err(if detail.is_empty() {
-                "VirtualFfmpegShim rescue relay did not become ready".to_owned()
+            let msg = if detail.is_empty() {
+                format!(
+                    "VirtualFfmpegShim HLS rescue relay did not become ready within 18s (running={running})"
+                )
             } else {
-                format!("VirtualFfmpegShim rescue relay failed: {detail}")
-            }));
+                format!("VirtualFfmpegShim HLS rescue relay failed: {detail}")
+            };
+            log::warn!(
+                target: "nsh_music_plugin",
+                "plugin `{}` video={video_id} {msg}",
+                self.manifest.id
+            );
+            return Err(msg);
         }
 
         let Some(addr) = vhandle.listen_addr() else {
             vhandle.kill();
-            return Some(Err(
-                "VirtualFfmpegShim rescue relay did not expose a listen address".to_owned(),
-            ));
+            return Err(
+                "VirtualFfmpegShim HLS rescue relay did not expose a listen address".to_owned(),
+            );
         };
 
         self.host_ctx.register_rescue_relay(vhandle);
-        let media_type = if resolved.is_hls {
-            "audio/aac".to_owned()
-        } else {
-            resolved.mime_type
-        };
-        Some(Ok(StreamInfo {
+        Ok(StreamInfo {
             url: format!("http://{addr}/"),
-            media_type,
+            media_type: "audio/aac".to_owned(),
             quality: quality.as_str().to_owned(),
             bit_rate: resolved.bitrate as i64,
             ..StreamInfo::default()
-        }))
+        })
     }
 }
 
@@ -2563,6 +2600,93 @@ mod tests {
             !source
                 .host_ctx
                 .was_ytdlp_recently_exhausted("dQw4w9WgXcQ", Duration::from_secs(10))
+        );
+
+        source.shutdown();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn direct_non_hls_stream_rescue_returns_direct_url_with_headers_and_no_ffmpeg_relay() {
+        let root = std::env::temp_dir().join(format!(
+            "nsh-plugin-direct-rescue-no-ffmpeg-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let plugin_dir = root.join("plugin");
+        let data_dir = root.join("data");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::create_dir_all(&data_dir).unwrap();
+
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            r#"{
+                "id":"yt-direct-rescue",
+                "name":"YT Direct Rescue",
+                "version":"0.1.0",
+                "main":"index.js",
+                "permissions":{"process":["yt-dlp"], "network":["*.googlevideo.com"]},
+                "requestHeaders":[
+                    {"domains":["*.googlevideo.com"],"kinds":["audio"],"headers":{"Referer":"https://music.youtube.com/"}}
+                ]
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            plugin_dir.join("index.js"),
+            r#"export async function stream() { return null; }"#,
+        )
+        .unwrap();
+
+        let source = PluginSource::load(&plugin_dir, &data_dir, HostRuntimeOptions::default())
+            .expect("load direct-rescue plugin");
+
+        let direct = crate::virtual_ytdlp::ResolvedAudioStream {
+            video_id: "WMOPURvS_3s".to_owned(),
+            title: "Test Direct".to_owned(),
+            url: "https://rr1---sn-test.googlevideo.com/videoplayback?itag=140".to_owned(),
+            mime_type: "audio/mp4; codecs=\"mp4a.40.2\"".to_owned(),
+            ext: "m4a".to_owned(),
+            acodec: "mp4a.40.2".to_owned(),
+            vcodec: "none".to_owned(),
+            format_id: "140".to_owned(),
+            bitrate: 128_000,
+            abr: Some(128.0),
+            tbr: Some(128.0),
+            asr: Some(44100),
+            audio_channels: Some(2),
+            filesize: Some(3_000_000),
+            duration_secs: Some(180),
+            protocol: "https".to_owned(),
+            uploader: "Artist".to_owned(),
+            channel_id: "UC123".to_owned(),
+            thumbnail: String::new(),
+            user_agent: "TestYouTubeJsUA/1.0".to_owned(),
+            is_hls: false,
+            formats_json: Vec::new(),
+        };
+
+        let info = source
+            .finish_youtube_stream_rescue("WMOPURvS_3s", Quality::High, direct)
+            .expect("direct non-HLS rescue must return direct StreamInfo");
+        assert_eq!(
+            info.url,
+            "https://rr1---sn-test.googlevideo.com/videoplayback?itag=140"
+        );
+        assert_eq!(info.media_type, "audio/mp4; codecs=\"mp4a.40.2\"");
+        assert_eq!(info.bit_rate, 128_000);
+        assert_eq!(
+            info.headers.get("User-Agent").map(String::as_str),
+            Some("TestYouTubeJsUA/1.0")
+        );
+        assert_eq!(
+            info.headers.get("Referer").map(String::as_str),
+            Some("https://music.youtube.com/")
+        );
+        assert_eq!(
+            source.host_ctx.active_process_count(),
+            0,
+            "direct non-HLS rescue must NOT spawn a VirtualFfmpegShim relay"
         );
 
         source.shutdown();

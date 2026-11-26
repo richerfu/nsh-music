@@ -18,9 +18,9 @@ pub mod manifest;
 pub mod mobile_compat;
 pub mod runtime;
 pub mod virtual_ytdlp;
-pub(crate) mod yt_clients;
 pub(crate) mod yt_ejs;
 pub(crate) mod yt_format_selector;
+pub(crate) mod yt_youtubejs;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -945,7 +945,7 @@ mod tests {
                 const ytCode = await yt.wait();
                 return {
                     id: "ok",
-                    name: `mobile=${host.capabilities.isMobile}|canSpawn=${host.capabilities.canSpawnExternal}|ff=${ffCode === 0 && ff.stdout().includes("ffmpeg")}|yt=${ytCode === 0 && Boolean(ytLine && ytLine.includes("nsh-virtual-ytdlp"))}|ey=${host.capabilities.embeddedYtdlp}|vp=${host.capabilities.virtualProcesses.join(",")}|open=${host.capabilities.openUrl}`,
+                    name: `mobile=${host.capabilities.isMobile}|canSpawn=${host.capabilities.canSpawnExternal}|ff=${ffCode === 0 && ff.stdout().includes("ffmpeg")}|yt=${ytCode === 0 && Boolean(ytLine && ytLine.includes("nsh-youtubejs-18.3.0+ejs-0.8.0"))}|ey=${host.capabilities.embeddedYtdlp}|vp=${host.capabilities.virtualProcesses.join(",")}|open=${host.capabilities.openUrl}`,
                     duration: 1000
                 };
             }
@@ -2340,7 +2340,7 @@ mod tests {
                 const code = await yt.wait();
                 return {
                     id,
-                    name: `yt=${code}:${Boolean(line && line.includes("nsh-virtual-ytdlp"))}`,
+                    name: `yt=${code}:${Boolean(line && line.includes("nsh-youtubejs-18.3.0+ejs-0.8.0"))}`,
                     duration: 1000
                 };
             }

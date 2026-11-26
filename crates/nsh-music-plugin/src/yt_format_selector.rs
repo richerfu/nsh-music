@@ -2,7 +2,20 @@
 
 use std::collections::HashSet;
 
-use crate::yt_clients::normalize_client_alias;
+/// Normalizes a `yt-dlp` `player_client` / `po_token` client token into a canonical lowercase key.
+pub fn normalize_client_alias(raw: &str) -> String {
+    let norm = raw.trim().to_ascii_lowercase().replace('-', "_");
+    match norm.as_str() {
+        "web_remix" | "ytmusic" | "music" => "web_music".to_owned(),
+        "tvhtml5" => "tv".to_owned(),
+        "tv_simply" => "tv_simply".to_owned(),
+        "tv_embedded" => "tv_embedded".to_owned(),
+        "web_embedded" | "web_embedded_player" => "web_embedded".to_owned(),
+        "android_music" | "ytmusic_android" => "android_music".to_owned(),
+        "android_creator" | "ytstudio_android" => "android_creator".to_owned(),
+        other => other.to_owned(),
+    }
+}
 
 /// YouTube Proof-of-Origin (`po_token`) context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,15 +292,21 @@ impl FormatSelector {
                 .collect();
 
             let mandates_specific = matches!(alt.base, BaseTarget::ExactId(_))
-                || alt.filters.iter().any(|f| {
-                    matches!(f.field.as_str(), "ext" | "acodec" | "format_id")
-                });
+                || alt
+                    .filters
+                    .iter()
+                    .any(|f| matches!(f.field.as_str(), "ext" | "acodec" | "format_id"));
             let reverse_bitrate = matches!(alt.base, BaseTarget::WorstAudio);
 
             matched.sort_by(|&a_idx, &b_idx| {
                 let a = &candidates[a_idx];
                 let b = &candidates[b_idx];
-                compare_candidates(a, b, prefer_mobile_aac && !mandates_specific, reverse_bitrate)
+                compare_candidates(
+                    a,
+                    b,
+                    prefer_mobile_aac && !mandates_specific,
+                    reverse_bitrate,
+                )
             });
 
             for idx in matched {
@@ -610,9 +629,30 @@ mod tests {
     #[test]
     fn format_selector_handles_chains_predicates_and_muxed_itags() {
         let candidates = vec![
-            mk_fmt("91", "m3u8", "m3u8_native", "mp4a.40.5", "avc1.42c00c", Some(86.0)),
-            mk_fmt("93", "m3u8", "m3u8_native", "mp4a.40.2", "avc1.4d401e", Some(263.0)),
-            mk_fmt("94", "m3u8", "m3u8_native", "mp4a.40.2", "avc1.4d401f", Some(322.0)),
+            mk_fmt(
+                "91",
+                "m3u8",
+                "m3u8_native",
+                "mp4a.40.5",
+                "avc1.42c00c",
+                Some(86.0),
+            ),
+            mk_fmt(
+                "93",
+                "m3u8",
+                "m3u8_native",
+                "mp4a.40.2",
+                "avc1.4d401e",
+                Some(263.0),
+            ),
+            mk_fmt(
+                "94",
+                "m3u8",
+                "m3u8_native",
+                "mp4a.40.2",
+                "avc1.4d401f",
+                Some(322.0),
+            ),
             mk_fmt("251", "webm", "https", "opus", "none", Some(160.0)),
             mk_fmt("774", "webm", "https", "opus", "none", Some(256.0)),
             mk_fmt("140", "m4a", "https", "mp4a.40.2", "none", Some(128.0)),
