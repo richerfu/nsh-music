@@ -26,9 +26,12 @@
 - **完整兼容 [egoist/mygo-music](https://github.com/egoist/mygo-music) 插件生态**
   - 内置 QuickJS (`quickjs-jit`) + `oxc` TypeScript 运行时，兼容 `plugin.json` 清单、38+ 标准与别名导出函数、`requestHeaders` 域名匹配与模板变量展开、二维码扫码登录以及原生 WebView 会话登录（支持 `HttpOnly` Cookie 获取与手动回退）。
   - 支持通过 **`mygo-music://install-plugin?repo=owner/repo`**（同时兼容 `mygo-music-dev://` 与 `nsh-music://`）DeepLink 一键拉起应用并导入插件，也支持 GitHub 仓库、本地目录、ZIP 压缩包与窗口拖放安装。
-- **移动端沙箱内进程兼容层**
-  - 内置 **`VirtualFfmpegShim`**、**`VirtualYtdlpShim`** 与内嵌 **`yt-dlp-ejs`**，在 iOS / Android / HarmonyOS 沙箱及未安装外部命令行工具的桌面环境中透明拦截并执行 `ffmpeg` / `yt-dlp` 调用，实现零外部二进制依赖的流媒体解析与 HLS/DASH 中继。
-  - 可在「设置 → 插件」中通过 **移动端虚拟化兼容（Mobile Virtualization Compatibility）** 开关自由切换内进程虚拟化与系统 `PATH` 外部命令调用。完整架构与兼容矩阵请参见 [`docs/PLUGIN_COMPAT.md`](./docs/PLUGIN_COMPAT.md)。
+- **移动端沙箱内进程兼容层（自动择优与用户自装策略）**
+  - 内置 **`VirtualFfmpegShim`** 与 **`VirtualYtdlpShim`**；其中 `VirtualYtdlpShim` 并非手写 InnerTube 协议，而是在 `quickjs-jit` 内嵌上游 **[LuanRT/YouTube.js (`youtubei.js`)](https://github.com/LuanRT/YouTube.js)** 与 **[yt-dlp/ejs](https://github.com/yt-dlp/ejs)** 并桥接至 Rust `reqwest`，在无外部二进制/无 Python 环境下也能完成流媒体解析、签名/节流挑战求解与 HLS/DASH 中继。
+  - 可在「设置 → 插件」中通过 **移动端虚拟化兼容（Mobile Virtualization Compatibility）** 开关按需控制执行策略（应用不会自动下载外部二进制）：
+    - **开启（默认）**：桌面端若检测到用户已在系统 `PATH` 中自行安装 `yt-dlp` / `ffmpeg` 且允许运行，会自动优先调用用户本机二进制，缺失时无缝回退至内进程虚拟化（`YouTube.js + yt-dlp/ejs` / `VirtualFfmpegShim`）；移动端（iOS / Android / HarmonyOS）直接在应用沙箱内运行内进程虚拟化。
+    - **关闭**：跳过内进程虚拟化，所有外部命令调用直接经系统 `PATH` 执行。
+  - 完整架构与兼容矩阵请参见 [`docs/PLUGIN_COMPAT.md`](./docs/PLUGIN_COMPAT.md)。
 - **高质量音频引擎与沉浸式播放页**
   - 内置渐进式 LRU 磁盘音频缓存与瞬断重试/断点续传机制，播放、切歌与下载共享缓存。
   - 支持 Symphonia 纯 Rust 解码与可选静态 FFmpeg 解码、**ReplayGain** 响度均衡、**Crossfade** 交叉淡入淡出 DSP，以及 16 频段实时 FFT 音频频谱。
@@ -49,7 +52,7 @@
 | `src/`                    | 应用入口、响应式状态管理 (`AppStore`)、三形态外壳 (`desktop` / `pad` / `phone`)、页面 UI、Now Playing 舞台与六端原生媒体会话驱动 (`src/platform/`) |
 | `crates/nsh-music-core`   | 数据模型、`MusicSource` 协议、LRC/YRC/QRC 歌词解析、本地音频扫描、`zh-CN`/`en` 国际化、设置与会话持久化                                            |
 | `crates/nsh-music-audio`  | 跨平台音频引擎、Symphonia/FFmpeg 解码、DSP、LRU 缓存、`VirtualFfmpegShim`、远程控制桥接与设备断开监听                                              |
-| `crates/nsh-music-plugin` | QuickJS + `oxc` 插件运行时、`plugin.json` 解析、权限与 `requestHeaders` 处理、`VirtualYtdlpShim` + `yt-dlp-ejs` 兼容层                             |
+| `crates/nsh-music-plugin` | QuickJS + `oxc` 插件运行时、`plugin.json` 解析、权限与 `requestHeaders` 处理、`VirtualYtdlpShim`（`YouTube.js` + `yt-dlp/ejs`）兼容层              |
 | `crates/nsh-web-signin`   | 六端原生 WebView 登录与 `HttpOnly` Cookie 采集模块                                                                                                 |
 | `docs/PLUGIN_COMPAT.md`   | 插件接口兼容矩阵、移动端虚拟化架构与迁移指南                                                                                                       |
 
@@ -82,6 +85,7 @@ nsh package --target <platform>
   NSH Music 的界面交互设计、插件清单与 Host/Plugin RPC 兼容规范，以及 `mygo-music://` DeepLink 协议均深受 `mygo-music` 启发并与之保持生态兼容。
 - **开源协议（AGPL-3.0）**：
   上游项目 [`egoist/mygo-music`](https://github.com/egoist/mygo-music) 采用 **GNU Affero General Public License v3.0 (AGPL-3.0)** 开源（参见其 [`LICENSE`](https://github.com/egoist/mygo-music/blob/main/LICENSE)）。遵循 AGPL-3.0 的传染性开源条款要求，**NSH Music** 同样依据 **[GNU Affero General Public License v3.0](./LICENSE)** 许可协议发布与分发。
-- **内进程兼容层第三方参考与内嵌组件**：
-  - **[yt-dlp](https://github.com/yt-dlp/yt-dlp)**（Unlicense）：`VirtualYtdlpShim` 的流媒体提取行为与客户端策略参考了 `yt-dlp`。
+- **内进程兼容层第三方开源组件与参考**：
+  - **[LuanRT/YouTube.js](https://github.com/LuanRT/YouTube.js)**（`MIT License`）：内嵌于 `VirtualYtdlpShim`（`quickjs-jit` 沙箱桥接 Rust `reqwest`），提供上游维护的 YouTube / YouTube Music InnerTube 客户端与多客户端流媒体解析能力。
+  - **[yt-dlp](https://github.com/yt-dlp/yt-dlp)**（Unlicense）：`VirtualYtdlpShim` 的 CLI 参数兼容与格式选择策略参考了 `yt-dlp`。
   - **[yt-dlp/ejs](https://github.com/yt-dlp/ejs)**（PyPI 包名 `yt-dlp-ejs`，Unlicense；包含 MIT 协议的 `meriyah` / `astring`）：内嵌于插件兼容层，用于在无外部 JS 运行时的环境中离线求解签名/节流挑战。

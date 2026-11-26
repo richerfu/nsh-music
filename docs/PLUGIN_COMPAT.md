@@ -84,7 +84,7 @@ Every plugin executes in its own isolated QuickJS worker thread with `globalThis
 | `host.log` | `debug`, `info`, `warn`, `error` | Routed to Rust `log` target `plugin::<id>` (also aliased to `console.*`) |
 | `host.i18n` | `t(key, params?)`, `locale()` | Loads `locales/<lang>.json` (`zh-CN`, `en`, automatic fallback) |
 | `host.capabilities` | `{ platform, isMobile, embeddedFfmpeg: true, embeddedYtdlp: true, virtualProcesses: ["ffmpeg", "yt-dlp"], nativeCodecs, openUrl: true, canSpawnExternal, webSignInMode }` | Runtime feature detection for adaptive plugins |
-| `host.spawn(cmd, args?, opts?)` | Handle: `stdout()`, `stderr()`, `errorOutput()`, `readLine()`, `write()`, `closeStdin()`, `wait()`, `kill()`, `isRunning()` | Virtualizes `ffmpeg` (`VirtualFfmpegShim`) and `yt-dlp` (`VirtualYtdlpShim`) in-process across all platforms; prefers real desktop binaries when `Allow Programs` is granted and installed; mobile blocks other CLIs with `MobileSandboxError` |
+| `host.spawn(cmd, args?, opts?)` | Handle: `stdout()`, `stderr()`, `errorOutput()`, `readLine()`, `write()`, `closeStdin()`, `wait()`, `kill()`, `isRunning()` | When `Mobile Virtualization Compatibility` is enabled (default), Desktop prefers user-installed `ffmpeg` / `yt-dlp` on `PATH` (when permitted) and seamlessly falls back to in-process `VirtualFfmpegShim` / `VirtualYtdlpShim` (`YouTube.js` + `yt-dlp/ejs`), while Mobile runs in-process virtualization directly inside the sandbox; when disabled, calls go straight to system `PATH` binaries without virtualization |
 | `host.webSignIn(opts)` | `{ url, title?, incognito?, userAgent?, evalJs?, cookieNames?, allowManualCookie? }` | Invokes native embedded `web_view()` via `SignInPromptCallback` / `WebSignInHandler` |
 | `host.prompt({ qr, text })` | Emits QR code / instruction prompt to UI | Used by NetEase / Bilibili / QQ QR-code login flows |
 | `host.sleep(ms)` | Returns `Promise<void>` | Non-blocking Tokio timer |
@@ -146,7 +146,7 @@ On desktop, plugins like `mygo-music`'s `youtube-music` and `bilibili` invoke an
 
 On iOS, Android, and HarmonyOS, spawning external executables is prohibited by the OS sandbox. `nsh-music` solves this **in-process**:
 
-1. `host.spawn(cmd, args, opts)` checks `is_ffmpeg_command(cmd)` **on every platform**.
+1. When **Mobile Virtualization Compatibility (`移动端虚拟化兼容`)** is enabled (default), `host.spawn(cmd, args, opts)` checks `is_ffmpeg_command(cmd)`: Desktop prefers a user-installed `ffmpeg` on `PATH` (when `Allow Programs` is granted) and seamlessly falls back to `VirtualFfmpegShim` when absent, while Mobile runs `VirtualFfmpegShim` directly in-process. When disabled by the user, `host.spawn` invokes system `PATH` directly without virtualization.
 2. Probe invocations (`-version`, `-h protocol=http`) return synthetic FFmpeg banners and protocol capabilities immediately without launching a subprocess.
 3. Relay invocations (`-listen 1 http://127.0.0.1:<port>/`) spin up an in-process **Tokio loopback HTTP server** inside `nsh_music_audio::virtual_ffmpeg::VirtualFfmpegShim`, immediately emit `Input #0, ...` on virtual stderr (`proc.errorOutput()`), and stream the upstream audio using Rust `reqwest` with the exact parsed `-headers` / `-user_agent` preserved across cross-host 3xx CDN redirects.
 4. `proc.kill()` cleanly shuts down the loopback server when tracks switch or the plugin unloads.
@@ -161,15 +161,18 @@ On iOS, Android, and HarmonyOS, spawning external executables is prohibited by t
 
 Plugins such as `youtube-music` fall back to `host.spawn("yt-dlp", ...)` (passing session cookies over stdin via `--config-locations -` and requesting `--print "%(.{url,http_headers})j"`, `-g`, or `-j`). On iOS, Android, HarmonyOS, and desktops without `yt-dlp` installed, `nsh-music` intercepts `yt-dlp` via `YtdlpVirtualShim` (`crates/nsh-music-plugin/src/virtual_ytdlp.rs`, advertised via `host.capabilities.embeddedYtdlp === true`):
 
-1. **Desktop vs Mobile Routing**:
-   - On Desktop when `Allow Programs` is granted and a real `yt-dlp` executable is found in `PATH` / `/opt/homebrew/bin` / `/usr/local/bin`, the real binary is spawned.
-   - On iOS, Android, HarmonyOS — or on Desktop when `yt-dlp` is not installed or `Allow Programs` is off — `VirtualYtdlpShim` runs completely in-process with zero Python/subprocess requirement.
+1. **Mobile Virtualization Compatibility & User Self-Install Routing / 自动择优与用户自装策略** (`Settings -> Plugins -> Mobile Virtualization Compatibility` / `设置 → 插件 → 移动端虚拟化兼容`):
+   - **Enabled (default / 默认开启)**:
+     - **Desktop (macOS / Windows / Linux)**: Automatically prefers a user-installed `yt-dlp` (or `ffmpeg`) on system `PATH` (when `Allow Programs` is granted), and seamlessly falls back to in-process virtualization (`YouTube.js + yt-dlp/ejs` / `VirtualFfmpegShim`) when absent. NSH Music never auto-downloads external binaries.
+     - **Mobile (iOS / Android / HarmonyOS)**: Runs in-process virtualization directly inside the app sandbox with zero Python or external executable dependency.
+   - **Disabled / 用户关闭开关**:
+     - Bypasses in-process virtualization and invokes `yt-dlp` / `ffmpeg` directly from system `PATH` (surfacing a runtime error banner on the plugin card if unavailable or blocked by the sandbox).
 2. **CLI & Stdin Config Compatibility**:
-   - `--version` immediately emits `2026.03.01 (nsh-virtual-ytdlp)` and exits `0`.
+   - `--version` immediately emits a compatible `yt-dlp` version banner (identifying the embedded `YouTube.js` + `yt-dlp/ejs` engine) and exits `0`.
    - `--config-locations -` waits for `proc.closeStdin()` and parses quoted flags (`--add-headers "Cookie:..."`, `--add-header`, `--user-agent`, `--cookies`) merged with CLI flags (`-f`/`--format`, `--extractor-args`, `--print`, `-g`/`--get-url`, `-j`/`--dump-json`).
-3. **Pure-Rust InnerTube Multi-Client Cascade**:
-   - Uses `HostContext`'s `rustls-tls` `reqwest::Client` and pure-Rust SHA-1 `SAPISIDHASH` authentication (`__Secure-3PAPISID` / `SAPISID`) with cached `visitorData`.
-   - Cascades across `ANDROID_VR` -> `IOS` -> `ANDROID_MUSIC` -> `TVHTML5_SIMPLY_EMBEDDED_PLAYER` -> `VISIONOS` to locate direct non-ciphered `streamingData.adaptiveFormats` audio streams playable via `VirtualFfmpegShim` + `nsh-music-audio` (preferring Symphonia-decodable `audio/mp4` AAC-LC on mobile, falling back to `hlsManifestUrl` only if no direct audio URL is present).
+3. **Embedded Upstream `YouTube.js` + `yt-dlp/ejs` Engine (in `quickjs-jit`)**:
+   - Instead of a handwritten InnerTube implementation, `VirtualYtdlpShim` embeds upstream **[LuanRT/YouTube.js (`youtubei.js`)](https://github.com/LuanRT/YouTube.js)** (MIT) together with **[yt-dlp/ejs](https://github.com/yt-dlp/ejs)** (Unlicense; `meriyah` / `astring` MIT) inside `quickjs-jit`, bridged to `HostContext`'s Rust `reqwest` (`rustls-tls`) HTTP stack.
+   - Supports authenticated cookie sessions with automatic anonymous client fallback across upstream `YouTube.js` clients, invokes `yt-dlp/ejs` to solve signature (`sig`) and throttle (`n`) challenges offline (with disk-cached preprocessed player scripts), prefers direct audio streams (`AudioEngine`'s progressive cache streams them natively without a redundant loopback relay) and falls back to HLS manifests relayed by `VirtualFfmpegShim` when needed.
    - Emits exact `%(.{url,http_headers})j`, `-g`, or `-j` output lines on stdout and standard `ERROR: [youtube] <id>: <reason>` diagnostics on stderr when unavailable or sign-in is required.
 
 ---
