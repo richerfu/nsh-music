@@ -414,7 +414,8 @@ fn start_viewport(width: f32, height: f32, os: Os, idiom: Idiom) -> Headless {
     let viewport = Size::new(Points(width), Points(height));
     let root = Root::of::<nsh_app_music::App>()
         .tokens(nsh_app_music::app_tokens())
-        .app_id("com.richerfu.nshmusic.test");
+        .app_id("com.richerfu.nshmusic.test")
+        .url_schemes(["nsh-music", "mygo-music"]);
     let env = Environment {
         window: viewport,
         os,
@@ -2292,4 +2293,434 @@ fn pad_structured_lyrics_render_and_stale_clear_on_track_change() {
     .unwrap();
     app.wait_for("id:now-playing-overlay >> text:暂无歌词，静心聆听。")
         .unwrap();
+}
+
+#[test]
+fn form_factor_parity_source_switcher_virtual_compat_and_now_playing() {
+    let mut guard = IsolatedStateGuard::acquire();
+    let music_dir = guard.make_temp_dir("parity-wav");
+    write_fixture_local_wavs(&music_dir);
+
+    // 1. Desktop (1280x800): source switcher, Settings -> Plugins virtual compat switch,
+    //    Now Playing open/tab switch/lazy song menu/close.
+    {
+        let mut app = start_viewport(1280.0, 800.0, Os::MacOs, Idiom::Desktop);
+        app.wait_for("id:desktop-shell").unwrap();
+
+        app.press("id:desktop-source-switcher").unwrap();
+        app.wait_for("id:source-switcher-item-local").unwrap();
+        app.press("id:source-switcher-item-local").unwrap();
+        app.wait_for_gone("id:source-switcher-item-local", GONE_TIMEOUT)
+            .unwrap();
+
+        app.press("id:nav-settings").unwrap();
+        app.wait_for("id:settings-nav-plugins").unwrap();
+        app.press("id:settings-nav-plugins").unwrap();
+        app.wait_for("id:plugins-mobile-virtual-compat-switch >> text:已启用")
+            .unwrap();
+        app.press("id:plugins-mobile-virtual-compat-switch")
+            .unwrap();
+        app.wait_for("id:plugins-mobile-virtual-compat-switch >> text:已停用")
+            .unwrap();
+        app.press("id:plugins-mobile-virtual-compat-switch")
+            .unwrap();
+        app.wait_for("id:plugins-mobile-virtual-compat-switch >> text:已启用")
+            .unwrap();
+        app.press_window_close("settings").unwrap();
+        app.wait_for_gone("id:settings-sidebar", GONE_TIMEOUT)
+            .unwrap();
+
+        app.on_pick_paths(vec![music_dir.clone()]).unwrap();
+        app.press("role:button[添加音乐文件夹]").unwrap();
+        app.wait_for("id:desktop-main-viewport >> text:Acoustic Sunrise")
+            .unwrap();
+        app.press("id:desktop-main-viewport >> text:Acoustic Sunrise >> nth=0")
+            .unwrap();
+        app.wait_for("id:player-bar >> text:Acoustic Sunrise")
+            .unwrap();
+
+        app.press("id:desktop-now-playing-trigger").unwrap();
+        app.wait_for("id:now-playing-overlay").unwrap();
+        app.wait_for("id:np-tab-lyrics").unwrap();
+        app.wait_for("id:np-tab-queue").unwrap();
+        app.press("id:np-tab-queue").unwrap();
+        app.wait_for("id:now-playing-overlay >> text:Evening Breeze")
+            .unwrap();
+        app.press("id:np-tab-lyrics").unwrap();
+        app.wait_for("id:now-playing-overlay >> text:Sunlight over warm strings")
+            .unwrap();
+
+        app.wait_for("id:np-song-more-btn").unwrap();
+        app.press("id:np-song-more-btn").unwrap();
+        app.wait_for("下一首播放").unwrap();
+        app.press("复制歌名").unwrap();
+        app.wait_for_gone("下一首播放", GONE_TIMEOUT).unwrap();
+
+        app.press("id:np-dismiss-btn").unwrap();
+        app.wait_for_gone("id:now-playing-overlay", GONE_TIMEOUT)
+            .unwrap();
+    }
+
+    // 2. Pad Landscape (1024x768) & Pad Portrait (768x1024): source switcher, Settings -> Plugins
+    //    virtual compat switch, Now Playing open/close, lazy song menu, and >= 44pt touch bounds.
+    {
+        let mut app = start_viewport(1024.0, 768.0, Os::Ios, Idiom::Pad);
+        app.wait_for("id:shell-pad-landscape").unwrap();
+        let mut touch_violations = Vec::new();
+
+        app.press("id:pad-source-switcher").unwrap();
+        app.wait_for("id:source-switcher-item-local").unwrap();
+        touch_violations.extend(check_min_touch_targets(
+            &app,
+            &["source-switcher-item-local"],
+        ));
+        app.press("id:source-switcher-item-local").unwrap();
+        app.wait_for_gone("id:source-switcher-item-local", GONE_TIMEOUT)
+            .unwrap();
+
+        app.press("id:pad-nav-settings").unwrap();
+        app.wait_for("id:settings-nav-plugins").unwrap();
+        app.press("id:settings-nav-plugins").unwrap();
+        app.wait_for("id:plugins-mobile-virtual-compat-switch >> text:已启用")
+            .unwrap();
+        touch_violations.extend(check_min_touch_targets(
+            &app,
+            &["plugins-mobile-virtual-compat-switch"],
+        ));
+        app.press("id:plugins-mobile-virtual-compat-switch")
+            .unwrap();
+        app.wait_for("id:plugins-mobile-virtual-compat-switch >> text:已停用")
+            .unwrap();
+        app.press("id:plugins-mobile-virtual-compat-switch")
+            .unwrap();
+        app.wait_for("id:plugins-mobile-virtual-compat-switch >> text:已启用")
+            .unwrap();
+
+        app.press("id:pad-nav-home").unwrap();
+        app.wait_for("id:pad-main-viewport >> text:Acoustic Sunrise")
+            .unwrap();
+        app.press("id:pad-main-viewport >> text:Acoustic Sunrise >> nth=0")
+            .unwrap();
+        app.wait_for("id:pad-player-dock >> text:Acoustic Sunrise")
+            .unwrap();
+
+        // Pad Landscape Now Playing + >= 44pt touch controls + lazy song menu.
+        app.press("id:pad-now-playing-trigger").unwrap();
+        app.wait_for("id:now-playing-overlay").unwrap();
+        touch_violations.extend(check_min_touch_targets(
+            &app,
+            &[
+                "np-dismiss-btn",
+                "np-tab-lyrics",
+                "np-tab-stage",
+                "np-tab-queue",
+                "np-tab-wall",
+                "np-mode-cover",
+                "np-mode-vinyl",
+                "np-mode-cassette",
+                "np-like-btn",
+                "np-song-more-btn",
+                "np-play-pause-btn",
+            ],
+        ));
+        app.press("id:np-tab-queue").unwrap();
+        app.wait_for("id:now-playing-overlay >> text:/即将播放/")
+            .unwrap();
+        app.press("id:np-tab-lyrics").unwrap();
+        app.press("id:np-song-more-btn").unwrap();
+        app.wait_for("下一首播放").unwrap();
+        app.press("复制歌名").unwrap();
+        app.wait_for_gone("下一首播放", GONE_TIMEOUT).unwrap();
+        app.press("id:np-dismiss-btn").unwrap();
+        app.wait_for_gone("id:now-playing-overlay", GONE_TIMEOUT)
+            .unwrap();
+
+        // Rotate to Pad Portrait (768x1024).
+        app.set_viewport(Size::new(Points(768.0), Points(1024.0)))
+            .unwrap();
+        app.wait_for("id:shell-pad-portrait").unwrap();
+
+        app.press("id:pad-source-switcher").unwrap();
+        app.wait_for("id:source-switcher-item-local").unwrap();
+        app.press("id:source-switcher-item-local").unwrap();
+        app.wait_for_gone("id:source-switcher-item-local", GONE_TIMEOUT)
+            .unwrap();
+
+        app.press("id:pad-settings-btn").unwrap();
+        app.wait_for("id:settings-nav-plugins").unwrap();
+        app.press("id:settings-nav-plugins").unwrap();
+        app.wait_for("id:plugins-mobile-virtual-compat-switch >> text:已启用")
+            .unwrap();
+        touch_violations.extend(check_min_touch_targets(
+            &app,
+            &["plugins-mobile-virtual-compat-switch"],
+        ));
+
+        app.press("id:pad-now-playing-trigger").unwrap();
+        app.wait_for("id:now-playing-overlay").unwrap();
+        touch_violations.extend(check_min_touch_targets(
+            &app,
+            &[
+                "np-dismiss-btn",
+                "np-tab-lyrics",
+                "np-tab-queue",
+                "np-mode-cover",
+                "np-like-btn",
+                "np-song-more-btn",
+                "np-play-pause-btn",
+            ],
+        ));
+        app.press("id:np-song-more-btn").unwrap();
+        app.wait_for("下一首播放").unwrap();
+        app.press("复制歌名").unwrap();
+        app.wait_for_gone("下一首播放", GONE_TIMEOUT).unwrap();
+        app.press("id:np-dismiss-btn").unwrap();
+        app.wait_for_gone("id:now-playing-overlay", GONE_TIMEOUT)
+            .unwrap();
+
+        assert!(
+            touch_violations.is_empty(),
+            "Pad parity touch target violations:\n{}",
+            touch_violations.join("\n")
+        );
+    }
+
+    // 3. Phone (390x844): source switcher, Settings -> Plugins virtual compat switch,
+    //    and Now Playing open/lazy song menu/close.
+    {
+        let mut app = start_viewport(390.0, 844.0, Os::Ios, Idiom::Phone);
+        app.wait_for("id:shell-phone").unwrap();
+        let mut touch_violations = Vec::new();
+
+        app.press("id:phone-source-switcher").unwrap();
+        app.wait_for("id:source-switcher-item-local").unwrap();
+        touch_violations.extend(check_min_touch_targets(
+            &app,
+            &["source-switcher-item-local"],
+        ));
+        app.press("id:source-switcher-item-local").unwrap();
+        app.wait_for_gone("id:source-switcher-item-local", GONE_TIMEOUT)
+            .unwrap();
+
+        app.press("id:tab-settings").unwrap();
+        app.wait_for("id:phone-settings-plugins").unwrap();
+        app.press("id:phone-settings-plugins").unwrap();
+        app.wait_for("id:plugins-mobile-virtual-compat-switch >> text:已启用")
+            .unwrap();
+        touch_violations.extend(check_min_touch_targets(
+            &app,
+            &["plugins-mobile-virtual-compat-switch"],
+        ));
+        app.press("id:plugins-mobile-virtual-compat-switch")
+            .unwrap();
+        app.wait_for("id:plugins-mobile-virtual-compat-switch >> text:已停用")
+            .unwrap();
+        app.press("id:plugins-mobile-virtual-compat-switch")
+            .unwrap();
+        app.wait_for("id:plugins-mobile-virtual-compat-switch >> text:已启用")
+            .unwrap();
+
+        app.press("id:phone-back-btn").unwrap();
+        app.wait_for("id:tab-home").unwrap();
+        app.press("id:tab-home").unwrap();
+        app.wait_for("id:phone-main-viewport >> text:Acoustic Sunrise")
+            .unwrap();
+        app.press("id:phone-main-viewport >> text:Acoustic Sunrise >> nth=0")
+            .unwrap();
+        app.wait_for("id:phone-mini-player-dock").unwrap();
+        app.press("id:phone-mini-player").unwrap();
+        app.wait_for("id:now-playing-overlay").unwrap();
+        touch_violations.extend(check_min_touch_targets(
+            &app,
+            &["np-dismiss-btn", "np-like-btn", "np-song-more-btn"],
+        ));
+        app.press("id:np-song-more-btn").unwrap();
+        app.wait_for("下一首播放").unwrap();
+        app.press("复制歌名").unwrap();
+        app.wait_for_gone("下一首播放", GONE_TIMEOUT).unwrap();
+        app.press("id:np-dismiss-btn").unwrap();
+        app.wait_for_gone("id:now-playing-overlay", GONE_TIMEOUT)
+            .unwrap();
+
+        assert!(
+            touch_violations.is_empty(),
+            "Phone parity touch target violations:\n{}",
+            touch_violations.join("\n")
+        );
+    }
+}
+
+fn encode_query_param(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for byte in raw.bytes() {
+        match byte {
+            b'%' | b' ' | b'#' | b'&' | b'+' | b'?' | b'=' => {
+                out.push_str(&format!("%{byte:02X}"));
+            }
+            _ => out.push(byte as char),
+        }
+    }
+    out
+}
+
+#[test]
+fn deep_link_install_plugin_closes_now_playing_and_stages_across_form_factors() {
+    let mut guard = IsolatedStateGuard::acquire();
+    let music_dir = guard.make_temp_dir("deeplink-wav");
+    write_fixture_local_wavs(&music_dir);
+    let plugin_dir = guard.make_temp_dir("deeplink-plugin");
+    write_fixture_js_plugin(&plugin_dir);
+
+    let encoded_dir = encode_query_param(&plugin_dir.to_string_lossy());
+    let hierarchical_url = format!("mygo-music://install-plugin?repo={encoded_dir}");
+    let opaque_url = format!("mygo-music:install-plugin?repo={encoded_dir}");
+
+    // 1. Desktop (1280x800): Now Playing open -> hierarchical & opaque deep links close Now Playing,
+    //    open/focus Desktop Settings child window on Plugins, and open ConfirmPluginInstall cleanly.
+    {
+        let mut app = start_viewport(1280.0, 800.0, Os::MacOs, Idiom::Desktop);
+        app.wait_for("id:desktop-shell").unwrap();
+
+        app.on_pick_paths(vec![music_dir.clone()]).unwrap();
+        app.press("role:button[添加音乐文件夹]").unwrap();
+        app.wait_for("id:desktop-main-viewport >> text:Acoustic Sunrise")
+            .unwrap();
+        app.press("id:desktop-main-viewport >> text:Acoustic Sunrise >> nth=0")
+            .unwrap();
+        app.wait_for("id:player-bar >> text:Acoustic Sunrise")
+            .unwrap();
+
+        // Hierarchical deep link with Settings child window initially closed.
+        assert!(
+            app.window_state("settings").unwrap().is_none(),
+            "Desktop settings window should start closed"
+        );
+        app.press("id:desktop-now-playing-trigger").unwrap();
+        app.wait_for("id:now-playing-overlay").unwrap();
+
+        app.open_with_url(&hierarchical_url).unwrap();
+        app.wait_for_gone("id:now-playing-overlay", GONE_TIMEOUT)
+            .unwrap();
+        app.wait_for("id:settings-sidebar").unwrap();
+        app.wait_for("id:settings-nav-plugins").unwrap();
+        assert!(
+            app.window_state("settings").unwrap().is_some(),
+            "Desktop deep link must open Settings child window"
+        );
+        app.wait_for("id:plugins-btn-github").unwrap();
+        app.wait_for("id:plugins-mobile-virtual-compat-switch")
+            .unwrap();
+        app.wait_for("id:confirm-plugin-install-btn").unwrap();
+        app.wait_for("Fixture Wave Music").unwrap();
+        app.wait_for("api.fixture.invalid").unwrap();
+        assert_eq!(
+            app.screen().count("id:confirm-plugin-install-btn").unwrap(),
+            1,
+            "ConfirmPluginInstall modal must render once without main/settings duplication"
+        );
+        app.press("role:button[取消]").unwrap();
+        app.wait_for_gone("id:confirm-plugin-install-btn", GONE_TIMEOUT)
+            .unwrap();
+
+        // Opaque deep link while Settings child window is already open on General and Now Playing re-opens.
+        app.press("id:settings-nav-general").unwrap();
+        app.wait_for_gone("id:plugins-btn-github", GONE_TIMEOUT)
+            .unwrap();
+        app.press("id:desktop-now-playing-trigger").unwrap();
+        app.wait_for("id:now-playing-overlay").unwrap();
+
+        app.open_with_url(&opaque_url).unwrap();
+        app.wait_for_gone("id:now-playing-overlay", GONE_TIMEOUT)
+            .unwrap();
+        assert!(
+            app.window_state("settings").unwrap().is_some(),
+            "Desktop Settings child window must stay open on opaque deep link"
+        );
+        app.wait_for("id:plugins-btn-github").unwrap();
+        app.wait_for("id:confirm-plugin-install-btn").unwrap();
+        assert_eq!(
+            app.screen().count("id:confirm-plugin-install-btn").unwrap(),
+            1
+        );
+        app.press("role:button[取消]").unwrap();
+        app.wait_for_gone("id:confirm-plugin-install-btn", GONE_TIMEOUT)
+            .unwrap();
+        app.press_window_close("settings").unwrap();
+        app.wait_for_gone("id:settings-sidebar", GONE_TIMEOUT)
+            .unwrap();
+    }
+
+    // 2. Pad (1024x768): Now Playing open -> hierarchical & opaque deep links close Now Playing,
+    //    navigate to Route::Settings (Plugins split section), and open ConfirmPluginInstall cleanly.
+    {
+        let mut app = start_viewport(1024.0, 768.0, Os::Ios, Idiom::Pad);
+        app.wait_for("id:shell-pad-landscape").unwrap();
+        app.wait_for("id:pad-main-viewport >> text:Acoustic Sunrise")
+            .unwrap();
+        app.press("id:pad-main-viewport >> text:Acoustic Sunrise >> nth=0")
+            .unwrap();
+        app.wait_for("id:pad-player-dock >> text:Acoustic Sunrise")
+            .unwrap();
+
+        for deep_link in [&hierarchical_url, &opaque_url] {
+            app.press("id:pad-nav-home").unwrap();
+            app.press("id:pad-now-playing-trigger").unwrap();
+            app.wait_for("id:now-playing-overlay").unwrap();
+
+            app.open_with_url(deep_link).unwrap();
+            app.wait_for_gone("id:now-playing-overlay", GONE_TIMEOUT)
+                .unwrap();
+            app.wait_for("id:pad-settings-split").unwrap();
+            app.wait_for("id:settings-nav-plugins").unwrap();
+            app.wait_for("id:plugins-btn-github").unwrap();
+            app.wait_for("id:confirm-plugin-install-btn").unwrap();
+            app.wait_for("Fixture Wave Music").unwrap();
+            assert_eq!(
+                app.screen().count("id:confirm-plugin-install-btn").unwrap(),
+                1
+            );
+            app.press("role:button[取消]").unwrap();
+            app.wait_for_gone("id:confirm-plugin-install-btn", GONE_TIMEOUT)
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+
+    // 3. Phone (390x844): Now Playing open -> hierarchical & opaque deep links close Now Playing,
+    //    navigate to Route::SettingsDetail(Plugins), and open ConfirmPluginInstall cleanly.
+    {
+        let mut app = start_viewport(390.0, 844.0, Os::Ios, Idiom::Phone);
+        app.wait_for("id:shell-phone").unwrap();
+        app.wait_for("id:phone-main-viewport >> text:Acoustic Sunrise")
+            .unwrap();
+        app.press("id:phone-main-viewport >> text:Acoustic Sunrise >> nth=0")
+            .unwrap();
+        app.wait_for("id:phone-mini-player-dock").unwrap();
+
+        for deep_link in [&hierarchical_url, &opaque_url] {
+            app.press("id:phone-mini-player").unwrap();
+            app.wait_for("id:now-playing-overlay").unwrap();
+
+            app.open_with_url(deep_link).unwrap();
+            app.wait_for_gone("id:now-playing-overlay", GONE_TIMEOUT)
+                .unwrap();
+            app.wait_for("id:phone-settings-detail").unwrap();
+            app.wait_for("id:phone-back-btn").unwrap();
+            app.wait_for("id:phone-plugins-install-btn").unwrap();
+            assert!(
+                !app.screen().matches("id:phone-tab-bar").unwrap(),
+                "Phone deep link must navigate to Level-2 SettingsDetail(Plugins) with tab bar hidden"
+            );
+            app.wait_for("id:confirm-plugin-install-btn").unwrap();
+            app.wait_for("Fixture Wave Music").unwrap();
+            assert_eq!(
+                app.screen().count("id:confirm-plugin-install-btn").unwrap(),
+                1
+            );
+            app.press("role:button[取消]").unwrap();
+            app.wait_for_gone("id:confirm-plugin-install-btn", GONE_TIMEOUT)
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
 }

@@ -70,6 +70,13 @@ fn resolve_app_icon_path() -> Option<std::path::PathBuf> {
     target_os = "macos",
     target_os = "windows"
 ))]
+const APP_URL_SCHEMES: &[&str] = &["nsh-music", "mygo-music"];
+
+#[cfg(any(
+    all(target_os = "linux", not(target_env = "ohos")),
+    target_os = "macos",
+    target_os = "windows"
+))]
 fn main() -> impl std::process::Termination {
     env_logger::init();
     platform::set_ui_sets(vec![nsh_base::registry(), nsh_app_music::registry()]);
@@ -91,6 +98,8 @@ fn main() -> impl std::process::Termination {
         app_id: app_id.to_owned(),
         icon: resolve_app_icon_path(),
         size: (1280, 820),
+        schemes: APP_URL_SCHEMES.iter().map(|s| (*s).to_owned()).collect(),
+        single_instance: true,
         ..Default::default()
     };
 
@@ -99,6 +108,8 @@ fn main() -> impl std::process::Termination {
         title: "NSH Music".to_owned(),
         app_id: app_id.to_owned(),
         size: (1280, 820),
+        schemes: APP_URL_SCHEMES.iter().map(|s| (*s).to_owned()).collect(),
+        single_instance: true,
         ..Default::default()
     };
 
@@ -106,7 +117,8 @@ fn main() -> impl std::process::Termination {
         platform::AppSource::Rust(
             platform::Root::of::<nsh_app_music::App>()
                 .tokens(nsh_app_music::app_tokens())
-                .app_id(app_id),
+                .app_id(app_id)
+                .url_schemes(APP_URL_SCHEMES.iter().copied()),
         ),
         options,
     )

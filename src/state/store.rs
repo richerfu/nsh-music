@@ -429,6 +429,7 @@ pub struct AppStore {
     pub settings: Signal<AppSettings>,
     pub main_window_open: Signal<bool>,
     pub settings_window_open: Signal<bool>,
+    pub settings_window_focus_seq: Signal<u64>,
     pub settings_section: Signal<SettingsSection>,
     pub locale: Signal<Locale>,
     pub theme_override: Signal<ThemeMode>,
@@ -813,6 +814,7 @@ impl AppStore {
             settings: signal(settings),
             main_window_open: signal(true),
             settings_window_open: signal(false),
+            settings_window_focus_seq: signal(0),
             settings_section: signal(SettingsSection::General),
             locale: signal(initial_locale),
             theme_override: signal(initial_theme),
@@ -1101,6 +1103,8 @@ impl AppStore {
         batch(|| {
             self.settings_section.set(section);
             self.settings_window_open.set(true);
+            self.settings_window_focus_seq
+                .update(|seq| *seq = seq.saturating_add(1));
         });
         self.refresh_cache_stats();
         if section == SettingsSection::Plugins {
@@ -1939,25 +1943,21 @@ impl AppStore {
         }
     }
 
-    /// Parses `mygo-music://install-plugin?repo=...` and `nsh-music://install-plugin?repo=...` links.
+    /// Parses `mygo-music://`, `mygo-music-dev://`, and `nsh-music://` `install-plugin` deep links.
     pub fn handle_deep_link(&self, raw_url: &str) {
-        let Ok(parsed) = url::Url::parse(raw_url.trim()) else {
+        let Some(repo) = parse_install_plugin_deep_link(raw_url) else {
             return;
         };
-        let scheme = parsed.scheme().to_ascii_lowercase();
-        if scheme != "mygo-music" && scheme != "nsh-music" {
-            return;
+        if self.now_playing_open.get_untracked() {
+            self.close_now_playing();
         }
-        let action = parsed.host_str().unwrap_or("").to_ascii_lowercase();
-        if action == "install-plugin"
-            && let Some((_, repo)) = parsed.query_pairs().find(|(k, _)| k == "repo")
-        {
-            let trimmed = repo.trim().to_owned();
-            if !trimmed.is_empty() {
-                self.navigate(Route::Plugins);
-                self.stage_github_plugin(&trimmed);
-            }
+        if !self.main_window_open.get_untracked() {
+            self.open_main_window();
         }
+        self.navigate(Route::Plugins);
+        self.toasts
+            .info(self.t_fmt("plugins.staging_repo", &[("repo", &repo)]));
+        self.stage_github_plugin(&repo);
     }
 
     // -------------------------------------------------------------------------
@@ -4845,6 +4845,7 @@ impl AppStore {
             settings: signal(settings),
             main_window_open: signal(true),
             settings_window_open: signal(false),
+            settings_window_focus_seq: signal(0),
             settings_section: signal(SettingsSection::General),
             locale: signal(Locale::En),
             theme_override: signal(ThemeMode::System),
@@ -4883,6 +4884,55 @@ impl AppStore {
             root_owner: Owner::current(),
         }
     }
+}
+
+/// Parses an upstream `mygo-music` / `nsh-music` `install-plugin` deep link and
+/// returns the trimmed repository specifier or URL when valid.
+///
+/// Accepts case-insensitive schemes `mygo-music`, `mygo-music-dev`, and
+/// `nsh-music`, with action `install-plugin` in either hierarchical authority
+/// form (`mygo-music://install-plugin?repo=...`, `mygo-music://install-plugin/?repo=...`)
+/// or opaque / empty-host path form (`mygo-music:install-plugin?repo=...`,
+/// `mygo-music:///install-plugin?repo=...`). Prefers query param `repo` and
+/// falls back to `url`.
+pub fn parse_install_plugin_deep_link(raw_url: &str) -> Option<String> {
+    let parsed = url::Url::parse(raw_url.trim()).ok()?;
+    let scheme = parsed.scheme().to_ascii_lowercase();
+    if !matches!(
+        scheme.as_str(),
+        "mygo-music" | "mygo-music-dev" | "nsh-music"
+    ) {
+        return None;
+    }
+
+    let is_install_plugin = match parsed.host_str() {
+        Some(host) if !host.is_empty() => {
+            host.eq_ignore_ascii_case("install-plugin")
+                && parsed.path().trim_matches('/').is_empty()
+        }
+        _ => parsed
+            .path()
+            .trim_matches('/')
+            .eq_ignore_ascii_case("install-plugin"),
+    };
+    if !is_install_plugin {
+        return None;
+    }
+
+    let mut repo_val: Option<String> = None;
+    let mut url_val: Option<String> = None;
+    for (k, v) in parsed.query_pairs() {
+        let trimmed = v.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if k.eq_ignore_ascii_case("repo") && repo_val.is_none() {
+            repo_val = Some(trimmed.to_owned());
+        } else if k.eq_ignore_ascii_case("url") && url_val.is_none() {
+            url_val = Some(trimmed.to_owned());
+        }
+    }
+    repo_val.or(url_val)
 }
 
 #[cfg(test)]
@@ -5213,5 +5263,155 @@ mod tests {
             .expect("headless mobile virtual compat test starts");
         app.wait_for("id:mobile-compat-store-test-ok")
             .expect("mobile virtual compat store assertions passed");
+    }
+
+    #[test]
+    fn parse_install_plugin_deep_link_supports_all_mygo_and_nsh_formats() {
+        assert_eq!(
+            parse_install_plugin_deep_link(
+                "mygo-music://install-plugin?repo=egoist/mygo-music-youtube-music"
+            ),
+            Some("egoist/mygo-music-youtube-music".to_owned())
+        );
+        assert_eq!(
+            parse_install_plugin_deep_link(
+                "mygo-music://install-plugin/?repo=egoist/mygo-music-youtube-music"
+            ),
+            Some("egoist/mygo-music-youtube-music".to_owned())
+        );
+        assert_eq!(
+            parse_install_plugin_deep_link(
+                "mygo-music:install-plugin?repo=egoist/mygo-music-youtube-music"
+            ),
+            Some("egoist/mygo-music-youtube-music".to_owned())
+        );
+        assert_eq!(
+            parse_install_plugin_deep_link(
+                "mygo-music:///install-plugin?repo=egoist/mygo-music-youtube-music"
+            ),
+            Some("egoist/mygo-music-youtube-music".to_owned())
+        );
+        assert_eq!(
+            parse_install_plugin_deep_link(
+                "mygo-music-dev://install-plugin?repo=egoist/mygo-music-youtube-music"
+            ),
+            Some("egoist/mygo-music-youtube-music".to_owned())
+        );
+        assert_eq!(
+            parse_install_plugin_deep_link(
+                "nsh-music://install-plugin?repo=egoist/mygo-music-youtube-music"
+            ),
+            Some("egoist/mygo-music-youtube-music".to_owned())
+        );
+        assert_eq!(
+            parse_install_plugin_deep_link(
+                "mygo-music://install-plugin?url=https://github.com/owner/repo"
+            ),
+            Some("https://github.com/owner/repo".to_owned())
+        );
+        assert_eq!(
+            parse_install_plugin_deep_link(
+                "mygo-music://install-plugin?url=https://github.com/fallback/repo&repo=owner/preferred"
+            ),
+            Some("owner/preferred".to_owned())
+        );
+        assert_eq!(
+            parse_install_plugin_deep_link(
+                "mygo-music://install-plugin?repo=&url=https://github.com/owner/repo"
+            ),
+            Some("https://github.com/owner/repo".to_owned())
+        );
+        assert_eq!(
+            parse_install_plugin_deep_link("MYGO-MUSIC://INSTALL-PLUGIN?repo=Owner/Repo"),
+            Some("Owner/Repo".to_owned())
+        );
+        assert_eq!(
+            parse_install_plugin_deep_link("MYGO-MUSIC:INSTALL-PLUGIN?URL=https://github.com/a/b"),
+            Some("https://github.com/a/b".to_owned())
+        );
+
+        // Reject missing/empty repo, unknown actions, and unrelated schemes.
+        assert_eq!(
+            parse_install_plugin_deep_link("mygo-music://install-plugin"),
+            None
+        );
+        assert_eq!(
+            parse_install_plugin_deep_link("mygo-music://install-plugin?repo="),
+            None
+        );
+        assert_eq!(
+            parse_install_plugin_deep_link("mygo-music://install-plugin?repo=%20%20"),
+            None
+        );
+        assert_eq!(
+            parse_install_plugin_deep_link("mygo-music://other-action?repo=owner/repo"),
+            None
+        );
+        assert_eq!(
+            parse_install_plugin_deep_link(
+                "mygo-music://other-host/install-plugin?repo=owner/repo"
+            ),
+            None
+        );
+        assert_eq!(
+            parse_install_plugin_deep_link("https://example.com/install-plugin?repo=owner/repo"),
+            None
+        );
+        assert_eq!(parse_install_plugin_deep_link("not a url"), None);
+    }
+
+    #[component]
+    fn SettingsFocusSeqStoreTestApp() -> impl IntoElement {
+        let root = std::env::temp_dir().join(format!(
+            "nsh-music-settings-focus-seq-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = AppStore::new_isolated_for_test(&root);
+
+        assert_eq!(store.settings_window_focus_seq.get_untracked(), 0);
+        assert!(!store.settings_window_open.get_untracked());
+
+        store.open_settings_window(SettingsSection::Plugins);
+        assert!(store.settings_window_open.get_untracked());
+        assert_eq!(
+            store.settings_section.get_untracked(),
+            SettingsSection::Plugins
+        );
+        assert_eq!(store.settings_window_focus_seq.get_untracked(), 1);
+
+        // Re-opening while already open bumps focus_seq so Desktop raises the child window.
+        store.open_settings_window(SettingsSection::Plugins);
+        assert_eq!(store.settings_window_focus_seq.get_untracked(), 2);
+
+        store.audio.with(|a| a.shutdown());
+        let _ = std::fs::remove_dir_all(&root);
+
+        view()
+            .test_id("settings-focus-seq-test-ok")
+            .w(px(120.0))
+            .h(px(40.0))
+            .child(text("ok"))
+    }
+
+    #[test]
+    fn open_settings_window_bumps_focus_seq_when_already_open() {
+        let viewport = nsh_core::geometry::Size::new(
+            nsh_core::geometry::Points(1280.0),
+            nsh_core::geometry::Points(800.0),
+        );
+        let root = nsh_engine::Root::of::<SettingsFocusSeqStoreTestApp>()
+            .tokens(crate::app_tokens())
+            .app_id("com.richerfu.nshmusic.settings_focus_seq_test");
+        let mut config = nsh_engine::EngineConfig::new(root);
+        config.viewport = viewport;
+        config.environment = nsh_engine::Environment {
+            window: viewport,
+            ..nsh_engine::Environment::default()
+        };
+        let mut app =
+            nsh_testing::Headless::start(config).expect("headless settings focus seq test starts");
+        app.wait_for("id:settings-focus-seq-test-ok")
+            .expect("settings focus seq assertions passed");
     }
 }

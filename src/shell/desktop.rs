@@ -93,6 +93,13 @@ pub fn settings_window(store: AppStore) -> AnyElement {
             }
         })
         .content(move || {
+            let win = current_window();
+            effect(move || {
+                let seq = store.settings_window_focus_seq.get();
+                if seq > 0 {
+                    win.focus();
+                }
+            });
             view()
                 .flex_1()
                 .w_full()

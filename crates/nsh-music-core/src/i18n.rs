@@ -366,6 +366,7 @@ define_translations! {
     "plugins.confirm_install.none" => ("无需特殊权限", "No special permissions required"),
     "plugins.confirm_remove.title" => ("移除插件「{name}」？", "Remove plugin \"{name}\"?"),
     "plugins.confirm_remove.desc" => ("将删除该插件目录，已收藏的其它音乐源不受影响。", "This deletes the plugin directory from disk."),
+    "plugins.staging_repo" => ("正在加载插件 {repo}...", "Loading plugin {repo}..."),
     "plugins.installed_fmt" => ("已安装「{name}」", "Installed \"{name}\""),
     "plugins.removed_fmt" => ("已移除插件「{name}」", "Removed \"{name}\""),
     "plugins.reloaded_fmt" => ("已重载「{name}」", "Reloaded \"{name}\""),
@@ -472,6 +473,22 @@ mod tests {
         assert_eq!(
             I18n::t_fmt(Locale::En, "library.tracks_count", &[("count", "12")]),
             "12 tracks"
+        );
+        assert_eq!(
+            I18n::t_fmt(
+                Locale::ZhCn,
+                "plugins.staging_repo",
+                &[("repo", "owner/repo")]
+            ),
+            "正在加载插件 owner/repo..."
+        );
+        assert_eq!(
+            I18n::t_fmt(
+                Locale::En,
+                "plugins.staging_repo",
+                &[("repo", "owner/repo")]
+            ),
+            "Loading plugin owner/repo..."
         );
     }
 

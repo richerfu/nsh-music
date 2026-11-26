@@ -547,7 +547,10 @@ fn pad_floating_player_dock(store: AppStore, has_left_rail: bool) -> View {
                     .rounded(px(radius::XL))
                     .overflow_hidden()
                     .bg(move || theme::mini_player_surface(store.current_accent.get()))
-                    .backdrop_blur(px(20.0))
+                    .style_when(
+                        move || !store.now_playing_open.get(),
+                        |s| s.backdrop_blur(px(20.0)),
+                    )
                     .border_1()
                     .border_color(move || theme::mini_player_border(store.current_accent.get()))
                     .transition_colors()

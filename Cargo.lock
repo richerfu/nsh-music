@@ -3805,10 +3805,14 @@ dependencies = [
 name = "nsh-app-music"
 version = "0.1.0"
 dependencies = [
+ "block2",
  "chrono",
  "dirs",
+ "dispatch2",
  "env_logger",
  "image",
+ "jni 0.21.1",
+ "libc",
  "log",
  "nsh-base",
  "nsh-core",
@@ -3822,6 +3826,11 @@ dependencies = [
  "nsh-platform-windows",
  "nsh-testing",
  "nsh-web-signin",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-core-foundation",
+ "objc2-foundation",
+ "objc2-ui-kit",
  "qrcode",
  "reqwest",
  "serde",
@@ -3829,6 +3838,8 @@ dependencies = [
  "sha2 0.10.9",
  "tokio",
  "url",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -4030,12 +4041,18 @@ name = "nsh-music-audio"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "block2",
+ "coreaudio-sys",
  "cpal",
  "dirs",
  "ffmpeg-sys-next",
  "hex",
+ "jni 0.21.1",
+ "libc",
  "log",
  "nsh-music-core",
+ "objc2",
+ "objc2-foundation",
  "ohos-audio-binding",
  "opus-pure",
  "reqwest",
@@ -4046,6 +4063,8 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "url",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -4620,9 +4639,9 @@ dependencies = [
 
 [[package]]
 name = "ohos-arkui-binding"
-version = "0.6.3"
+version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e358e5638b919359465d2e41f30ffe15c0a0d998dffbc61fc8134bd1fd01f360"
+checksum = "45da7d96c299b1dc69b4190e382379d570222d21fb5412a21898b498253d7d4f"
 dependencies = [
  "bitflags 2.13.2",
  "log",
