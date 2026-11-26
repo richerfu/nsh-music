@@ -380,13 +380,13 @@ pub const INNERTUBE_CLIENTS: &[InnerTubeClientSpec] = &[
 pub const DEFAULT_CLIENTS_WITH_COOKIE: &[&str] = &[
     "web_music",
     "web_safari",
-    "web_creator",
     "tv_samsung",
+    "android_vr",
+    "visionos",
+    "web_creator",
     "web",
     "mweb",
-    "visionos",
     "android",
-    "android_vr",
     "ios",
 ];
 
@@ -593,7 +593,8 @@ mod tests {
 
     #[test]
     fn computes_multi_scheme_sapisid_authorization_header() {
-        let cookie = "SAPISID=plain_sid; __Secure-1PAPISID=one_p_sid; __Secure-3PAPISID=three_p_sid";
+        let cookie =
+            "SAPISID=plain_sid; __Secure-1PAPISID=one_p_sid; __Secure-3PAPISID=three_p_sid";
         let origin = "https://music.youtube.com";
         let ts = 1_700_000_000;
         let auth = compute_youtube_auth_header(cookie, origin, ts).expect("auth header");

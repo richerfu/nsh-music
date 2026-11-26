@@ -6,7 +6,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nsh_music_audio::virtual_ffmpeg::VirtualProcessHandle;
 use nsh_music_core::model::SignInPrompt;
@@ -825,6 +825,7 @@ pub struct HostContext {
     platform: String,
     mobile_virtual_compat: AtomicBool,
     last_runtime_error: RwLock<Option<String>>,
+    last_ytdlp_exhausted: Arc<Mutex<Option<(String, Instant)>>>,
     granted: AtomicBool,
     next_proc_id: AtomicU64,
     processes: Mutex<HashMap<u64, Arc<ManagedProcess>>>,
@@ -859,12 +860,20 @@ impl HostContext {
 
         let http_client = reqwest::Client::builder()
             .user_agent("nsh-music/0.1")
+            .connect_timeout(Duration::from_secs(10))
+            .pool_idle_timeout(Some(Duration::from_secs(30)))
+            .tcp_keepalive(Some(Duration::from_secs(30)))
+            .tcp_nodelay(true)
             .timeout(Duration::from_secs(120))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
         let no_redirect_client = reqwest::Client::builder()
             .user_agent("nsh-music/0.1")
+            .connect_timeout(Duration::from_secs(10))
+            .pool_idle_timeout(Some(Duration::from_secs(30)))
+            .tcp_keepalive(Some(Duration::from_secs(30)))
+            .tcp_nodelay(true)
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(120))
             .build()
@@ -897,6 +906,7 @@ impl HostContext {
             platform,
             mobile_virtual_compat: AtomicBool::new(options.mobile_virtual_compat),
             last_runtime_error: RwLock::new(None),
+            last_ytdlp_exhausted: Arc::new(Mutex::new(None)),
             granted: AtomicBool::new(persisted_granted),
             next_proc_id: AtomicU64::new(1),
             processes: Mutex::new(HashMap::new()),
@@ -911,6 +921,30 @@ impl HostContext {
 
     pub(crate) fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    pub(crate) fn ytdlp_exhausted_tracker(&self) -> Arc<Mutex<Option<(String, Instant)>>> {
+        Arc::clone(&self.last_ytdlp_exhausted)
+    }
+
+    pub fn record_ytdlp_exhausted(&self, video_id: &str) {
+        if let Ok(mut guard) = self.last_ytdlp_exhausted.lock() {
+            *guard = Some((video_id.to_owned(), Instant::now()));
+        }
+    }
+
+    pub fn clear_ytdlp_exhausted(&self) {
+        if let Ok(mut guard) = self.last_ytdlp_exhausted.lock() {
+            *guard = None;
+        }
+    }
+
+    pub fn was_ytdlp_recently_exhausted(&self, video_id: &str, within: Duration) -> bool {
+        self.last_ytdlp_exhausted
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .is_some_and(|(vid, at)| vid == video_id && at.elapsed() <= within)
     }
 
     pub fn has_web_sign_in_handler(&self) -> bool {

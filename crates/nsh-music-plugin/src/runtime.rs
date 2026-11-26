@@ -39,6 +39,8 @@ use crate::virtual_ytdlp::{
 
 /// Default per-call RPC timeout for normal plugin exports (matches `mygo-music`).
 pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Extended timeout for stream resolution exports (`stream`, `getStreamUrl`).
+pub const STREAM_CALL_TIMEOUT: Duration = Duration::from_secs(45);
 /// Extended timeout for interactive sign-in exports (`signIn`, `getQrSignIn`, `pollQrSignIn`).
 pub const SIGN_IN_CALL_TIMEOUT: Duration = Duration::from_secs(300);
 /// Per-plugin QuickJS heap memory limit (256 MiB, matching `mygo-music`).
@@ -293,6 +295,7 @@ enum RuntimeCommand {
         method: String,
         args: Vec<serde_json::Value>,
         reply: std_mpsc::SyncSender<Result<serde_json::Value, SourceError>>,
+        started_tx: std_mpsc::SyncSender<()>,
         started: Arc<AtomicBool>,
         cancelled: Arc<AtomicBool>,
         cancel_notify: Arc<tokio::sync::Notify>,
@@ -496,12 +499,8 @@ impl PluginSource {
         if !self.exports.contains(method) {
             return Err(SourceError::Unsupported);
         }
-        let effective_timeout = self
-            .call_timeout_override
-            .lock()
-            .ok()
-            .and_then(|g| *g)
-            .unwrap_or(timeout);
+        let timeout_override = self.call_timeout_override.lock().ok().and_then(|g| *g);
+        let effective_timeout = timeout_override.unwrap_or(timeout);
         let is_low_priority = is_low_priority_method(method);
 
         let (tx, hi_tx) = {
@@ -534,12 +533,14 @@ impl PluginSource {
         let started = Arc::new(AtomicBool::new(false));
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancel_notify = Arc::new(tokio::sync::Notify::new());
+        let (started_tx, started_rx) = std_mpsc::sync_channel(1);
         let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
         if tx
             .send(RuntimeCommand::Call {
                 method: method.to_owned(),
                 args,
                 reply: reply_tx,
+                started_tx,
                 started: Arc::clone(&started),
                 cancelled: Arc::clone(&cancelled),
                 cancel_notify: Arc::clone(&cancel_notify),
@@ -550,6 +551,37 @@ impl PluginSource {
             return Err(SourceError::Message(
                 "the plugin stopped; try again".to_owned(),
             ));
+        }
+
+        // When no explicit `call_timeout_override` is set, wait separately for queue dispatch
+        // so calls queued behind a slow active RPC get their full execution budget once started.
+        if timeout_override.is_none() {
+            let queue_wait = Duration::from_secs(30).max(effective_timeout);
+            match started_rx.recv_timeout(queue_wait) {
+                Ok(()) => {}
+                Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                    cancelled.store(true, Ordering::SeqCst);
+                    cancel_notify.notify_one();
+                    log::warn!(
+                        target: "nsh_music_plugin",
+                        "plugin `{}` timed out waiting in queue for `{method}` after {:?} (low_priority={is_low_priority}); preserving worker and active processes",
+                        self.manifest.id,
+                        queue_wait
+                    );
+                    return Err(SourceError::Message(format!(
+                        "the plugin didn't answer {method} in time"
+                    )));
+                }
+                Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                    if let Ok(res) = reply_rx.try_recv() {
+                        return res;
+                    }
+                    let _ = self.restart();
+                    return Err(SourceError::Message(
+                        "plugin runtime stopped while awaiting response".to_owned(),
+                    ));
+                }
+            }
         }
 
         match reply_rx.recv_timeout(effective_timeout) {
@@ -630,11 +662,28 @@ impl PluginSource {
         legacy: &[&str],
         legacy_args: Vec<serde_json::Value>,
     ) -> Result<serde_json::Value, SourceError> {
+        self.call_mygo_or_legacy_with_timeout(
+            canonical,
+            obj_arg,
+            legacy,
+            legacy_args,
+            DEFAULT_CALL_TIMEOUT,
+        )
+    }
+
+    fn call_mygo_or_legacy_with_timeout(
+        &self,
+        canonical: &str,
+        obj_arg: Option<serde_json::Value>,
+        legacy: &[&str],
+        legacy_args: Vec<serde_json::Value>,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, SourceError> {
         if self.exports.contains(canonical) {
             let args = obj_arg.into_iter().collect();
-            return self.call_raw(canonical, args);
+            return self.call_raw_with_timeout(canonical, args, timeout);
         }
-        self.call_any(legacy, legacy_args)
+        self.call_any_with_timeout(legacy, legacy_args, timeout)
     }
 
     fn has_any(&self, candidates: &[&str]) -> bool {
@@ -749,6 +798,17 @@ impl PluginSource {
             return None;
         }
         let video_id = extract_youtube_video_id(id)?;
+        if self
+            .host_ctx
+            .was_ytdlp_recently_exhausted(&video_id, Duration::from_secs(10))
+        {
+            log::info!(
+                target: "nsh_music_plugin",
+                "plugin `{}` skipping duplicate VirtualYtdlpShim rescue for video={video_id} (recently exhausted)",
+                self.manifest.id
+            );
+            return None;
+        }
 
         log::info!(
             target: "nsh_music_plugin",
@@ -1340,7 +1400,7 @@ impl MusicSource for PluginSource {
 
     fn stream(&self, id: &str, quality: Quality) -> Result<StreamInfo, SourceError> {
         let mut resolved: Result<StreamInfo, SourceError> = (|| {
-            let val = self.call_mygo_or_legacy(
+            let val = self.call_mygo_or_legacy_with_timeout(
                 "stream",
                 Some(serde_json::json!({
                     "id": id,
@@ -1348,6 +1408,7 @@ impl MusicSource for PluginSource {
                 })),
                 &["getStreamUrl"],
                 vec![serde_json::json!(id), serde_json::json!(quality.as_str())],
+                STREAM_CALL_TIMEOUT,
             )?;
             let mut info: StreamInfo = if let Some(url) = val.as_str() {
                 StreamInfo {
@@ -1389,6 +1450,7 @@ impl MusicSource for PluginSource {
         match &resolved {
             Ok(info) => {
                 self.host_ctx.clear_runtime_error();
+                self.host_ctx.clear_ytdlp_exhausted();
                 log::info!(
                     target: "nsh_music_plugin",
                     "plugin stream resolved: plugin_id={} track_id={} quality={} media_type={} url={}",
@@ -1699,6 +1761,7 @@ fn run_plugin_actor(
                     args,
                     reply,
                     started,
+                    started_tx,
                     cancelled,
                     cancel_notify,
                 } => {
@@ -1706,6 +1769,7 @@ fn run_plugin_actor(
                         continue;
                     }
                     started.store(true, Ordering::SeqCst);
+                    let _ = started_tx.send(());
                     if cancelled.load(Ordering::SeqCst) {
                         continue;
                     }
@@ -2142,10 +2206,13 @@ mod tests {
             s_lo.call_raw_with_timeout("lyrics", vec![], Duration::from_millis(140))
         });
 
-        // Wait until `lyrics` is executing, then enqueue a high-priority `track` call with a 40ms timeout
-        // so it strictly times out BEFORE `lyrics` finishes or cancels (`cancelled = true`, `started = false`).
+        // Wait until `lyrics` is executing, then enqueue a high-priority `track` call with an
+        // explicit 40ms `call_timeout_override` (which caps total wait) so it strictly times out
+        // BEFORE `lyrics` finishes or cancels (`cancelled = true`, `started = false`).
         thread::sleep(Duration::from_millis(30));
+        source.set_call_timeout_override(Some(Duration::from_millis(40)));
         let queued_res = source.call_raw_with_timeout("track", vec![], Duration::from_millis(40));
+        source.set_call_timeout_override(None);
         assert!(
             queued_res.is_err(),
             "queued high-priority call should time out"
@@ -2348,6 +2415,154 @@ mod tests {
             source.call_raw("getGen", vec![]).unwrap(),
             serde_json::json!(0),
             "wedged JS loop must trigger worker restart cleanly"
+        );
+
+        source.shutdown();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn queued_call_timeout_begins_at_execution_start_not_enqueue() {
+        let root = std::env::temp_dir().join(format!(
+            "nsh-plugin-queue-start-timeout-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let plugin_dir = root.join("plugin");
+        let data_dir = root.join("data");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::create_dir_all(&data_dir).unwrap();
+
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            r#"{"id":"queue-start-timeout","name":"Queue Start Timeout","version":"0.1.0","main":"index.js"}"#,
+        )
+        .unwrap();
+        fs::write(
+            plugin_dir.join("index.js"),
+            r#"
+            const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+            export async function search() {
+                await sleep(220);
+                return { tracks: [] };
+            }
+            export async function lyrics() {
+                await sleep(30);
+                return { lrc: "queued-ok" };
+            }
+            export async function slowLyrics() {
+                await sleep(220);
+                return { lrc: "too-slow" };
+            }
+            "#,
+        )
+        .unwrap();
+
+        let source = Arc::new(
+            PluginSource::load(&plugin_dir, &data_dir, HostRuntimeOptions::default())
+                .expect("load queue-start-timeout plugin"),
+        );
+
+        // 1. Occupy the worker with a 220ms active `search` call.
+        let s_blocker = Arc::clone(&source);
+        let t_blocker = thread::spawn(move || {
+            s_blocker.call_raw_with_timeout("search", vec![], Duration::from_secs(5))
+        });
+        thread::sleep(Duration::from_millis(35));
+
+        // 2. Enqueue `lyrics` with a 120ms execution timeout (shorter than the remaining ~185ms
+        //    queue wait, but longer than its 30ms execution body). With `call_timeout_override == None`,
+        //    the 120ms timeout must NOT begin until `lyrics` actually starts executing.
+        let t0 = Instant::now();
+        let queued = source
+            .call_raw_with_timeout("lyrics", vec![], Duration::from_millis(120))
+            .expect("queued call must not time out while waiting behind an active call");
+        let elapsed = t0.elapsed();
+        assert_eq!(queued, serde_json::json!({ "lrc": "queued-ok" }));
+        assert!(
+            elapsed >= Duration::from_millis(180),
+            "expected queued call to wait behind blocker (~215ms), elapsed={elapsed:?}"
+        );
+        assert!(t_blocker.join().unwrap().is_ok());
+
+        // 3. A call whose own execution exceeds its timeout MUST still time out cleanly.
+        let slow_err = source
+            .call_raw_with_timeout("slowLyrics", vec![], Duration::from_millis(90))
+            .expect_err("genuinely slow execution must still time out");
+        assert!(slow_err.to_string().contains("in time"), "got {slow_err}");
+
+        source.shutdown();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn recently_exhausted_ytdlp_skips_duplicate_stream_rescue() {
+        let root =
+            std::env::temp_dir().join(format!("nsh-plugin-skip-dup-rescue-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let plugin_dir = root.join("plugin");
+        let data_dir = root.join("data");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::create_dir_all(&data_dir).unwrap();
+
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            r#"{
+                "id":"yt-rescue-dedup",
+                "name":"YT Rescue Dedup",
+                "version":"0.1.0",
+                "main":"index.js",
+                "permissions":{"process":["yt-dlp"]}
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            plugin_dir.join("index.js"),
+            r#"
+            export async function stream() {
+                const err = new Error("yt-dlp failed");
+                err.code = "unavailable";
+                throw err;
+            }
+            "#,
+        )
+        .unwrap();
+
+        let source = PluginSource::load(&plugin_dir, &data_dir, HostRuntimeOptions::default())
+            .expect("load rescue-dedup plugin");
+
+        // Record that `VirtualYtdlpShim` just exhausted all clients for `dQw4w9WgXcQ`.
+        source.host_ctx.record_ytdlp_exhausted("dQw4w9WgXcQ");
+        assert!(
+            source
+                .host_ctx
+                .was_ytdlp_recently_exhausted("dQw4w9WgXcQ", Duration::from_secs(10))
+        );
+        assert!(
+            !source
+                .host_ctx
+                .was_ytdlp_recently_exhausted("otherVid123", Duration::from_secs(10))
+        );
+
+        // `try_youtube_stream_rescue` must short-circuit with `None` immediately (no duplicate cascade).
+        let t0 = Instant::now();
+        let skipped = source.try_youtube_stream_rescue(
+            "dQw4w9WgXcQ",
+            Quality::High,
+            &SourceError::Unavailable("yt-dlp failed".to_owned()),
+        );
+        assert!(skipped.is_none());
+        assert!(
+            t0.elapsed() < Duration::from_millis(200),
+            "duplicate rescue should skip immediately, elapsed={:?}",
+            t0.elapsed()
+        );
+
+        source.host_ctx.clear_ytdlp_exhausted();
+        assert!(
+            !source
+                .host_ctx
+                .was_ytdlp_recently_exhausted("dQw4w9WgXcQ", Duration::from_secs(10))
         );
 
         source.shutdown();
