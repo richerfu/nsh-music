@@ -74,7 +74,13 @@ pub fn root_app_with_store(store: AppStore) -> View {
             }
         })
         .content(move || {
-            main_window_ref.with(|w| *w = Some(current_window()));
+            let win = current_window();
+            main_window_ref.with(|w| *w = Some(win.clone()));
+            effect(move || {
+                if store.main_window_focus_seq.get() > 0 {
+                    win.focus();
+                }
+            });
             shell::device_shell(store)
         });
 

@@ -532,6 +532,7 @@ pub struct AppStore {
     // Settings, locale, theme, modals, toasts
     pub settings: Signal<AppSettings>,
     pub main_window_open: Signal<bool>,
+    pub main_window_focus_seq: Signal<u64>,
     pub settings_window_open: Signal<bool>,
     pub settings_window_focus_seq: Signal<u64>,
     pub settings_section: Signal<SettingsSection>,
@@ -564,6 +565,8 @@ pub struct AppStore {
     pending_open_urls: Stored<PendingOpenUrlsSlot>,
     has_open_url_request: Stored<Arc<AtomicBool>>,
     pending_remote_toggle_favorite: Stored<Arc<AtomicBool>>,
+    pending_remote_raise: Stored<Arc<AtomicBool>>,
+    pending_remote_quit: Stored<Arc<AtomicBool>>,
     signing_in_source_id: Stored<Option<String>>,
     search_suggest_gen: Stored<u64>,
     browse_cache: Stored<HashMap<(String, String), Browse>>,
@@ -800,6 +803,8 @@ impl AppStore {
         }
 
         let pending_remote_toggle_favorite = Arc::new(AtomicBool::new(false));
+        let pending_remote_raise = Arc::new(AtomicBool::new(false));
+        let pending_remote_quit = Arc::new(AtomicBool::new(false));
         {
             let remote = audio.remote_controller();
             crate::platform::install_platform_remote(remote);
@@ -808,10 +813,13 @@ impl AppStore {
                 session.shuffle,
             ));
             let fav_flag = Arc::clone(&pending_remote_toggle_favorite);
-            remote.on_command(Arc::new(move |cmd| {
-                if matches!(cmd, RemoteCommand::ToggleFavorite) {
-                    fav_flag.store(true, Ordering::Release);
-                }
+            let raise_flag = Arc::clone(&pending_remote_raise);
+            let quit_flag = Arc::clone(&pending_remote_quit);
+            remote.on_command(Arc::new(move |cmd| match cmd {
+                RemoteCommand::ToggleFavorite => fav_flag.store(true, Ordering::Release),
+                RemoteCommand::RaiseWindow => raise_flag.store(true, Ordering::Release),
+                RemoteCommand::QuitApp => quit_flag.store(true, Ordering::Release),
+                _ => {}
             }));
         }
 
@@ -931,6 +939,7 @@ impl AppStore {
 
             settings: signal(settings),
             main_window_open: signal(true),
+            main_window_focus_seq: signal(0),
             settings_window_open: signal(false),
             settings_window_focus_seq: signal(0),
             settings_section: signal(SettingsSection::General),
@@ -962,6 +971,8 @@ impl AppStore {
             pending_open_urls: stored(pending_open_urls),
             has_open_url_request: stored(has_open_url_request),
             pending_remote_toggle_favorite: stored(pending_remote_toggle_favorite),
+            pending_remote_raise: stored(pending_remote_raise),
+            pending_remote_quit: stored(pending_remote_quit),
             signing_in_source_id: stored(None),
             search_suggest_gen: stored(0),
             browse_cache: stored(HashMap::new()),
@@ -1248,9 +1259,13 @@ impl AppStore {
         self.settings_window_open.set(false);
     }
 
-    /// Opens (or re-opens) the primary desktop window.
+    /// Opens (or re-opens) the primary desktop window and signals focus.
     pub fn open_main_window(&self) {
-        self.main_window_open.set(true);
+        batch(|| {
+            self.main_window_open.set(true);
+            self.main_window_focus_seq
+                .update(|seq| *seq = seq.saturating_add(1));
+        });
     }
 
     /// Closes the primary desktop window along with the Settings child window.
@@ -5009,6 +5024,25 @@ impl AppStore {
             self.toggle_like_current();
         }
 
+        if self
+            .pending_remote_raise
+            .with(|f| f.swap(false, Ordering::AcqRel))
+        {
+            self.open_main_window();
+        }
+
+        if self
+            .pending_remote_quit
+            .with(|f| f.swap(false, Ordering::AcqRel))
+        {
+            #[cfg(any(
+                target_os = "macos",
+                target_os = "windows",
+                all(target_os = "linux", not(target_env = "ohos"))
+            ))]
+            nsh_core::element::desktop::quit();
+        }
+
         let snap = self.audio.with(|a| a.snapshot());
 
         let snapshot_changed = self.last_snapshot.with(|prev| prev.as_ref() != Some(&snap));
@@ -5441,6 +5475,21 @@ impl AppStore {
         let audio =
             AudioEngine::with_output(audio_cfg, Box::new(nsh_music_audio::NullOutput::new()))
                 .expect("init isolated audio engine");
+        let pending_remote_toggle_favorite = Arc::new(AtomicBool::new(false));
+        let pending_remote_raise = Arc::new(AtomicBool::new(false));
+        let pending_remote_quit = Arc::new(AtomicBool::new(false));
+        {
+            let remote = audio.remote_controller();
+            let fav_flag = Arc::clone(&pending_remote_toggle_favorite);
+            let raise_flag = Arc::clone(&pending_remote_raise);
+            let quit_flag = Arc::clone(&pending_remote_quit);
+            remote.on_command(Arc::new(move |cmd| match cmd {
+                RemoteCommand::ToggleFavorite => fav_flag.store(true, Ordering::Release),
+                RemoteCommand::RaiseWindow => raise_flag.store(true, Ordering::Release),
+                RemoteCommand::QuitApp => quit_flag.store(true, Ordering::Release),
+                _ => {}
+            }));
+        }
         let artwork = ArtworkLoader::new(sandbox.artwork_cache_dir.clone());
 
         Self {
@@ -5528,6 +5577,7 @@ impl AppStore {
 
             settings: signal(settings),
             main_window_open: signal(true),
+            main_window_focus_seq: signal(0),
             settings_window_open: signal(false),
             settings_window_focus_seq: signal(0),
             settings_section: signal(SettingsSection::General),
@@ -5558,7 +5608,9 @@ impl AppStore {
             active_web_sign_in: stored(Arc::new(Mutex::new(None))),
             pending_open_urls: stored(Arc::new(Mutex::new(Vec::new()))),
             has_open_url_request: stored(Arc::new(AtomicBool::new(false))),
-            pending_remote_toggle_favorite: stored(Arc::new(AtomicBool::new(false))),
+            pending_remote_toggle_favorite: stored(pending_remote_toggle_favorite),
+            pending_remote_raise: stored(pending_remote_raise),
+            pending_remote_quit: stored(pending_remote_quit),
             signing_in_source_id: stored(None),
             search_suggest_gen: stored(0),
             browse_cache: stored(HashMap::new()),
@@ -6079,6 +6131,17 @@ mod tests {
         // Re-opening while already open bumps focus_seq so Desktop raises the child window.
         store.open_settings_window(SettingsSection::Plugins);
         assert_eq!(store.settings_window_focus_seq.get_untracked(), 2);
+
+        // Remote RaiseWindow re-opens the main window and bumps main_window_focus_seq.
+        assert_eq!(store.main_window_focus_seq.get_untracked(), 0);
+        store.close_main_window();
+        assert!(!store.main_window_open.get_untracked());
+        store
+            .audio
+            .with(|a| a.remote_controller().dispatch(RemoteCommand::RaiseWindow));
+        store.sync_from_audio_engine();
+        assert!(store.main_window_open.get_untracked());
+        assert_eq!(store.main_window_focus_seq.get_untracked(), 1);
 
         store.audio.with(|a| a.shutdown());
         let _ = std::fs::remove_dir_all(&root);

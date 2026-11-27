@@ -1,13 +1,10 @@
-//! Native Apple (`macOS` / `iOS`) media control driver backed by
-//! `MediaPlayer.framework` (`MPNowPlayingInfoCenter` + `MPRemoteCommandCenter`).
+//! Shared Apple `MediaPlayer.framework` engine (`MPNowPlayingInfoCenter` +
+//! `MPRemoteCommandCenter`) used by `platforms/macos/mod.rs` and
+//! `platforms/ios/mod.rs`.
 //!
-//! - Dispatches all MediaPlayer mutations onto `DispatchQueue::main()` with
-//!   coalesced state updates so high-frequency playback ticks never queue up.
-//! - Loads local/cached artwork bytes off-thread before constructing
-//!   `NSImage` (macOS) / `UIImage` (iOS) + `MPMediaItemArtwork` on the main queue.
-//! - Checks `NSApp.is_null()` on macOS so headless `cargo test` runs never
-//!   touch AppKit, `DispatchQueue::main()`, or `MediaPlayer`.
-//! - Activates `AVAudioSession` playback category on iOS when playback begins.
+//! Platform-specific behavior (`NSImage` vs `UIImage`, macOS `NSApp` headless
+//! guard & `setPlaybackState:`, iOS `AVAudioSession` playback category &
+//! interruption/AirPods route-change observers) is provided by [`ApplePlatform`].
 
 #![cfg(any(target_os = "macos", target_os = "ios"))]
 
@@ -15,31 +12,32 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use block2::RcBlock;
 use dispatch2::DispatchQueue;
-use objc2::AnyThread;
 use objc2::msg_send;
 use objc2::rc::{Allocated, Retained};
 use objc2::runtime::{AnyClass, AnyObject, Bool};
-#[cfg(target_os = "macos")]
-use objc2_app_kit::NSImage;
 use objc2_core_foundation::CGSize;
-use objc2_foundation::{NSData, NSMutableDictionary, NSNumber, NSString};
-#[cfg(target_os = "ios")]
-use objc2_ui_kit::UIImage;
+use objc2_foundation::{NSMutableDictionary, NSNumber, NSString};
 
 use nsh_music_audio::{
     NowPlayingMetadata, PlatformRemoteDriver, RemoteBackend, RemoteCommand, RemoteController,
     RemotePlaybackStatus,
 };
 
-use super::{
-    apple_loop_from_repeat, apple_loop_from_shuffle, apple_playback_rate, apple_playback_state,
-    apple_repeat_shuffle_from_loop, artwork_local_path,
+use crate::{
+    apple_loop_from_repeat, apple_loop_from_shuffle, apple_playback_rate,
+    apple_repeat_shuffle_from_loop, artwork_http_url, artwork_local_path,
 };
 
-/// Maximum local artwork file size read into memory for OS Now Playing surfaces (16 MiB).
+#[cfg(target_os = "ios")]
+use crate::ios::IosPlatform as ActivePlatform;
+#[cfg(target_os = "macos")]
+use crate::macos::MacOsPlatform as ActivePlatform;
+
+/// Maximum local or HTTP artwork size read into memory for OS Now Playing surfaces (16 MiB).
 const MAX_ARTWORK_BYTES: u64 = 16 * 1024 * 1024;
 
 static NEXT_DRIVER_ID: AtomicU64 = AtomicU64::new(1);
@@ -56,29 +54,40 @@ unsafe extern "C" {
     static MPNowPlayingInfoPropertyDefaultPlaybackRate: *const NSString;
 }
 
-#[cfg(target_os = "macos")]
-#[link(name = "AppKit", kind = "framework")]
-unsafe extern "C" {
-    static NSApp: *const AnyObject;
+/// Platform hooks differentiating macOS (`AppKit`) and iOS (`UIKit` / `AVFAudio`).
+pub(crate) trait ApplePlatform: 'static {
+    type SessionState;
+
+    fn backend() -> RemoteBackend;
+    fn is_gui_active() -> bool;
+    fn build_media_item_artwork(bytes: &[u8]) -> Option<Retained<AnyObject>>;
+    fn apply_playback_state(_center: &AnyObject, _status: RemotePlaybackStatus) {}
+    fn clear_playback_state(_center: &AnyObject) {}
+    fn create_session_state(remote: &RemoteController) -> Self::SessionState;
+    fn on_playing(_state: &mut Self::SessionState) {}
+    fn teardown_session_state(_state: Self::SessionState) {}
 }
 
-#[cfg(target_os = "ios")]
-#[link(name = "AVFAudio", kind = "framework")]
-unsafe extern "C" {}
-
-#[cfg(target_os = "ios")]
-#[link(name = "UIKit", kind = "framework")]
-unsafe extern "C" {}
-
-fn is_gui_active() -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        // SAFETY: `NSApp` is AppKit's global `NSApplication *` pointer (null in headless tests).
-        !unsafe { NSApp }.is_null()
-    }
-    #[cfg(target_os = "ios")]
-    {
-        AnyClass::get(c"MPNowPlayingInfoCenter").is_some()
+/// Wraps a decoded `NSImage` or `UIImage` into an `MPMediaItemArtwork` instance.
+pub(crate) fn wrap_media_item_artwork<Img>(
+    img: Retained<Img>,
+    size: CGSize,
+) -> Option<Retained<AnyObject>>
+where
+    Img: objc2::Message + 'static,
+{
+    let artwork_cls = AnyClass::get(c"MPMediaItemArtwork")?;
+    let bounds = if size.width > 0.0 && size.height > 0.0 {
+        size
+    } else {
+        CGSize::new(512.0, 512.0)
+    };
+    let handler = RcBlock::new(move |_requested: CGSize| -> *mut AnyObject {
+        Retained::autorelease_return(img.clone()).cast::<AnyObject>()
+    });
+    unsafe {
+        let alloc: Allocated<AnyObject> = msg_send![artwork_cls, alloc];
+        msg_send![alloc, initWithBoundsSize: bounds, requestHandler: &*handler]
     }
 }
 
@@ -125,7 +134,20 @@ impl Drop for ScheduleResetGuard {
     }
 }
 
-/// Native macOS / iOS implementation of [`PlatformRemoteDriver`].
+enum ArtworkSource {
+    Local(PathBuf),
+    Http(String),
+}
+
+fn resolve_artwork_source(artwork_url: &str) -> Option<ArtworkSource> {
+    if let Some(path) = artwork_local_path(artwork_url) {
+        Some(ArtworkSource::Local(path))
+    } else {
+        artwork_http_url(artwork_url).map(|url| ArtworkSource::Http(url.to_owned()))
+    }
+}
+
+/// Shared Apple (`MediaPlayer.framework`) implementation of [`PlatformRemoteDriver`].
 pub(crate) struct AppleNowPlayingDriver {
     shared: Arc<SharedState>,
 }
@@ -146,10 +168,10 @@ impl AppleNowPlayingDriver {
     }
 
     fn maybe_load_artwork(&self, artwork_url: &str) {
-        if !is_gui_active() {
+        if !ActivePlatform::is_gui_active() {
             return;
         }
-        let Some(local_path) = artwork_local_path(artwork_url) else {
+        let Some(source) = resolve_artwork_source(artwork_url) else {
             return;
         };
         let key = artwork_url.to_owned();
@@ -174,7 +196,7 @@ impl AppleNowPlayingDriver {
         let shared = Arc::clone(&self.shared);
         let _ = std::thread::Builder::new()
             .name("nsh-apple-artwork".into())
-            .spawn(move || load_artwork_bytes_off_thread(shared, key, local_path));
+            .spawn(move || load_artwork_bytes_off_thread(shared, key, source));
     }
 
     fn schedule_flush(&self) {
@@ -183,7 +205,7 @@ impl AppleNowPlayingDriver {
 }
 
 fn schedule_flush_shared(shared: &Arc<SharedState>) {
-    if !is_gui_active() {
+    if !ActivePlatform::is_gui_active() {
         return;
     }
     if shared.scheduled.swap(true, Ordering::AcqRel) {
@@ -197,11 +219,44 @@ fn schedule_flush_shared(shared: &Arc<SharedState>) {
     });
 }
 
-fn load_artwork_bytes_off_thread(shared: Arc<SharedState>, key: String, path: PathBuf) {
-    let bytes = std::fs::metadata(&path)
-        .ok()
-        .filter(|m| m.is_file() && m.len() > 0 && m.len() <= MAX_ARTWORK_BYTES)
-        .and_then(|_| std::fs::read(&path).ok());
+fn fetch_http_artwork_bytes(url: &str) -> Option<Vec<u8>> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    rt.block_on(async {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(8))
+            .build()
+            .ok()?;
+        let mut resp = client.get(url).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        if let Some(len) = resp.content_length()
+            && len > MAX_ARTWORK_BYTES
+        {
+            return None;
+        }
+        let mut buf = Vec::new();
+        while let Some(chunk) = resp.chunk().await.ok()? {
+            if (buf.len() as u64).saturating_add(chunk.len() as u64) > MAX_ARTWORK_BYTES {
+                return None;
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        (!buf.is_empty()).then_some(buf)
+    })
+}
+
+fn load_artwork_bytes_off_thread(shared: Arc<SharedState>, key: String, source: ArtworkSource) {
+    let bytes = match source {
+        ArtworkSource::Local(path) => std::fs::metadata(&path)
+            .ok()
+            .filter(|m| m.is_file() && m.len() > 0 && m.len() <= MAX_ARTWORK_BYTES)
+            .and_then(|_| std::fs::read(&path).ok()),
+        ArtworkSource::Http(url) => fetch_http_artwork_bytes(&url),
+    };
 
     let should_flush = {
         let Ok(mut pending) = shared.pending.lock() else {
@@ -213,9 +268,17 @@ fn load_artwork_bytes_off_thread(shared: Arc<SharedState>, key: String, path: Pa
         if !pending.alive {
             false
         } else if let Some(data) = bytes {
-            pending.artwork_key = Some(key);
-            pending.artwork_bytes = Some(Arc::new(data));
-            true
+            let still_current = pending
+                .metadata
+                .as_ref()
+                .is_some_and(|m| m.artwork_url == key);
+            if still_current {
+                pending.artwork_key = Some(key);
+                pending.artwork_bytes = Some(Arc::new(data));
+                true
+            } else {
+                false
+            }
         } else {
             false
         }
@@ -227,20 +290,13 @@ fn load_artwork_bytes_off_thread(shared: Arc<SharedState>, key: String, path: Pa
 
 impl PlatformRemoteDriver for AppleNowPlayingDriver {
     fn backend(&self) -> RemoteBackend {
-        #[cfg(target_os = "macos")]
-        {
-            RemoteBackend::MacOsNowPlaying
-        }
-        #[cfg(target_os = "ios")]
-        {
-            RemoteBackend::IosControlCenter
-        }
+        ActivePlatform::backend()
     }
 
     fn update_metadata(&self, meta: &NowPlayingMetadata) {
         if let Ok(mut pending) = self.shared.pending.lock() {
             if pending.artwork_key.as_deref() != Some(meta.artwork_url.as_str())
-                && artwork_local_path(&meta.artwork_url).is_none()
+                && resolve_artwork_source(&meta.artwork_url).is_none()
             {
                 pending.artwork_key = None;
                 pending.artwork_bytes = None;
@@ -304,7 +360,7 @@ impl Drop for AppleNowPlayingDriver {
             pending.artwork_bytes = None;
             pending.artwork_loading_key = None;
         }
-        if is_gui_active() {
+        if ActivePlatform::is_gui_active() {
             let driver_id = self.shared.driver_id;
             DispatchQueue::main().exec_async(move || {
                 teardown_session_on_main_thread(Some(driver_id));
@@ -316,10 +372,9 @@ impl Drop for AppleNowPlayingDriver {
 struct MainThreadSession {
     driver_id: u64,
     targets: Vec<(Retained<AnyObject>, Retained<AnyObject>)>,
+    platform_state: <ActivePlatform as ApplePlatform>::SessionState,
     cached_artwork_key: Option<String>,
     cached_artwork: Option<Retained<AnyObject>>,
-    #[cfg(target_os = "ios")]
-    audio_session_activated: bool,
 }
 
 thread_local! {
@@ -358,13 +413,10 @@ fn flush_on_main_thread(shared: Arc<SharedState>) {
 
     ensure_session_registered(shared.driver_id, &shared.remote);
 
-    #[cfg(target_os = "ios")]
     if meta.status.is_playing() {
         MAIN_SESSION.with(|cell| {
-            if let Some(sess) = cell.borrow_mut().as_mut()
-                && !sess.audio_session_activated
-            {
-                sess.audio_session_activated = activate_ios_audio_session();
+            if let Some(sess) = cell.borrow_mut().as_mut() {
+                ActivePlatform::on_playing(&mut sess.platform_state);
             }
         });
     }
@@ -375,7 +427,7 @@ fn flush_on_main_thread(shared: Arc<SharedState>) {
         match art_data {
             Some((key, bytes)) => {
                 if sess.cached_artwork_key.as_deref() != Some(key.as_str()) {
-                    sess.cached_artwork = build_media_item_artwork(&bytes);
+                    sess.cached_artwork = ActivePlatform::build_media_item_artwork(&bytes);
                     sess.cached_artwork_key = Some(key);
                 }
                 sess.cached_artwork.clone()
@@ -532,14 +584,15 @@ fn ensure_session_registered(driver_id: u64, remote: &RemoteController) {
         }
     }
 
+    let platform_state = ActivePlatform::create_session_state(remote);
+
     MAIN_SESSION.with(|cell| {
         *cell.borrow_mut() = Some(MainThreadSession {
             driver_id,
             targets,
+            platform_state,
             cached_artwork_key: None,
             cached_artwork: None,
-            #[cfg(target_os = "ios")]
-            audio_session_activated: false,
         });
     });
 }
@@ -682,42 +735,7 @@ fn update_now_playing_info_center(meta: &NowPlayingMetadata, artwork: Option<&An
         }
 
         let _: () = msg_send![&center, setNowPlayingInfo: &*dict];
-        let state = apple_playback_state(meta.status);
-        let _: () = msg_send![&center, setPlaybackState: state];
-    }
-}
-
-fn build_media_item_artwork(bytes: &[u8]) -> Option<Retained<AnyObject>> {
-    let artwork_cls = AnyClass::get(c"MPMediaItemArtwork")?;
-    let data = NSData::with_bytes(bytes);
-
-    #[cfg(target_os = "macos")]
-    let (img, size) = {
-        let img = NSImage::initWithData(NSImage::alloc(), &data)?;
-        let sz = img.size();
-        (img, CGSize::new(sz.width, sz.height))
-    };
-
-    #[cfg(target_os = "ios")]
-    let (img, size) = {
-        let img = UIImage::initWithData(UIImage::alloc(), &data)?;
-        let sz = unsafe { img.size() };
-        (img, sz)
-    };
-
-    let bounds = if size.width > 0.0 && size.height > 0.0 {
-        size
-    } else {
-        CGSize::new(512.0, 512.0)
-    };
-
-    let handler = RcBlock::new(move |_requested: CGSize| -> *mut AnyObject {
-        Retained::autorelease_return(img.clone()).cast::<AnyObject>()
-    });
-
-    unsafe {
-        let alloc: Allocated<AnyObject> = msg_send![artwork_cls, alloc];
-        msg_send![alloc, initWithBoundsSize: bounds, requestHandler: &*handler]
+        ActivePlatform::apply_playback_state(&center, meta.status);
     }
 }
 
@@ -739,6 +757,7 @@ fn teardown_session_on_main_thread(expected_driver_id: Option<u64>) {
                 let _: () = msg_send![&cmd, setEnabled: Bool::NO];
             }
         }
+        ActivePlatform::teardown_session_state(sess.platform_state);
     }
 
     if let Some(center_cls) = AnyClass::get(c"MPNowPlayingInfoCenter") {
@@ -746,33 +765,8 @@ fn teardown_session_on_main_thread(expected_driver_id: Option<u64>) {
             let center: Option<Retained<AnyObject>> = msg_send![center_cls, defaultCenter];
             if let Some(center) = center {
                 let _: () = msg_send![&center, setNowPlayingInfo: std::ptr::null::<AnyObject>()];
-                let _: () = msg_send![&center, setPlaybackState: 3usize]; // Stopped
+                ActivePlatform::clear_playback_state(&center);
             }
         }
-    }
-}
-
-#[cfg(target_os = "ios")]
-fn activate_ios_audio_session() -> bool {
-    let Some(cls) = AnyClass::get(c"AVAudioSession") else {
-        return false;
-    };
-    unsafe {
-        let session: Option<Retained<AnyObject>> = msg_send![cls, sharedInstance];
-        let Some(session) = session else {
-            return false;
-        };
-        let category = NSString::from_str("AVAudioSessionCategoryPlayback");
-        let mut cat_err: *mut AnyObject = std::ptr::null_mut();
-        let ok_cat: Bool = msg_send![&session, setCategory: &*category, error: &mut cat_err];
-        if !ok_cat.as_bool() {
-            log::warn!("[remote:ios] AVAudioSession setCategory playback failed");
-        }
-        let mut act_err: *mut AnyObject = std::ptr::null_mut();
-        let ok_act: Bool = msg_send![&session, setActive: Bool::YES, error: &mut act_err];
-        if !ok_act.as_bool() {
-            log::warn!("[remote:ios] AVAudioSession setActive failed");
-        }
-        ok_act.as_bool()
     }
 }

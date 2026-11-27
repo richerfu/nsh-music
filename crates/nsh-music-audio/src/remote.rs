@@ -147,6 +147,8 @@ pub enum RemoteCommand {
     SetVolume(u8),
     ToggleFavorite,
     SetLoopMode(RemoteLoopMode),
+    RaiseWindow,
+    QuitApp,
 }
 
 /// Now-Playing metadata pushed to the OS media control surface.
@@ -909,7 +911,7 @@ mod tests {
         assert_eq!(driver2.metadata_calls.lock().unwrap().len(), 1);
         assert_eq!(driver2.playback_detail_calls.lock().unwrap().len(), 1);
 
-        // Command dispatch for ToggleFavorite and SetLoopMode.
+        // Command dispatch for ToggleFavorite, SetLoopMode, RaiseWindow, and QuitApp.
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen_cb = Arc::clone(&seen);
         remote.on_command(Arc::new(move |cmd| {
@@ -918,11 +920,15 @@ mod tests {
         let mut rx = remote.subscribe();
         remote.dispatch(RemoteCommand::ToggleFavorite);
         remote.dispatch(RemoteCommand::SetLoopMode(RemoteLoopMode::Shuffle));
+        remote.dispatch(RemoteCommand::RaiseWindow);
+        remote.dispatch(RemoteCommand::QuitApp);
         assert_eq!(
             *seen.lock().unwrap(),
             vec![
                 RemoteCommand::ToggleFavorite,
-                RemoteCommand::SetLoopMode(RemoteLoopMode::Shuffle)
+                RemoteCommand::SetLoopMode(RemoteLoopMode::Shuffle),
+                RemoteCommand::RaiseWindow,
+                RemoteCommand::QuitApp,
             ]
         );
         assert_eq!(rx.try_recv().unwrap(), RemoteCommand::ToggleFavorite);
@@ -930,5 +936,7 @@ mod tests {
             rx.try_recv().unwrap(),
             RemoteCommand::SetLoopMode(RemoteLoopMode::Shuffle)
         );
+        assert_eq!(rx.try_recv().unwrap(), RemoteCommand::RaiseWindow);
+        assert_eq!(rx.try_recv().unwrap(), RemoteCommand::QuitApp);
     }
 }

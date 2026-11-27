@@ -362,60 +362,184 @@ pub fn install_desktop_menu_and_tray(store: AppStore, show_main: std::rc::Rc<dyn
         set_application_menu(items);
     });
 
-    // Native system tray icon & menu reactive to current track, play state, and locale.
+    // Native system tray / macOS menu-bar player controller reactive to track,
+    // lyric line changes, play/like/shuffle/repeat states, and locale.
     let tray_icon_src = resolve_tray_icon_src();
-    let tray_track = computed(move || {
+    let tray_track_meta = computed(move || {
         store.current_track.with(|t| {
             t.as_ref().map(|tr| {
-                let artists = tr.artist_names();
-                if artists.is_empty() {
-                    tr.name.clone()
-                } else {
-                    format!("{} — {}", tr.name, artists)
-                }
+                let liked = store.is_liked(&tr.id);
+                (tr.name.clone(), tr.artist_names(), liked)
             })
         })
+    });
+    let tray_has_queue = computed(move || !store.queue.with(Vec::is_empty));
+    let tray_active_lyric = computed(move || {
+        let line_idx = store
+            .active_lyric
+            .with(|a| a.as_ref().map(|l| l.line_index));
+        let idx = line_idx?;
+        store.lyrics.with(|doc| {
+            doc.lines
+                .get(idx)
+                .map(|l| l.text.trim().to_owned())
+                .filter(|s| !s.is_empty())
+        })
+    });
+    #[cfg(target_os = "macos")]
+    let tray_bar_title = computed(move || {
+        if !store.is_playing.get() {
+            return String::new();
+        }
+        if let Some(lyric) = tray_active_lyric.get() {
+            return truncate_status_title(&lyric, 18);
+        }
+        tray_track_meta
+            .get()
+            .map(|(name, _, _)| truncate_status_title(&name, 18))
+            .unwrap_or_default()
     });
 
     effect(move || {
         let _locale = store.locale.get();
         let playing = store.is_playing.get();
-        let tooltip = tray_track
-            .get()
+        let shuffle_on = store.shuffle.get();
+        let repeat_mode = store.repeat.get();
+        let track_meta = tray_track_meta.get();
+        let has_track = track_meta.is_some();
+        let has_queue = tray_has_queue.get();
+        let can_transport = has_track || has_queue;
+        let is_liked = track_meta.as_ref().is_some_and(|(_, _, liked)| *liked);
+        let lyric_line = tray_active_lyric.get();
+
+        let track_summary = track_meta.as_ref().map(|(name, artists, _)| {
+            if artists.is_empty() {
+                name.clone()
+            } else {
+                format!("{name} — {artists}")
+            }
+        });
+        let tooltip = track_summary
+            .clone()
             .unwrap_or_else(|| store.t("app.name").to_string());
         let play_label = if playing {
             store.t("player.pause").to_string()
         } else {
             store.t("player.play").to_string()
         };
-        let show_main_click = show_main.clone();
-        let show_main_menu = show_main.clone();
+        let like_label = if is_liked {
+            store.t("player.unlike").to_string()
+        } else {
+            store.t("player.like").to_string()
+        };
+        let repeat_label = match repeat_mode {
+            RepeatMode::Off => store.t("player.repeat_off").to_string(),
+            RepeatMode::All => store.t("player.repeat_all").to_string(),
+            RepeatMode::One => store.t("player.repeat_one").to_string(),
+        };
 
-        set_tray(
-            tray()
-                .icon(tray_icon_src.clone())
-                .tooltip(tooltip)
-                .on_click(move |_| {
-                    show_main_click();
-                })
-                .menu([
-                    MenuItem::new(play_label).on_select(move || store.toggle_play()),
-                    MenuItem::new(store.t("player.prev").to_string())
-                        .on_select(move || store.prev_track()),
-                    MenuItem::new(store.t("player.next").to_string())
-                        .on_select(move || store.next_track()),
-                    MenuItem::separator(),
-                    MenuItem::new(store.t("tray.show_window").to_string()).on_select(move || {
-                        show_main_menu();
+        let mut menu_items = Vec::with_capacity(14);
+        if let Some(summary) = track_summary {
+            let prefix = if playing { "▶" } else { "⏸" };
+            let show_main_track = show_main.clone();
+            menu_items.push(
+                MenuItem::new(format!("{prefix} {}", truncate_status_title(&summary, 42)))
+                    .on_select(move || {
+                        show_main_track();
+                        store.open_now_playing();
                     }),
-                    MenuItem::new(store.t("menu.settings").to_string()).on_select(move || {
-                        store.open_settings_window(SettingsSection::General);
-                    }),
-                    MenuItem::separator(),
-                    MenuItem::new(store.t("menu.quit").to_string()).on_select(quit),
-                ]),
-        );
+            );
+        } else {
+            menu_items.push(MenuItem::new(store.t("app.name").to_string()).disabled(true));
+        }
+
+        if let Some(lyric) = lyric_line {
+            let show_main_lyric = show_main.clone();
+            menu_items.push(
+                MenuItem::new(format!("♪ {}", truncate_status_title(&lyric, 40))).on_select(
+                    move || {
+                        show_main_lyric();
+                        store.set_now_playing_panel(NowPlayingPanel::Lyrics);
+                        store.open_now_playing();
+                    },
+                ),
+            );
+        }
+
+        let show_main_menu = show_main.clone();
+        menu_items.extend([
+            MenuItem::separator(),
+            MenuItem::new(play_label)
+                .disabled(!can_transport)
+                .on_select(move || store.toggle_play()),
+            MenuItem::new(store.t("player.prev").to_string())
+                .disabled(!can_transport)
+                .on_select(move || store.prev_track()),
+            MenuItem::new(store.t("player.next").to_string())
+                .disabled(!can_transport)
+                .on_select(move || store.next_track()),
+            MenuItem::separator(),
+            MenuItem::new(like_label)
+                .checked(is_liked)
+                .disabled(!has_track)
+                .on_select(move || store.toggle_like_current()),
+            MenuItem::new(store.t("player.shuffle").to_string())
+                .checked(shuffle_on)
+                .on_select(move || store.toggle_shuffle()),
+            MenuItem::new(repeat_label)
+                .checked(repeat_mode != RepeatMode::Off)
+                .on_select(move || store.cycle_repeat()),
+            MenuItem::separator(),
+            MenuItem::new(store.t("tray.show_window").to_string()).on_select(move || {
+                show_main_menu();
+            }),
+            MenuItem::new(store.t("menu.settings").to_string()).on_select(move || {
+                store.open_settings_window(SettingsSection::General);
+            }),
+            MenuItem::separator(),
+            MenuItem::new(store.t("menu.quit").to_string()).on_select(quit),
+        ]);
+
+        let tray_builder = tray()
+            .icon(tray_icon_src.clone())
+            .tooltip(tooltip)
+            .menu(menu_items);
+
+        #[cfg(target_os = "macos")]
+        let tray_builder = {
+            use nsh_core::desktop::TrayTitleRun;
+            let bar_title = tray_bar_title.get();
+            if bar_title.is_empty() {
+                tray_builder
+            } else {
+                tray_builder.title([TrayTitleRun::new(bar_title)])
+            }
+        };
+
+        #[cfg(not(target_os = "macos"))]
+        let tray_builder = {
+            let show_main_click = show_main.clone();
+            tray_builder.on_click(move |_| {
+                show_main_click();
+            })
+        };
+
+        set_tray(tray_builder);
     });
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "windows",
+    all(target_os = "linux", not(target_env = "ohos"))
+))]
+fn truncate_status_title(raw: &str, max_chars: usize) -> String {
+    let trimmed = raw.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_owned();
+    }
+    let shortened: String = trimmed.chars().take(max_chars.saturating_sub(1)).collect();
+    format!("{shortened}…")
 }
 
 #[cfg(not(any(

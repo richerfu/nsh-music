@@ -30,7 +30,7 @@ use windows::Storage::Streams::RandomAccessStreamReference;
 use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize};
 use windows_core::{HSTRING, Ref};
 
-use super::{
+use crate::{
     artwork_local_path, hns_to_ms, ms_to_hns, smtc_loop_from_repeat, smtc_loop_from_shuffle,
     smtc_playback_status, smtc_repeat_shuffle,
 };
@@ -120,6 +120,7 @@ impl PlatformRemoteDriver for WindowsSmtcDriver {
                     || prev.artist != meta.artist
                     || prev.album != meta.album
                     || prev.artwork_url != meta.artwork_url
+                    || prev.duration_ms != meta.duration_ms
                     || prev.can_next != meta.can_next
                     || prev.can_prev != meta.can_prev
             });

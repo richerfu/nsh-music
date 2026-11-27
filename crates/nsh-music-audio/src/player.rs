@@ -543,7 +543,9 @@ impl AudioEngine {
                     engine.set_repeat(repeat);
                     engine.set_shuffle(shuffle);
                 }
-                RemoteCommand::ToggleFavorite => {
+                RemoteCommand::ToggleFavorite
+                | RemoteCommand::RaiseWindow
+                | RemoteCommand::QuitApp => {
                     // Handled by AppStore remote command listener.
                 }
             }

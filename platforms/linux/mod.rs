@@ -18,9 +18,9 @@ use nsh_music_audio::{
     RemoteLoopMode, RemotePlaybackStatus,
 };
 
-use super::{
+use crate::{
     mpris_art_url, mpris_loop_and_shuffle, mpris_loop_from_status, mpris_playback_status,
-    mpris_track_object_path, ms_to_us, us_to_ms,
+    mpris_track_object_path, mpris_volume_to_percent, ms_to_us, us_to_ms,
 };
 
 const G_BUS_TYPE_SESSION: c_int = 2;
@@ -160,6 +160,7 @@ struct GioMprisApi {
     g_variant_builder_unref: unsafe extern "C" fn(*mut c_void),
     g_variant_get_string: unsafe extern "C" fn(*mut c_void, *mut usize) -> *const c_char,
     g_variant_get_int64: unsafe extern "C" fn(*mut c_void) -> i64,
+    g_variant_get_double: unsafe extern "C" fn(*mut c_void) -> f64,
     g_variant_get_boolean: unsafe extern "C" fn(*mut c_void) -> c_int,
     g_variant_get_child_value: unsafe extern "C" fn(*mut c_void, usize) -> *mut c_void,
     g_variant_n_children: unsafe extern "C" fn(*mut c_void) -> usize,
@@ -268,6 +269,7 @@ fn api() -> Option<&'static GioMprisApi> {
             g_variant_builder_unref: load_sym(glib, c"g_variant_builder_unref")?,
             g_variant_get_string: load_sym(glib, c"g_variant_get_string")?,
             g_variant_get_int64: load_sym(glib, c"g_variant_get_int64")?,
+            g_variant_get_double: load_sym(glib, c"g_variant_get_double")?,
             g_variant_get_boolean: load_sym(glib, c"g_variant_get_boolean")?,
             g_variant_get_child_value: load_sym(glib, c"g_variant_get_child_value")?,
             g_variant_n_children: load_sym(glib, c"g_variant_n_children")?,
@@ -301,6 +303,7 @@ struct MprisState {
     meta: NowPlayingMetadata,
     updated_at: Instant,
     has_track: bool,
+    volume: f64,
     last_track_id: String,
     last_position_ms: u64,
     last_position_at: Instant,
@@ -313,6 +316,7 @@ impl Default for MprisState {
             meta: NowPlayingMetadata::default(),
             updated_at: now,
             has_track: false,
+            volume: 1.0,
             last_track_id: String::new(),
             last_position_ms: 0,
             last_position_at: now,
@@ -673,14 +677,26 @@ unsafe extern "C" fn on_root_method_call(
     _sender: *const c_char,
     _path: *const c_char,
     _iface: *const c_char,
-    _method: *const c_char,
+    method_name: *const c_char,
     _params: *mut c_void,
     invocation: *mut c_void,
-    _user_data: *mut c_void,
+    user_data: *mut c_void,
 ) {
-    if let Some(a) = api() {
-        unsafe { (a.g_dbus_method_invocation_return_value)(invocation, std::ptr::null_mut()) };
+    let Some(a) = api() else {
+        return;
+    };
+    if !method_name.is_null() && !user_data.is_null() {
+        let method = unsafe { CStr::from_ptr(method_name) }
+            .to_str()
+            .unwrap_or("");
+        let shared = unsafe { &*(user_data as *const MprisShared) };
+        match method {
+            "Raise" => shared.remote.dispatch(RemoteCommand::RaiseWindow),
+            "Quit" => shared.remote.dispatch(RemoteCommand::QuitApp),
+            _ => {}
+        }
     }
+    unsafe { (a.g_dbus_method_invocation_return_value)(invocation, std::ptr::null_mut()) };
 }
 
 unsafe extern "C" fn on_root_get_property(
@@ -703,7 +719,8 @@ unsafe extern "C" fn on_root_get_property(
         .unwrap_or("");
     let var = unsafe {
         match prop {
-            "CanQuit" | "CanRaise" | "HasTrackList" => (a.g_variant_new_boolean)(0),
+            "CanQuit" | "CanRaise" => (a.g_variant_new_boolean)(1),
+            "HasTrackList" => (a.g_variant_new_boolean)(0),
             "Identity" => (a.g_variant_new_string)(c"NSH Music".as_ptr()),
             "DesktopEntry" => (a.g_variant_new_string)(c"nsh-music".as_ptr()),
             "SupportedUriSchemes" | "SupportedMimeTypes" => {
@@ -785,7 +802,7 @@ unsafe extern "C" fn on_player_get_property(
         .to_str()
         .unwrap_or("");
     let shared = unsafe { &*(user_data as *const MprisShared) };
-    let (meta, has_track, interpolated_pos_ms) = {
+    let (meta, has_track, interpolated_pos_ms, volume) = {
         let Ok(st) = shared.state.lock() else {
             return std::ptr::null_mut();
         };
@@ -802,7 +819,7 @@ unsafe extern "C" fn on_player_get_property(
         } else {
             pos
         };
-        (st.meta.clone(), st.has_track, clamped)
+        (st.meta.clone(), st.has_track, clamped, st.volume)
     };
 
     let var = unsafe {
@@ -823,7 +840,8 @@ unsafe extern "C" fn on_player_get_property(
                 let (_, shuffle) = mpris_loop_and_shuffle(meta.loop_mode);
                 (a.g_variant_new_boolean)(i32::from(shuffle))
             }
-            "Rate" | "MinimumRate" | "MaximumRate" | "Volume" => (a.g_variant_new_double)(1.0),
+            "Rate" | "MinimumRate" | "MaximumRate" => (a.g_variant_new_double)(1.0),
+            "Volume" => (a.g_variant_new_double)(volume),
             "Position" => (a.g_variant_new_int64)(if has_track {
                 ms_to_us(interpolated_pos_ms)
             } else {
@@ -841,7 +859,7 @@ unsafe extern "C" fn on_player_get_property(
 }
 
 unsafe extern "C" fn on_player_set_property(
-    _conn: *mut c_void,
+    conn: *mut c_void,
     _sender: *const c_char,
     _path: *const c_char,
     _iface: *const c_char,
@@ -886,6 +904,21 @@ unsafe extern "C" fn on_player_set_property(
             };
             shared.remote.dispatch(RemoteCommand::SetLoopMode(next));
             1
+        }
+        "Volume" => {
+            let raw = unsafe { (a.g_variant_get_double)(value) };
+            if let Some((clamped, pct)) = mpris_volume_to_percent(raw) {
+                if let Ok(mut st) = shared.state.lock() {
+                    st.volume = clamped;
+                }
+                shared.remote.dispatch(RemoteCommand::SetVolume(pct));
+                if !conn.is_null() {
+                    unsafe { emit_volume_changed(a, conn, clamped) };
+                }
+                1
+            } else {
+                0
+            }
         }
         _ => 1,
     }
@@ -1023,6 +1056,36 @@ unsafe fn emit_properties_changed(
             );
         }
 
+        let changed_dict = (a.g_variant_builder_end)(builder);
+        (a.g_variant_builder_unref)(builder);
+
+        let iface_var = (a.g_variant_new_string)(MPRIS_PLAYER_IFACE.as_ptr());
+        let invalidated = (a.g_variant_new_strv)(std::ptr::null(), 0);
+        let children = [iface_var, changed_dict, invalidated];
+        let params = (a.g_variant_new_tuple)(children.as_ptr(), children.len());
+
+        let mut err: *mut c_void = std::ptr::null_mut();
+        (a.g_dbus_connection_emit_signal)(
+            conn,
+            std::ptr::null(),
+            MPRIS_OBJECT_PATH.as_ptr(),
+            DBUS_PROPS_IFACE.as_ptr(),
+            c"PropertiesChanged".as_ptr(),
+            params,
+            &mut err,
+        );
+        if !err.is_null() {
+            (a.g_error_free)(err);
+        }
+    }
+}
+
+unsafe fn emit_volume_changed(a: &'static GioMprisApi, conn: *mut c_void, volume: f64) {
+    unsafe {
+        let dict_ty = (a.g_variant_type_new)(c"a{sv}".as_ptr());
+        let builder = (a.g_variant_builder_new)(dict_ty);
+        (a.g_variant_type_free)(dict_ty);
+        add_dict_entry(a, builder, c"Volume", (a.g_variant_new_double)(volume));
         let changed_dict = (a.g_variant_builder_end)(builder);
         (a.g_variant_builder_unref)(builder);
 

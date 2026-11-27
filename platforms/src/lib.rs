@@ -1,19 +1,39 @@
-//! Platform-specific native integrations (media session / notification bar controls).
+//! Per-platform native media session and OS integration drivers for `nsh-music`.
+//!
+//! Each target platform lives in its own directory under `platforms/<os>/`:
+//! - `android/` — Android `MediaSession` + `Notification.MediaStyle` + build-time compiled Java bridge
+//! - `ios/` — iOS `MPNowPlayingInfoCenter` + `MPRemoteCommandCenter` + `AVAudioSession`
+//! - `macos/` — macOS `MPNowPlayingInfoCenter` + `MPRemoteCommandCenter` + AppKit headless guard
+//! - `windows/` — Windows WinRT MTA System Media Transport Controls (SMTC)
+//! - `linux/` — Linux GDBus MPRIS2 (`org.mpris.MediaPlayer2.nshmusic`)
+//! - `harmonyos/` — HarmonyOS `AVSession` + `wantAgent` + `backgroundTaskManager`
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+mod apple_common;
 
 #[cfg(target_os = "android")]
 #[path = "../android/mod.rs"]
 mod android;
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-mod apple_common;
-#[cfg(target_env = "ohos")]
-#[path = "../harmonyos/mod.rs"]
-mod harmonyos;
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-#[path = "../linux/mod.rs"]
-mod linux;
+
+#[cfg(target_os = "ios")]
+#[path = "../ios/mod.rs"]
+mod ios;
+
+#[cfg(target_os = "macos")]
+#[path = "../macos/mod.rs"]
+mod macos;
+
 #[cfg(target_os = "windows")]
 #[path = "../windows/mod.rs"]
 mod windows;
+
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+#[path = "../linux/mod.rs"]
+mod linux;
+
+#[cfg(target_env = "ohos")]
+#[path = "../harmonyos/mod.rs"]
+mod harmonyos;
 
 use std::path::PathBuf;
 
@@ -22,11 +42,17 @@ use nsh_music_audio::{NowPlayingMetadata, RemoteController, RemoteLoopMode, Remo
 /// Installs the native OS media session driver onto `remote` for the active
 /// compilation target (macOS, iOS, Windows, Linux, Android, HarmonyOS).
 pub fn install_platform_remote(remote: &RemoteController) {
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[cfg(target_os = "macos")]
     {
-        remote.set_driver(std::sync::Arc::new(
-            apple_common::AppleNowPlayingDriver::new(remote.clone()),
-        ));
+        remote.set_driver(std::sync::Arc::new(macos::MacOsNowPlayingDriver::new(
+            remote.clone(),
+        )));
+    }
+    #[cfg(target_os = "ios")]
+    {
+        remote.set_driver(std::sync::Arc::new(ios::IosNowPlayingDriver::new(
+            remote.clone(),
+        )));
     }
     #[cfg(target_os = "windows")]
     {
@@ -91,6 +117,18 @@ pub(crate) fn artwork_local_path(artwork_url: &str) -> Option<PathBuf> {
         return Some(PathBuf::from(trimmed));
     }
     None
+}
+
+/// Returns `Some(trimmed_url)` if `artwork_url` is an HTTP(S) URL suitable for
+/// remote artwork fallback fetching.
+#[allow(dead_code)]
+pub(crate) fn artwork_http_url(artwork_url: &str) -> Option<&str> {
+    let trimmed = artwork_url.trim();
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        Some(trimmed)
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -323,6 +361,18 @@ pub(crate) const fn ms_to_us(ms: u64) -> i64 {
 #[allow(dead_code)]
 pub(crate) const fn us_to_ms(us: i64) -> u64 {
     if us <= 0 { 0 } else { (us as u64) / 1_000 }
+}
+
+/// Clamps an MPRIS2 `Volume` (`0.0..=1.0`) to `(clamped_f64, percent_u8)`.
+/// Non-finite values are rejected (`None`).
+#[allow(dead_code)]
+pub(crate) fn mpris_volume_to_percent(raw: f64) -> Option<(f64, u8)> {
+    if !raw.is_finite() {
+        return None;
+    }
+    let clamped = raw.clamp(0.0, 1.0);
+    let pct = (clamped * 100.0).round() as u8;
+    Some((clamped, pct))
 }
 
 // ---------------------------------------------------------------------------
@@ -595,6 +645,14 @@ mod tests {
         assert_eq!(ms_to_us(3_500), 3_500_000);
         assert_eq!(us_to_ms(3_500_000), 3_500);
         assert_eq!(us_to_ms(-100), 0);
+
+        assert_eq!(mpris_volume_to_percent(0.0), Some((0.0, 0)));
+        assert_eq!(mpris_volume_to_percent(0.456), Some((0.456, 46)));
+        assert_eq!(mpris_volume_to_percent(1.0), Some((1.0, 100)));
+        assert_eq!(mpris_volume_to_percent(-0.25), Some((0.0, 0)));
+        assert_eq!(mpris_volume_to_percent(1.8), Some((1.0, 100)));
+        assert_eq!(mpris_volume_to_percent(f64::NAN), None);
+        assert_eq!(mpris_volume_to_percent(f64::INFINITY), None);
     }
 
     #[test]
@@ -630,5 +688,17 @@ mod tests {
         );
         assert_eq!(artwork_local_path("https://cdn.example/art.jpg"), None);
         assert_eq!(artwork_local_path(""), None);
+
+        assert_eq!(
+            artwork_http_url("https://cdn.example/art.jpg"),
+            Some("https://cdn.example/art.jpg")
+        );
+        assert_eq!(
+            artwork_http_url("  http://cdn.example/art.png  "),
+            Some("http://cdn.example/art.png")
+        );
+        assert_eq!(artwork_http_url("file:///tmp/cover.png"), None);
+        assert_eq!(artwork_http_url("/var/cache/art.jpg"), None);
+        assert_eq!(artwork_http_url(""), None);
     }
 }

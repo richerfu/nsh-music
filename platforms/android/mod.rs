@@ -3,28 +3,43 @@
 //! Spawns a dedicated JNI worker thread, discovers the process `JavaVM` via
 //! `JNI_GetCreatedJavaVMs` (with `libart.so` fallback), acquires the host
 //! `Application` context from `ActivityThread.currentApplication()`, and manages:
-//! - `android.media.session.MediaSession` (metadata, playback state, launch `PendingIntent`)
-//! - `android.media.MediaMetadata` (title, artist, album, duration, `BitmapFactory.decodeFile` artwork)
-//! - `android.media.session.PlaybackState` (state, position, speed, buffered position, actions)
-//! - `android.app.Notification` (`Notification.MediaStyle`) on channel `"nsh_music_playback"`,
-//!   handling Android API >= 26 (`NotificationChannel`) and API >= 33 (`POST_NOTIFICATIONS`)
-//!   cleanly via `Build.VERSION.SDK_INT`.
+//! - `android.media.session.MediaSession` (metadata, playback state, launch `PendingIntent`,
+//!   and interactive `MediaSession.Callback` via a build-time compiled `InMemoryDexClassLoader`
+//!   Java bridge from `platforms/android/java/com/richerfu/nshmusic/NshMediaBridge.java`)
+//! - `android.media.MediaMetadata` (title, artist, album, duration, `BitmapFactory.decodeFile`
+//!   artwork + HTTP(S) `ALBUM_ART_URI` fallback)
+//! - `android.media.session.PlaybackState` (state, position, speed, buffered position, actions,
+//!   and lock-screen / Quick Settings `"favorite"` custom action)
+//! - `android.app.Notification` (`Notification.MediaStyle`) on channel `"nsh_music_playback"`
+//!   with interactive `Previous` / `Play|Pause` / `Next` broadcast actions, Android 13+
+//!   `POST_NOTIFICATIONS` runtime prompt, and `PowerManager.PARTIAL_WAKE_LOCK` during playback.
 
 #![cfg(target_os = "android")]
 
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
-use jni::objects::{GlobalRef, JObject, JValue};
-use jni::sys::{JNI_OK, jint, jsize};
-use jni::{JNIEnv, JavaVM};
+use jni::objects::{GlobalRef, JClass, JObject, JValue};
+use jni::sys::{JNI_OK, jint, jlong, jsize};
+use jni::{JNIEnv, JavaVM, NativeMethod};
 use nsh_music_audio::{
-    NowPlayingMetadata, PlatformRemoteDriver, RemoteBackend, RemoteController, RemotePlaybackStatus,
+    NowPlayingMetadata, PlatformRemoteDriver, RemoteBackend, RemoteCommand, RemoteController,
+    RemotePlaybackStatus,
 };
 
-use super::{
-    android_playback_actions, android_playback_speed, android_playback_state, artwork_local_path,
+use crate::{
+    android_playback_actions, android_playback_speed, android_playback_state, artwork_http_url,
+    artwork_local_path,
 };
+
+/// DEX compiled from `platforms/android/java/com/richerfu/nshmusic/NshMediaBridge.java`
+/// at build time by `platforms/build.rs`.
+const MEDIA_BRIDGE_DEX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/nsh_media_bridge.dex"));
+const MEDIA_BRIDGE_CLASS: &str = "com.richerfu.nshmusic.NshMediaBridge";
+const MEDIA_ACTION_INTENT: &str = "com.richerfu.nshmusic.MEDIA_ACTION";
+const MEDIA_EXTRA_CMD: &str = "cmd";
 
 const NOTIFICATION_CHANNEL_ID: &str = "nsh_music_playback";
 const NOTIFICATION_CHANNEL_NAME: &str = "Music Playback";
@@ -39,10 +54,60 @@ const FLAG_UPDATE_CURRENT: jint = 0x0800_0000;
 const FLAG_IMMUTABLE: jint = 0x0400_0000;
 /// `MediaSession.FLAG_HANDLES_MEDIA_BUTTONS | FLAG_HANDLES_TRANSPORT_CONTROLS`
 const SESSION_FLAGS: jint = 3;
-/// `android.R.drawable.ic_media_play` (`17_301_540`) fallback small icon resource ID
-const FALLBACK_SMALL_ICON: jint = 0x0108_0024;
+/// `PowerManager.PARTIAL_WAKE_LOCK`
+const PARTIAL_WAKE_LOCK: jint = 1;
+
+/// Android system drawable icons for notification actions & custom playback actions.
+const IC_MEDIA_PLAY: jint = 0x0108_0024;
+const IC_MEDIA_PAUSE: jint = 0x0108_0023;
+const IC_MEDIA_NEXT: jint = 0x0108_0022;
+const IC_MEDIA_PREVIOUS: jint = 0x0108_0025;
+const IC_STAR_ON: jint = 0x0108_000c;
+const IC_STAR_OFF: jint = 0x0108_000b;
+const FALLBACK_SMALL_ICON: jint = IC_MEDIA_PLAY;
+
+const CMD_PLAY: jint = 1;
+const CMD_PAUSE: jint = 2;
+const CMD_STOP: jint = 3;
+const CMD_NEXT: jint = 4;
+const CMD_PREV: jint = 5;
+const CMD_SEEK: jint = 6;
+const CMD_FAVORITE: jint = 7;
+const CMD_LOOP: jint = 8;
+const CMD_TOGGLE_PLAY_PAUSE: jint = 9;
 
 static JAVA_VM: OnceLock<JavaVM> = OnceLock::new();
+static ACTIVE_REMOTE: Mutex<Option<RemoteController>> = Mutex::new(None);
+static NOTIF_PERMISSION_PROMPTED: AtomicBool = AtomicBool::new(false);
+
+/// JNI callback target invoked from `com.richerfu.nshmusic.NshMediaBridge.nativeOnAction`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_richerfu_nshmusic_NshMediaBridge_nativeOnAction(
+    _env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    action: jint,
+    arg: jlong,
+) {
+    let remote = ACTIVE_REMOTE.lock().ok().and_then(|g| g.clone());
+    let Some(remote) = remote else {
+        return;
+    };
+    match action {
+        CMD_PLAY => remote.dispatch(RemoteCommand::Play),
+        CMD_PAUSE => remote.dispatch(RemoteCommand::Pause),
+        CMD_STOP => remote.dispatch(RemoteCommand::Stop),
+        CMD_NEXT => remote.dispatch(RemoteCommand::Next),
+        CMD_PREV => remote.dispatch(RemoteCommand::Prev),
+        CMD_SEEK => remote.dispatch(RemoteCommand::Seek(arg.max(0) as u64)),
+        CMD_FAVORITE => remote.dispatch(RemoteCommand::ToggleFavorite),
+        CMD_LOOP => {
+            let next = remote.metadata().loop_mode.next_cycle();
+            remote.dispatch(RemoteCommand::SetLoopMode(next));
+        }
+        CMD_TOGGLE_PLAY_PAUSE => remote.dispatch(RemoteCommand::TogglePlayPause),
+        _ => {}
+    }
+}
 
 fn discover_java_vm() -> Option<&'static JavaVM> {
     if let Some(vm) = JAVA_VM.get() {
@@ -99,6 +164,9 @@ pub(crate) struct AndroidMediaSessionDriver {
 
 impl AndroidMediaSessionDriver {
     pub(crate) fn new(remote: RemoteController) -> Self {
+        if let Ok(mut slot) = ACTIVE_REMOTE.lock() {
+            *slot = Some(remote.clone());
+        }
         let shared = Arc::new(SharedState {
             remote,
             pending: Mutex::new(PendingState::default()),
@@ -162,6 +230,7 @@ impl PlatformRemoteDriver for AndroidMediaSessionDriver {
                     || prev.album != meta.album
                     || prev.artwork_url != meta.artwork_url
                     || prev.duration_ms != meta.duration_ms
+                    || prev.is_favorite != meta.is_favorite
             });
             pending.metadata = Some(meta.clone());
             if meta_changed {
@@ -186,6 +255,9 @@ impl PlatformRemoteDriver for AndroidMediaSessionDriver {
 
 impl Drop for AndroidMediaSessionDriver {
     fn drop(&mut self) {
+        if let Ok(mut slot) = ACTIVE_REMOTE.lock() {
+            *slot = None;
+        }
         if let Ok(mut pending) = self.shared.pending.lock() {
             pending.shutdown = true;
             self.shared.wake.notify_all();
@@ -204,12 +276,21 @@ struct AndroidSessionRefs {
     session_token: GlobalRef,
     notif_mgr: Option<GlobalRef>,
     launch_intent: Option<GlobalRef>,
+    bridge_class: Option<GlobalRef>,
+    _session_callback: Option<GlobalRef>,
+    action_receiver: Option<GlobalRef>,
+    wake_lock: Option<GlobalRef>,
+    wake_lock_held: bool,
+    session_active: bool,
     small_icon: jint,
     sdk_int: jint,
     cached_artwork_path: String,
     cached_artwork_bitmap: Option<GlobalRef>,
     last_notif_playing: Option<bool>,
     last_notif_track_id: String,
+    last_notif_artwork: String,
+    last_notif_fav: Option<bool>,
+    notif_posted: bool,
 }
 
 fn run_android_worker(shared: Arc<SharedState>) {
@@ -254,7 +335,7 @@ fn run_android_worker(shared: Arc<SharedState>) {
             continue;
         };
 
-        let _ = env.with_local_frame(48, |env| -> jni::errors::Result<()> {
+        let _ = env.with_local_frame(64, |env| -> jni::errors::Result<()> {
             if clear_requested {
                 if let Some(refs) = session_refs.as_mut() {
                     clear_android_session(env, refs);
@@ -273,34 +354,51 @@ fn run_android_worker(shared: Arc<SharedState>) {
                 return Ok(());
             };
 
-            let mut need_notif = meta_dirty;
+            let playing = meta.status.is_playing();
+            sync_wake_lock(env, refs, playing);
+
+            if refs.sdk_int >= 33
+                && !NOTIF_PERMISSION_PROMPTED.load(Ordering::Relaxed)
+                && !can_post_notifications(env, refs)
+            {
+                maybe_request_post_notifications(env, refs);
+            }
+
+            let mut need_notif = meta_dirty || !refs.notif_posted;
             if meta_dirty {
                 push_android_metadata(env, refs, &meta);
             }
             if playback_dirty {
                 push_android_playback(env, refs, &meta);
-                let playing = meta.status.is_playing();
                 if refs.last_notif_playing != Some(playing)
                     || refs.last_notif_track_id != meta.track_id
+                    || refs.last_notif_artwork != meta.artwork_url
+                    || refs.last_notif_fav != Some(meta.is_favorite)
                 {
                     need_notif = true;
                 }
             }
             if need_notif {
-                post_media_notification(env, refs, &meta);
-                refs.last_notif_playing = Some(meta.status.is_playing());
-                refs.last_notif_track_id = meta.track_id.clone();
+                if post_media_notification(env, refs, &meta) {
+                    refs.notif_posted = true;
+                    refs.last_notif_playing = Some(playing);
+                    refs.last_notif_track_id = meta.track_id.clone();
+                    refs.last_notif_artwork = meta.artwork_url.clone();
+                    refs.last_notif_fav = Some(meta.is_favorite);
+                } else {
+                    refs.notif_posted = false;
+                }
             }
             Ok(())
         });
     }
 
-    if let Some(refs) = session_refs
+    if let Some(mut refs) = session_refs
         && let Some(vm) = discover_java_vm()
         && let Ok(mut env) = vm.attach_current_thread()
     {
-        let _ = env.with_local_frame(24, |env| -> jni::errors::Result<()> {
-            release_android_session(env, &refs);
+        let _ = env.with_local_frame(32, |env| -> jni::errors::Result<()> {
+            release_android_session(env, &mut refs);
             Ok(())
         });
     }
@@ -361,6 +459,9 @@ fn create_android_session(env: &mut JNIEnv<'_>) -> Option<AndroidSessionRefs> {
         clear_pending_exception(env);
     }
 
+    let (bridge_class, session_callback, action_receiver) =
+        install_media_bridge(env, &app_obj, &session_obj);
+
     let token_obj = env
         .call_method(
             &session_obj,
@@ -375,6 +476,7 @@ fn create_android_session(env: &mut JNIEnv<'_>) -> Option<AndroidSessionRefs> {
     }
 
     let notif_mgr = obtain_notification_manager(env, &app_obj, sdk_int);
+    let wake_lock = obtain_partial_wake_lock(env, &app_obj);
     let small_icon = resolve_app_icon(env, &app_obj);
 
     Some(AndroidSessionRefs {
@@ -383,13 +485,218 @@ fn create_android_session(env: &mut JNIEnv<'_>) -> Option<AndroidSessionRefs> {
         session_token: env.new_global_ref(&token_obj).ok()?,
         notif_mgr,
         launch_intent,
+        bridge_class,
+        _session_callback: session_callback,
+        action_receiver,
+        wake_lock,
+        wake_lock_held: false,
+        session_active: false,
         small_icon,
         sdk_int,
         cached_artwork_path: String::new(),
         cached_artwork_bitmap: None,
         last_notif_playing: None,
         last_notif_track_id: String::new(),
+        last_notif_artwork: String::new(),
+        last_notif_fav: None,
+        notif_posted: false,
     })
+}
+
+fn install_media_bridge(
+    env: &mut JNIEnv<'_>,
+    context: &JObject<'_>,
+    session: &JObject<'_>,
+) -> (Option<GlobalRef>, Option<GlobalRef>, Option<GlobalRef>) {
+    let Ok(dex_arr) = env.byte_array_from_slice(MEDIA_BRIDGE_DEX) else {
+        clear_pending_exception(env);
+        return (None, None, None);
+    };
+    let dex_obj = JObject::from(dex_arr);
+    let Ok(buf_val) = env.call_static_method(
+        "java/nio/ByteBuffer",
+        "wrap",
+        "([B)Ljava/nio/ByteBuffer;",
+        &[JValue::Object(&dex_obj)],
+    ) else {
+        clear_pending_exception(env);
+        return (None, None, None);
+    };
+    let Ok(buf_obj) = buf_val.l() else {
+        clear_pending_exception(env);
+        return (None, None, None);
+    };
+    if clear_pending_exception(env) || buf_obj.is_null() {
+        return (None, None, None);
+    }
+
+    let Ok(parent_loader_val) =
+        env.call_method(context, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
+    else {
+        clear_pending_exception(env);
+        return (None, None, None);
+    };
+    let Ok(parent_loader) = parent_loader_val.l() else {
+        clear_pending_exception(env);
+        return (None, None, None);
+    };
+    if clear_pending_exception(env) || parent_loader.is_null() {
+        return (None, None, None);
+    }
+
+    let Ok(dex_loader) = env.new_object(
+        "dalvik/system/InMemoryDexClassLoader",
+        "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V",
+        &[JValue::Object(&buf_obj), JValue::Object(&parent_loader)],
+    ) else {
+        clear_pending_exception(env);
+        return (None, None, None);
+    };
+    if clear_pending_exception(env) || dex_loader.is_null() {
+        return (None, None, None);
+    }
+
+    let Ok(jcls_name) = env.new_string(MEDIA_BRIDGE_CLASS) else {
+        clear_pending_exception(env);
+        return (None, None, None);
+    };
+    let Ok(cls_val) = env.call_method(
+        &dex_loader,
+        "loadClass",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        &[JValue::Object(&jcls_name)],
+    ) else {
+        clear_pending_exception(env);
+        return (None, None, None);
+    };
+    let Ok(cls_obj) = cls_val.l() else {
+        clear_pending_exception(env);
+        return (None, None, None);
+    };
+    if clear_pending_exception(env) || cls_obj.is_null() {
+        return (None, None, None);
+    }
+
+    let bridge_cls = JClass::from(cls_obj);
+    let native_methods = [NativeMethod {
+        name: "nativeOnAction".into(),
+        sig: "(IJ)V".into(),
+        fn_ptr: Java_com_richerfu_nshmusic_NshMediaBridge_nativeOnAction as *mut c_void,
+    }];
+    if env
+        .register_native_methods(&bridge_cls, &native_methods)
+        .is_err()
+        || clear_pending_exception(env)
+    {
+        return (None, None, None);
+    }
+
+    let cb_ref = env
+        .call_static_method(
+            &bridge_cls,
+            "attachCallback",
+            "(Landroid/media/session/MediaSession;)Landroid/media/session/MediaSession$Callback;",
+            &[JValue::Object(session)],
+        )
+        .ok()
+        .and_then(|v| v.l().ok())
+        .filter(|obj| !clear_pending_exception(env) && !obj.is_null())
+        .and_then(|obj| env.new_global_ref(&obj).ok());
+
+    let rx_ref = env
+        .call_static_method(
+            &bridge_cls,
+            "registerActionReceiver",
+            "(Landroid/content/Context;)Landroid/content/BroadcastReceiver;",
+            &[JValue::Object(context)],
+        )
+        .ok()
+        .and_then(|v| v.l().ok())
+        .filter(|obj| !clear_pending_exception(env) && !obj.is_null())
+        .and_then(|obj| env.new_global_ref(&obj).ok());
+
+    let bridge_ref = env.new_global_ref(&bridge_cls).ok();
+    (bridge_ref, cb_ref, rx_ref)
+}
+
+fn maybe_request_post_notifications(env: &mut JNIEnv<'_>, refs: &AndroidSessionRefs) {
+    let Some(ref bridge_ref) = refs.bridge_class else {
+        return;
+    };
+    let Ok(local_cls_obj) = env.new_local_ref(bridge_ref.as_obj()) else {
+        clear_pending_exception(env);
+        return;
+    };
+    let bridge_cls = JClass::from(local_cls_obj);
+    let prompted = env
+        .call_static_method(
+            &bridge_cls,
+            "requestPostNotifications",
+            "(Landroid/content/Context;)Z",
+            &[JValue::Object(refs.context.as_obj())],
+        )
+        .ok()
+        .and_then(|v| v.z().ok())
+        .unwrap_or(false);
+    if !clear_pending_exception(env) && prompted {
+        NOTIF_PERMISSION_PROMPTED.store(true, Ordering::Relaxed);
+    }
+}
+
+fn obtain_partial_wake_lock(env: &mut JNIEnv<'_>, context: &JObject<'_>) -> Option<GlobalRef> {
+    let svc_name = env.new_string("power").ok()?;
+    let pm = env
+        .call_method(
+            context,
+            "getSystemService",
+            "(Ljava/lang/String;)Ljava/lang/Object;",
+            &[JValue::Object(&svc_name)],
+        )
+        .ok()
+        .and_then(|v| v.l().ok())?;
+    if clear_pending_exception(env) || pm.is_null() {
+        return None;
+    }
+    let tag = env.new_string("nshmusic:playback").ok()?;
+    let wl = env
+        .call_method(
+            &pm,
+            "newWakeLock",
+            "(ILjava/lang/String;)Landroid/os/PowerManager$WakeLock;",
+            &[JValue::Int(PARTIAL_WAKE_LOCK), JValue::Object(&tag)],
+        )
+        .ok()
+        .and_then(|v| v.l().ok())?;
+    if clear_pending_exception(env) || wl.is_null() {
+        return None;
+    }
+    let _ = env.call_method(&wl, "setReferenceCounted", "(Z)V", &[JValue::Bool(0)]);
+    clear_pending_exception(env);
+    env.new_global_ref(&wl).ok()
+}
+
+fn sync_wake_lock(env: &mut JNIEnv<'_>, refs: &mut AndroidSessionRefs, want_held: bool) {
+    let Some(ref wl) = refs.wake_lock else {
+        return;
+    };
+    if want_held && !refs.wake_lock_held {
+        let _ = env.call_method(wl.as_obj(), "acquire", "()V", &[]);
+        if !clear_pending_exception(env) {
+            refs.wake_lock_held = true;
+        }
+    } else if !want_held && refs.wake_lock_held {
+        let is_held = env
+            .call_method(wl.as_obj(), "isHeld", "()Z", &[])
+            .ok()
+            .and_then(|v| v.z().ok())
+            .unwrap_or(false);
+        clear_pending_exception(env);
+        if is_held {
+            let _ = env.call_method(wl.as_obj(), "release", "()V", &[]);
+            clear_pending_exception(env);
+        }
+        refs.wake_lock_held = false;
+    }
 }
 
 fn build_launch_pending_intent(
@@ -579,6 +886,15 @@ fn push_android_metadata(
     put_metadata_string(env, &builder, "android.media.metadata.ARTIST", &meta.artist);
     put_metadata_string(env, &builder, "android.media.metadata.ALBUM", &meta.album);
 
+    if let Some(http_art) = artwork_http_url(&meta.artwork_url) {
+        put_metadata_string(
+            env,
+            &builder,
+            "android.media.metadata.ALBUM_ART_URI",
+            http_art,
+        );
+    }
+
     if let Ok(key) = env.new_string("android.media.metadata.DURATION") {
         let _ = env.call_method(
             &builder,
@@ -622,7 +938,9 @@ fn push_android_metadata(
             "(Z)V",
             &[JValue::Bool(1)],
         );
-        clear_pending_exception(env);
+        if !clear_pending_exception(env) {
+            refs.session_active = true;
+        }
     }
 }
 
@@ -643,7 +961,7 @@ fn put_metadata_string(env: &mut JNIEnv<'_>, builder: &JObject<'_>, key: &str, v
 
 fn push_android_playback(
     env: &mut JNIEnv<'_>,
-    refs: &AndroidSessionRefs,
+    refs: &mut AndroidSessionRefs,
     meta: &NowPlayingMetadata,
 ) {
     let Ok(builder) = env.new_object("android/media/session/PlaybackState$Builder", "()V", &[])
@@ -683,6 +1001,43 @@ fn push_android_playback(
     );
     clear_pending_exception(env);
 
+    // Expose a Favorite toggle in Android 13/14 Quick Settings & Lock Screen media card.
+    if let (Ok(act_id), Ok(act_name)) = (env.new_string("favorite"), env.new_string("Favorite")) {
+        let fav_icon = if meta.is_favorite {
+            IC_STAR_ON
+        } else {
+            IC_STAR_OFF
+        };
+        if let Ok(ca_builder) = env.new_object(
+            "android/media/session/PlaybackState$CustomAction$Builder",
+            "(Ljava/lang/String;Ljava/lang/CharSequence;I)V",
+            &[
+                JValue::Object(&act_id),
+                JValue::Object(&act_name),
+                JValue::Int(fav_icon),
+            ],
+        ) && !clear_pending_exception(env)
+            && !ca_builder.is_null()
+            && let Ok(ca_val) = env.call_method(
+                &ca_builder,
+                "build",
+                "()Landroid/media/session/PlaybackState$CustomAction;",
+                &[],
+            )
+            && !clear_pending_exception(env)
+            && let Ok(ca_obj) = ca_val.l()
+            && !ca_obj.is_null()
+        {
+            let _ = env.call_method(
+                &builder,
+                "addCustomAction",
+                "(Landroid/media/session/PlaybackState$CustomAction;)Landroid/media/session/PlaybackState$Builder;",
+                &[JValue::Object(&ca_obj)],
+            );
+            clear_pending_exception(env);
+        }
+    }
+
     if let Ok(val) = env.call_method(
         &builder,
         "build",
@@ -699,6 +1054,17 @@ fn push_android_playback(
             &[JValue::Object(&state_obj)],
         );
         clear_pending_exception(env);
+        if !refs.session_active {
+            let _ = env.call_method(
+                refs.session.as_obj(),
+                "setActive",
+                "(Z)V",
+                &[JValue::Bool(1)],
+            );
+            if !clear_pending_exception(env) {
+                refs.session_active = true;
+            }
+        }
     }
 }
 
@@ -723,21 +1089,126 @@ fn can_post_notifications(env: &mut JNIEnv<'_>, refs: &AndroidSessionRefs) -> bo
     granted == 0
 }
 
+struct NotifAction<'a> {
+    req_code: jint,
+    cmd: jint,
+    icon_res: jint,
+    title: &'a str,
+}
+
+fn add_notification_action(
+    env: &mut JNIEnv<'_>,
+    refs: &AndroidSessionRefs,
+    builder: &JObject<'_>,
+    pkg: &JObject<'_>,
+    action: &NotifAction<'_>,
+) {
+    let (Ok(action_str), Ok(extra_key), Ok(title_str)) = (
+        env.new_string(MEDIA_ACTION_INTENT),
+        env.new_string(MEDIA_EXTRA_CMD),
+        env.new_string(action.title),
+    ) else {
+        clear_pending_exception(env);
+        return;
+    };
+    let Ok(intent) = env.new_object(
+        "android/content/Intent",
+        "(Ljava/lang/String;)V",
+        &[JValue::Object(&action_str)],
+    ) else {
+        clear_pending_exception(env);
+        return;
+    };
+    if clear_pending_exception(env) || intent.is_null() {
+        return;
+    }
+    let _ = env.call_method(
+        &intent,
+        "setPackage",
+        "(Ljava/lang/String;)Landroid/content/Intent;",
+        &[JValue::Object(pkg)],
+    );
+    clear_pending_exception(env);
+    let _ = env.call_method(
+        &intent,
+        "putExtra",
+        "(Ljava/lang/String;I)Landroid/content/Intent;",
+        &[JValue::Object(&extra_key), JValue::Int(action.cmd)],
+    );
+    clear_pending_exception(env);
+
+    let flags = if refs.sdk_int >= 23 {
+        FLAG_UPDATE_CURRENT | FLAG_IMMUTABLE
+    } else {
+        FLAG_UPDATE_CURRENT
+    };
+    let Ok(pi_val) = env.call_static_method(
+        "android/app/PendingIntent",
+        "getBroadcast",
+        "(Landroid/content/Context;ILandroid/content/Intent;I)Landroid/app/PendingIntent;",
+        &[
+            JValue::Object(refs.context.as_obj()),
+            JValue::Int(action.req_code),
+            JValue::Object(&intent),
+            JValue::Int(flags),
+        ],
+    ) else {
+        clear_pending_exception(env);
+        return;
+    };
+    let Ok(pi_obj) = pi_val.l() else {
+        clear_pending_exception(env);
+        return;
+    };
+    if clear_pending_exception(env) || pi_obj.is_null() {
+        return;
+    }
+
+    if let Ok(act_builder) = env.new_object(
+        "android/app/Notification$Action$Builder",
+        "(ILjava/lang/CharSequence;Landroid/app/PendingIntent;)V",
+        &[
+            JValue::Int(action.icon_res),
+            JValue::Object(&title_str),
+            JValue::Object(&pi_obj),
+        ],
+    ) && !clear_pending_exception(env)
+        && !act_builder.is_null()
+        && let Ok(act_val) = env.call_method(
+            &act_builder,
+            "build",
+            "()Landroid/app/Notification$Action;",
+            &[],
+        )
+        && !clear_pending_exception(env)
+        && let Ok(act_obj) = act_val.l()
+        && !act_obj.is_null()
+    {
+        let _ = env.call_method(
+            builder,
+            "addAction",
+            "(Landroid/app/Notification$Action;)Landroid/app/Notification$Builder;",
+            &[JValue::Object(&act_obj)],
+        );
+        clear_pending_exception(env);
+    }
+}
+
 fn post_media_notification(
     env: &mut JNIEnv<'_>,
     refs: &AndroidSessionRefs,
     meta: &NowPlayingMetadata,
-) {
+) -> bool {
     let Some(ref mgr) = refs.notif_mgr else {
-        return;
+        return false;
     };
     if !can_post_notifications(env, refs) {
-        return;
+        return false;
     }
 
     let builder = if refs.sdk_int >= 26 {
         let Ok(ch_id) = env.new_string(NOTIFICATION_CHANNEL_ID) else {
-            return;
+            return false;
         };
         env.new_object(
             "android/app/Notification$Builder",
@@ -756,10 +1227,10 @@ fn post_media_notification(
     };
     let Ok(builder) = builder else {
         clear_pending_exception(env);
-        return;
+        return false;
     };
     if clear_pending_exception(env) || builder.is_null() {
-        return;
+        return false;
     }
 
     if let Ok(title) = env.new_string(&meta.title) {
@@ -812,11 +1283,12 @@ fn post_media_notification(
         clear_pending_exception(env);
     }
 
+    let playing = meta.status.is_playing();
     let _ = env.call_method(
         &builder,
         "setOngoing",
         "(Z)Landroid/app/Notification$Builder;",
-        &[JValue::Bool(u8::from(meta.status.is_playing()))],
+        &[JValue::Bool(u8::from(playing))],
     );
     clear_pending_exception(env);
 
@@ -836,6 +1308,16 @@ fn post_media_notification(
     );
     clear_pending_exception(env);
 
+    if let Ok(category) = env.new_string("transport") {
+        let _ = env.call_method(
+            &builder,
+            "setCategory",
+            "(Ljava/lang/String;)Landroid/app/Notification$Builder;",
+            &[JValue::Object(&category)],
+        );
+        clear_pending_exception(env);
+    }
+
     if let Some(ref pi) = refs.launch_intent {
         let _ = env.call_method(
             &builder,
@@ -844,6 +1326,58 @@ fn post_media_notification(
             &[JValue::Object(pi.as_obj())],
         );
         clear_pending_exception(env);
+    }
+
+    // Add Previous / Play|Pause / Next interactive transport actions.
+    if let Ok(pkg_val) = env.call_method(
+        refs.context.as_obj(),
+        "getPackageName",
+        "()Ljava/lang/String;",
+        &[],
+    ) && !clear_pending_exception(env)
+        && let Ok(pkg_obj) = pkg_val.l()
+        && !pkg_obj.is_null()
+    {
+        add_notification_action(
+            env,
+            refs,
+            &builder,
+            &pkg_obj,
+            &NotifAction {
+                req_code: 101,
+                cmd: CMD_PREV,
+                icon_res: IC_MEDIA_PREVIOUS,
+                title: "Previous",
+            },
+        );
+        let play_pause = if playing {
+            NotifAction {
+                req_code: 102,
+                cmd: CMD_PAUSE,
+                icon_res: IC_MEDIA_PAUSE,
+                title: "Pause",
+            }
+        } else {
+            NotifAction {
+                req_code: 102,
+                cmd: CMD_PLAY,
+                icon_res: IC_MEDIA_PLAY,
+                title: "Play",
+            }
+        };
+        add_notification_action(env, refs, &builder, &pkg_obj, &play_pause);
+        add_notification_action(
+            env,
+            refs,
+            &builder,
+            &pkg_obj,
+            &NotifAction {
+                req_code: 103,
+                cmd: CMD_NEXT,
+                icon_res: IC_MEDIA_NEXT,
+                title: "Next",
+            },
+        );
     }
 
     if let Ok(style) = env.new_object("android/app/Notification$MediaStyle", "()V", &[])
@@ -857,6 +1391,20 @@ fn post_media_notification(
             &[JValue::Object(refs.session_token.as_obj())],
         );
         clear_pending_exception(env);
+        if let Ok(compact_idx) = env.new_int_array(3)
+            && env
+                .set_int_array_region(&compact_idx, 0, &[0, 1, 2])
+                .is_ok()
+        {
+            let compact_obj = JObject::from(compact_idx);
+            let _ = env.call_method(
+                &style,
+                "setShowActionsInCompactView",
+                "([I)Landroid/app/Notification$MediaStyle;",
+                &[JValue::Object(&compact_obj)],
+            );
+            clear_pending_exception(env);
+        }
         let _ = env.call_method(
             &builder,
             "setStyle",
@@ -877,11 +1425,14 @@ fn post_media_notification(
             "(ILandroid/app/Notification;)V",
             &[JValue::Int(NOTIFICATION_ID), JValue::Object(&notification)],
         );
-        clear_pending_exception(env);
+        return !clear_pending_exception(env);
     }
+    false
 }
 
 fn clear_android_session(env: &mut JNIEnv<'_>, refs: &mut AndroidSessionRefs) {
+    sync_wake_lock(env, refs, false);
+
     let _ = env.call_method(
         refs.session.as_obj(),
         "setActive",
@@ -889,6 +1440,7 @@ fn clear_android_session(env: &mut JNIEnv<'_>, refs: &mut AndroidSessionRefs) {
         &[JValue::Bool(0)],
     );
     clear_pending_exception(env);
+    refs.session_active = false;
 
     if let Some(ref mgr) = refs.notif_mgr {
         let _ = env.call_method(
@@ -903,9 +1455,31 @@ fn clear_android_session(env: &mut JNIEnv<'_>, refs: &mut AndroidSessionRefs) {
     refs.cached_artwork_bitmap = None;
     refs.last_notif_playing = None;
     refs.last_notif_track_id.clear();
+    refs.last_notif_artwork.clear();
+    refs.last_notif_fav = None;
+    refs.notif_posted = false;
 }
 
-fn release_android_session(env: &mut JNIEnv<'_>, refs: &AndroidSessionRefs) {
+fn release_android_session(env: &mut JNIEnv<'_>, refs: &mut AndroidSessionRefs) {
+    sync_wake_lock(env, refs, false);
+
+    if let Some(ref receiver) = refs.action_receiver {
+        let _ = env.call_method(
+            refs.context.as_obj(),
+            "unregisterReceiver",
+            "(Landroid/content/BroadcastReceiver;)V",
+            &[JValue::Object(receiver.as_obj())],
+        );
+        clear_pending_exception(env);
+    }
+    let null_cb = JObject::null();
+    let _ = env.call_method(
+        refs.session.as_obj(),
+        "setCallback",
+        "(Landroid/media/session/MediaSession$Callback;)V",
+        &[JValue::Object(&null_cb)],
+    );
+    clear_pending_exception(env);
     let _ = env.call_method(
         refs.session.as_obj(),
         "setActive",
@@ -913,6 +1487,7 @@ fn release_android_session(env: &mut JNIEnv<'_>, refs: &AndroidSessionRefs) {
         &[JValue::Bool(0)],
     );
     clear_pending_exception(env);
+    refs.session_active = false;
     let _ = env.call_method(refs.session.as_obj(), "release", "()V", &[]);
     clear_pending_exception(env);
     if let Some(ref mgr) = refs.notif_mgr {
