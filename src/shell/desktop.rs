@@ -205,66 +205,53 @@ pub fn desktop_shell(store: AppStore) -> View {
     all(target_os = "linux", not(target_env = "ohos"))
 ))]
 fn resolve_tray_icon_src() -> nsh_core::element::ImageSrc {
-    use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
 
     use nsh_core::element::ImageSrc;
 
-    // macOS NSStatusBar tints monochrome SVG templates natively for light/dark menu bars.
-    // Windows & Linux backends treat SVGs as monochrome templates (repainting all opaque
-    // pixels white/black), so we ship a 64x64 RGBA raster PNG badge there to preserve our
-    // coral-red + white brand contrast across both light and dark taskbars/panels.
-    #[cfg(target_os = "macos")]
-    const TRAY_ICON_FILE: &str = "tray-icon.svg";
-    #[cfg(target_os = "macos")]
-    const TRAY_ICON_BYTES: &[u8] = include_bytes!("../../assets/tray-icon.svg");
-
-    #[cfg(not(target_os = "macos"))]
-    const TRAY_ICON_FILE: &str = "tray-icon-color.png";
-    #[cfg(not(target_os = "macos"))]
-    const TRAY_ICON_BYTES: &[u8] = include_bytes!("../../assets/tray-icon-color.png");
-
-    let rel = Path::new("assets").join(TRAY_ICON_FILE);
-    if rel.is_file() {
-        return ImageSrc::from(rel.to_string_lossy().into_owned());
-    }
-
-    let manifest_icon = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("assets")
-        .join(TRAY_ICON_FILE);
-    if manifest_icon.is_file() {
-        return ImageSrc::from(manifest_icon.to_string_lossy().into_owned());
-    }
-
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        for candidate in [
-            dir.join("assets").join(TRAY_ICON_FILE),
-            dir.join("../assets").join(TRAY_ICON_FILE),
-            dir.join("../Resources").join(TRAY_ICON_FILE),
-        ] {
-            if candidate.is_file() {
-                return ImageSrc::from(candidate.to_string_lossy().into_owned());
+    static TRAY_ICON: OnceLock<ImageSrc> = OnceLock::new();
+    TRAY_ICON
+        .get_or_init(|| {
+            // Packaged NSH apps restrict `capabilities.fs.read` to `${dataDir}`, so
+            // tray icons must be built purely in-memory with zero filesystem reads.
+            // - macOS NSStatusBar treats inline SVG (`Natural::Vector`) as a monochrome
+            //   template (`NSImage.setTemplate(true)`), tinting cleanly for light/dark bars.
+            // - Windows & Linux treat SVG as monochrome templates too (repainting all opaque
+            //   pixels white/black), so we decode our embedded 64x64 RGBA PNG into
+            //   `ImageSrc::rgba` (`Natural::Pixels` -> `template = false`) to keep vivid
+            //   coral-red + white contrast across both dark and light taskbars/panels.
+            #[cfg(target_os = "macos")]
+            {
+                ImageSrc::svg_markup(include_str!("../../assets/tray-icon.svg"))
             }
-        }
-    }
 
-    let cache_dir = dirs::cache_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("nsh-music");
-    let cached = cache_dir.join(TRAY_ICON_FILE);
-    let needs_write = std::fs::metadata(&cached)
-        .map(|m| m.len() != TRAY_ICON_BYTES.len() as u64)
-        .unwrap_or(true);
-    if !needs_write
-        || (std::fs::create_dir_all(&cache_dir).is_ok()
-            && std::fs::write(&cached, TRAY_ICON_BYTES).is_ok())
-    {
-        return ImageSrc::from(cached.to_string_lossy().into_owned());
-    }
+            #[cfg(not(target_os = "macos"))]
+            {
+                decode_embedded_tray_png(include_bytes!("../../assets/tray-icon-color.png"))
+                    .unwrap_or_else(|| {
+                        ImageSrc::svg_markup(include_str!("../../assets/tray-icon.svg"))
+                    })
+            }
+        })
+        .clone()
+}
 
-    // Fallback when cache_dir is unwritable: inline monochrome template SVG (valid on all 3 OSes).
-    ImageSrc::svg_markup(include_str!("../../assets/tray-icon.svg"))
+#[cfg(any(
+    all(test, target_os = "macos"),
+    target_os = "windows",
+    all(target_os = "linux", not(target_env = "ohos"))
+))]
+fn decode_embedded_tray_png(bytes: &[u8]) -> Option<nsh_core::element::ImageSrc> {
+    let rgba = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some(nsh_core::element::ImageSrc::rgba(
+        width,
+        height,
+        rgba.into_raw(),
+    ))
 }
 
 #[cfg(any(
@@ -2660,5 +2647,56 @@ fn route_matches(current: &Route, target: &Route, custom_nav: &[NavItem]) -> boo
         }
         (Route::Settings | Route::SettingsDetail(_), Route::Settings) => true,
         _ => current == target,
+    }
+}
+
+#[cfg(all(
+    test,
+    any(
+        target_os = "macos",
+        target_os = "windows",
+        all(target_os = "linux", not(target_env = "ohos"))
+    )
+))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tray_icon_src_is_in_memory_and_stable() {
+        let first = resolve_tray_icon_src();
+        let second = resolve_tray_icon_src();
+        assert!(!first.is_empty());
+        assert_eq!(
+            first, second,
+            "tray icon ImageSrc should stay stable across reactive ticks"
+        );
+
+        let debug = format!("{first:?}");
+        assert!(
+            !debug.contains("assets/") && !debug.contains("assets\\"),
+            "tray icon must never reference a local filesystem path (blocked by capabilities.fs.read): {debug}"
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            debug.contains("data:image/svg+xml,"),
+            "macOS tray icon should use inline SVG data URI for NSStatusBar template tinting: {debug}"
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert!(
+            debug.contains("rgba"),
+            "Windows/Linux tray icon should use in-memory RGBA pixel data to preserve color: {debug}"
+        );
+    }
+
+    #[test]
+    fn embedded_color_tray_png_decodes_to_in_memory_rgba() {
+        let icon = decode_embedded_tray_png(include_bytes!("../../assets/tray-icon-color.png"))
+            .expect("embedded 64x64 RGBA tray-icon-color.png should decode");
+        assert!(!icon.is_empty());
+        let debug = format!("{icon:?}");
+        assert!(
+            !debug.contains("assets/") && !debug.contains("assets\\"),
+            "decoded tray PNG must be in-memory, not a file path: {debug}"
+        );
     }
 }
