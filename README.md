@@ -147,6 +147,24 @@ nsh run --target <platform>
 nsh package --target <platform>
 ```
 
+### CI 与多平台自动发布流水线
+
+仓库通过 GitHub Actions 提供完整的持续集成与多平台发布流水线：
+
+- **持续集成（[`.github/workflows/ci.yml`](./.github/workflows/ci.yml)）**：在 `push`（`main`）、`pull_request` 及手动触发时自动运行格式检查（`cargo fmt --all -- --check`），在 **macOS / Linux / Windows** 三端执行零警告 `cargo clippy --workspace --all-targets --locked -- -D warnings` 与单元测试，并在 **HarmonyOS (`aarch64-unknown-linux-ohos`)** 上执行跨平台 `clippy` 静态检查。
+- **多平台自动发布（[`.github/workflows/release.yml`](./.github/workflows/release.yml)）**：推送 `v*` 标签（如 `git tag v0.1.0 && git push origin v0.1.0`）自动构建全平台产物并发布 GitHub Release（含 `SHA256SUMS.txt`）；也可在 Actions 页面通过 **`workflow_dispatch`** 按需选择单平台或全平台构建（留空 `tag` 仅上传工作流产物，填写已有 `tag` 则同步发布至对应 Release）。
+
+| 平台目标                       | 自动构建产物                                                                                                   |
+| ------------------------------ | -------------------------------------------------------------------------------------------------------------- |
+| **macOS (`arm64`/`x86_64`)**   | `NSH-Music-v<ver>-macos-<arch>.dmg`（拖拽安装）+ `NSH-Music-v<ver>-macos-<arch>.app.tar.gz`                    |
+| **Windows (`x86_64`/`arm64`)** | `NSH-Music-v<ver>-windows-<arch>-setup.exe`（Inno Setup 安装器）+ `-portable.zip`                              |
+| **Linux (`x86_64`/`arm64`)**   | `NSH-Music-v<ver>-linux-<arch>.AppImage` + `NSH-Music-v<ver>-linux-<arch>.tar.gz`                              |
+| **Android**                    | `NSH-Music-v<ver>-android-arm64-v8a.apk` + `NSH-Music-v<ver>-android-universal.apk`（`arm64-v8a` + `x86_64`）  |
+| **HarmonyOS (`arm64`)**        | `NSH-Music-v<ver>-harmonyos-arm64.hap`（基于 `nsh-platform-harmonyos 0.7` + `ohpm-rs` + `@ohos-rs/arkdown`）   |
+
+- **零签名密钥要求**：CI 构建无需配置任何签名 Secrets——Android 使用 `nsh` 内置密钥打包可直接安装的 `.apk`，macOS 采用 ad-hoc 签名，HarmonyOS 输出未签名 `.hap`。
+- **iOS 说明**：iOS 非越狱真机无法直接安装未签名 `.ipa`（需要付费 Apple Developer 证书与设备 UDID Ad-Hoc / Enterprise / TestFlight 描述文件），因此默认不包含在公开 GitHub Actions 流水线中，请按需在本地配置签名后构建。
+
 ---
 
 ## 开源协议与致谢

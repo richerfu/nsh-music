@@ -106,4 +106,4 @@ jni = "0.21"
 libc = "0.2"
 
 [target.'cfg(target_env = "ohos")'.dependencies]
-nsh-platform-harmonyos = { path = "../../../nsh-platform-harmonyos.worktrees/upgrade-nsh-0.7", default-features = false }
+nsh-platform-harmonyos.workspace = true

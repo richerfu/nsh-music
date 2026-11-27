@@ -1,0 +1,147 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_TERM_COLOR: always
+  NO_PROXY: 127.0.0.1,localhost
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  macos:
+    name: macOS (clippy & test)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-macos
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --workspace --locked
+
+  linux:
+    name: Linux (clippy & test)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang llvm libclang-dev pkg-config build-essential \
+            libgtk-4-dev libwebkitgtk-6.0-dev libasound2-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            xvfb xauth dbus-x11
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-linux
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        run: dbus-run-session -- xvfb-run -a cargo test --workspace --lib --locked
+
+  windows:
+    name: Windows (clippy & test)
+    runs-on: windows-latest
+    env:
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+      RUST_MIN_STACK: "268435456"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-windows
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --workspace --lib --locked
+
+  harmonyos:
+    name: HarmonyOS (ohos clippy)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install host build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libclang-dev pkg-config build-essential
+      - name: Setup OpenHarmony 6.0 NDK
+        id: setup-ohos-sdk
+        uses: openharmony-rs/setup-ohos-sdk@v0.2
+        with:
+          version: "6.0"
+          components: native
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: aarch64-unknown-linux-ohos
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-harmonyos
+      - name: Configure OHOS cross-compilation toolchain
+        run: |
+          set -euo pipefail
+          SDK_HOME="${{ steps.setup-ohos-sdk.outputs.ohos-base-sdk-home }}"
+          NATIVE="${{ steps.setup-ohos-sdk.outputs.ohos_sdk_native }}"
+          if [[ -z "$NATIVE" ]]; then
+            NATIVE="$SDK_HOME/native"
+          fi
+          BIN="$NATIVE/llvm/bin"
+          SYSROOT="$NATIVE/sysroot"
+          if [[ -x "$BIN/aarch64-unknown-linux-ohos-clang" ]]; then
+            CC="$BIN/aarch64-unknown-linux-ohos-clang"
+            CXX="$BIN/aarch64-unknown-linux-ohos-clang++"
+          else
+            CC="$BIN/clang"
+            CXX="$BIN/clang++"
+            echo "CFLAGS_aarch64_unknown_linux_ohos=--target=aarch64-linux-ohos --sysroot=$SYSROOT -D__MUSL__" >> "$GITHUB_ENV"
+            echo "CXXFLAGS_aarch64_unknown_linux_ohos=--target=aarch64-linux-ohos --sysroot=$SYSROOT -D__MUSL__" >> "$GITHUB_ENV"
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_OHOS_RUSTFLAGS=-Clink-arg=--target=aarch64-linux-ohos -Clink-arg=--sysroot=$SYSROOT" >> "$GITHUB_ENV"
+          fi
+          {
+            echo "OHOS_NDK_HOME=$SDK_HOME"
+            echo "CC_aarch64_unknown_linux_ohos=$CC"
+            echo "CXX_aarch64_unknown_linux_ohos=$CXX"
+            echo "AR_aarch64_unknown_linux_ohos=$BIN/llvm-ar"
+            echo "RANLIB_aarch64_unknown_linux_ohos=$BIN/llvm-ranlib"
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_OHOS_LINKER=$CC"
+            echo "LIBCLANG_PATH=$NATIVE/llvm/lib"
+            echo "BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_ohos=--target=aarch64-linux-ohos --sysroot=$SYSROOT -D__MUSL__"
+          } >> "$GITHUB_ENV"
+      - name: Clippy (aarch64-unknown-linux-ohos)
+        run: cargo clippy --workspace --lib --target aarch64-unknown-linux-ohos --locked -- -D warnings

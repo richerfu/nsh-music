@@ -1,0 +1,621 @@
+name: Release
+
+# Multi-platform release pipeline for NSH Music:
+# - macOS (arm64, x86_64): drag-to-Applications .dmg + .app.tar.gz
+# - Windows (x86_64, arm64): Inno Setup -setup.exe + portable .zip
+# - Linux (x86_64, arm64): .AppImage + .tar.gz
+# - Android: arm64-v8a .apk + universal (arm64-v8a + x86_64) .apk
+# - HarmonyOS (arm64): .hap built via `nsh-platform-harmonyos` 0.7.0 + `ohpm-rs` + `@ohos-rs/arkdown`
+#
+# Note on omitted platform:
+# - iOS is intentionally omitted: `nsh package --target ios` requires BOTH an
+#   Apple Developer code-signing identity (`--sign`, `.p12`) AND a provisioning
+#   profile (`--profile`, `.mobileprovision`) to produce an `.ipa` (without
+#   them it emits only an unsigned `.app`), and iOS `installd` strictly rejects
+#   unsigned `.ipa` installation on non-jailbroken devices without paid Apple
+#   Developer Ad-Hoc (per-UDID), Enterprise, or TestFlight/App Store signing.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Platform target to package"
+        required: true
+        type: choice
+        default: "all"
+        options:
+          - all
+          - macos-arm64
+          - macos-x86_64
+          - windows-x86_64
+          - windows-arm64
+          - linux-x86_64
+          - linux-arm64
+          - android
+          - harmonyos
+      tag:
+        description: "Existing tag to publish/update as a GitHub Release (e.g. v0.1.0); leave empty to build workflow artifacts only"
+        required: false
+        type: string
+        default: ""
+      draft:
+        description: "Create the GitHub Release as a draft"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}-${{ inputs.target || 'all' }}
+  cancel-in-progress: false
+
+env:
+  NSH_VERSION: v0.7.2
+  NSH_HARMONYOS_VERSION: 0.7.0
+  OHPM_RS_VERSION: 0.7.0
+  ARKDOWN_VERSION: 0.1.6
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  plan:
+    name: Plan release matrix
+    runs-on: ubuntu-24.04
+    outputs:
+      ref: ${{ steps.plan.outputs.ref }}
+      version: ${{ steps.plan.outputs.version }}
+      is_release: ${{ steps.plan.outputs.is_release }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || (github.event_name == 'push' && github.ref_type == 'tag' && github.ref_name) || github.sha }}
+
+      - id: plan
+        env:
+          INPUT_TAG: ${{ inputs.tag || (github.event_name == 'push' && github.ref_type == 'tag' && github.ref_name) || '' }}
+          INPUT_TARGET: ${{ inputs.target || 'all' }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib
+
+          tag = os.environ.get("INPUT_TAG", "").strip()
+          target_filter = os.environ.get("INPUT_TARGET", "all").strip() or "all"
+          github_sha = os.environ["GITHUB_SHA"]
+
+          if tag:
+              ref = tag
+              version = tag[1:] if tag.startswith("v") else tag
+              is_release = "true"
+          else:
+              ref = github_sha
+              nsh_json = json.loads(pathlib.Path("nsh.json").read_text(encoding="utf-8"))
+              version = str(nsh_json.get("version", "0.1.0")).lstrip("v")
+              is_release = "false"
+
+          all_targets = [
+              {"target": "macos-arm64", "os": "macos-15", "platform": "macos", "arch": "arm64"},
+              {"target": "macos-x86_64", "os": "macos-15-intel", "platform": "macos", "arch": "x86_64"},
+              {"target": "windows-x86_64", "os": "windows-latest", "platform": "windows", "arch": "x86_64"},
+              {"target": "windows-arm64", "os": "windows-11-arm", "platform": "windows", "arch": "arm64"},
+              {"target": "linux-x86_64", "os": "ubuntu-24.04", "platform": "linux", "arch": "x86_64", "appimage_arch": "x86_64"},
+              {"target": "linux-arm64", "os": "ubuntu-24.04-arm", "platform": "linux", "arch": "arm64", "appimage_arch": "aarch64"},
+              {"target": "android", "os": "ubuntu-24.04", "platform": "android", "arch": "multi"},
+              {"target": "harmonyos", "os": "ubuntu-24.04", "platform": "harmonyos", "arch": "arm64"},
+          ]
+
+          if target_filter == "all":
+              selected = all_targets
+          else:
+              selected = [t for t in all_targets if t["target"] == target_filter]
+              if not selected:
+                  raise SystemExit(f"Unknown target filter: {target_filter}")
+
+          out = pathlib.Path(os.environ["GITHUB_OUTPUT"])
+          with out.open("a", encoding="utf-8") as f:
+              f.write(f"ref={ref}\n")
+              f.write(f"version={version}\n")
+              f.write(f"is_release={is_release}\n")
+              f.write(f"matrix={json.dumps(selected, separators=(',', ':'))}\n")
+
+          print(f"Planned ref={ref} version={version} is_release={is_release} targets={[t['target'] for t in selected]}")
+          PY
+
+  package:
+    name: Package (${{ matrix.target }})
+    needs: plan
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.matrix) }}
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.ref }}
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Sync release version into nsh.json and Cargo manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v python3 > /dev/null 2>&1 && python3 --version > /dev/null 2>&1; then
+            PY=python3
+          else
+            PY=python
+          fi
+          "$PY" - <<'PY'
+          import json, os, pathlib, re
+
+          version = os.environ["VERSION"]
+          nsh_path = pathlib.Path("nsh.json")
+          nsh_data = json.loads(nsh_path.read_text(encoding="utf-8"))
+          current = str(nsh_data.get("version", ""))
+          if current != version:
+              print(f"Syncing manifest version: {current} -> {version}")
+              nsh_data["version"] = version
+              nsh_path.write_text(json.dumps(nsh_data, indent=2) + "\n", encoding="utf-8", newline="\n")
+
+              cargo_path = pathlib.Path("Cargo.toml")
+              cargo_text = cargo_path.read_text(encoding="utf-8")
+              updated, count = re.subn(
+                  r'(\[workspace\.package\][^\[]*?^\s*version\s*=\s*")[^"]+(")',
+                  rf'\g<1>{version}\g<2>',
+                  cargo_text,
+                  count=1,
+                  flags=re.MULTILINE | re.DOTALL,
+              )
+              if count != 1:
+                  raise SystemExit("Failed to update [workspace.package] version in Cargo.toml")
+              cargo_path.write_text(updated, encoding="utf-8", newline="\n")
+
+              ws_pkgs = {
+                  "nsh-app-music",
+                  "nsh-music-audio",
+                  "nsh-music-core",
+                  "nsh-music-platforms",
+                  "nsh-music-plugin",
+                  "nsh-web-signin",
+              }
+              lock_path = pathlib.Path("Cargo.lock")
+              lock_text = lock_path.read_text(encoding="utf-8")
+              for pkg in ws_pkgs:
+                  lock_text, n = re.subn(
+                      rf'(\[\[package\]\]\nname = "{re.escape(pkg)}"\nversion = ")[^"]+(")',
+                      rf'\g<1>{version}\g<2>',
+                      lock_text,
+                      count=1,
+                  )
+                  if n != 1:
+                      raise SystemExit(f"Failed to update {pkg} version in Cargo.lock")
+              lock_path.write_text(lock_text, encoding="utf-8", newline="\n")
+          else:
+              print(f"Manifest version already matches {version}")
+          PY
+
+      # -----------------------------------------------------------------------
+      # Install NSH CLI (pinned to NSH_VERSION from longbridge/nsh Releases)
+      # -----------------------------------------------------------------------
+      - name: Install NSH CLI (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          curl -fsSL "https://github.com/longbridge/nsh/releases/download/${NSH_VERSION}/install.sh" | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.nsh/bin" >> "$GITHUB_PATH"
+          "$HOME/.nsh/bin/nsh" --version
+
+      - name: Install NSH CLI (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:NSH_VERSION = $env:NSH_VERSION
+          $installer = Join-Path $env:RUNNER_TEMP 'install-nsh.ps1'
+          Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/longbridge/nsh/releases/download/$($env:NSH_VERSION)/install.ps1" -OutFile $installer
+          & $installer
+          $nshBin = Join-Path (Join-Path $env:LOCALAPPDATA 'nsh') 'bin'
+          Add-Content -Path $env:GITHUB_PATH -Value $nshBin
+          & (Join-Path $nshBin 'nsh.exe') --version
+
+      # -----------------------------------------------------------------------
+      # macOS packaging (arm64 & x86_64 -> .dmg + .app.tar.gz)
+      # -----------------------------------------------------------------------
+      - name: Package macOS (${{ matrix.arch }})
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          nsh package --target macos --arch "${{ matrix.arch }}" --app-version "${VERSION}" -o .nsh/out -v
+
+          APP_PATH=".nsh/out/NSH Music.app"
+          test -d "$APP_PATH"
+
+          STAGING="$RUNNER_TEMP/dmg-staging"
+          rm -rf "$STAGING"
+          mkdir -p "$STAGING"
+          cp -R "$APP_PATH" "$STAGING/"
+          ln -s /Applications "$STAGING/Applications"
+
+          DMG_OUT="release-assets/NSH-Music-v${VERSION}-macos-${{ matrix.arch }}.dmg"
+          hdiutil create \
+            -volname "NSH Music" \
+            -srcfolder "$STAGING" \
+            -ov \
+            -format UDZO \
+            "$DMG_OUT"
+          rm -rf "$STAGING"
+
+          TAR_OUT="release-assets/NSH-Music-v${VERSION}-macos-${{ matrix.arch }}.app.tar.gz"
+          tar -C .nsh/out -czf "$TAR_OUT" "NSH Music.app"
+          ls -lh release-assets/
+
+      # -----------------------------------------------------------------------
+      # Windows packaging (x86_64 & arm64 -> -setup.exe + -portable.zip)
+      # -----------------------------------------------------------------------
+      - name: Prepare Windows LLVM & Inno Setup 6
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Add-Content -Path $env:GITHUB_ENV -Value 'RUST_MIN_STACK=268435456'
+
+          # Ensure LLVM / libclang for QuickJS bindgen (check both 64-bit & 32-bit Program Files for ARM64 compatibility)
+          $llvmCandidates = @(
+            'C:\Program Files\LLVM\bin',
+            'C:\Program Files (x86)\LLVM\bin'
+          )
+          $llvmBin = $llvmCandidates | Where-Object { Test-Path (Join-Path $_ 'libclang.dll') } | Select-Object -First 1
+          if (-not $llvmBin) {
+            if (Get-Command choco -ErrorAction SilentlyContinue) {
+              choco install llvm --no-progress -y
+            } else {
+              winget install --id LLVM.LLVM -e --silent --accept-package-agreements --accept-source-agreements
+            }
+            $llvmBin = $llvmCandidates | Where-Object { Test-Path (Join-Path $_ 'libclang.dll') } | Select-Object -First 1
+          }
+          if (-not $llvmBin) {
+            throw "libclang.dll not found under standard LLVM directories"
+          }
+          Write-Host "Using LIBCLANG_PATH=$llvmBin"
+          Add-Content -Path $env:GITHUB_ENV -Value "LIBCLANG_PATH=$llvmBin"
+
+          # Ensure Inno Setup 6 (ISCC.exe) so `nsh package --target windows` compiles `NSH Music-setup.exe`
+          $isccCandidates = @(
+            'C:\Program Files (x86)\Inno Setup 6',
+            'C:\Program Files\Inno Setup 6',
+            (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6')
+          )
+          $isccDir = $isccCandidates | Where-Object { Test-Path (Join-Path $_ 'ISCC.exe') } | Select-Object -First 1
+          if (-not $isccDir -and -not (Get-Command ISCC.exe -ErrorAction SilentlyContinue)) {
+            if (Get-Command choco -ErrorAction SilentlyContinue) {
+              choco install innosetup --no-progress -y
+            } else {
+              winget install --id JRSoftware.InnoSetup -e --silent --accept-package-agreements --accept-source-agreements
+            }
+            $isccDir = $isccCandidates | Where-Object { Test-Path (Join-Path $_ 'ISCC.exe') } | Select-Object -First 1
+          }
+          if ($isccDir) {
+            Write-Host "Using Inno Setup directory: $isccDir"
+            Add-Content -Path $env:GITHUB_PATH -Value $isccDir
+          } elseif (-not (Get-Command ISCC.exe -ErrorAction SilentlyContinue)) {
+            throw "ISCC.exe (Inno Setup 6) not found after installation"
+          }
+
+      - name: Package Windows (${{ matrix.arch }})
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+          nsh package --target windows --app-version "$($env:VERSION)" -o .nsh/out -v
+
+          $setupSrc = '.nsh\out\NSH Music-setup.exe'
+          $zipSrc = '.nsh\out\NSH Music.zip'
+          if (-not (Test-Path $setupSrc)) { throw "Expected installer missing: $setupSrc" }
+          if (-not (Test-Path $zipSrc)) { throw "Expected portable zip missing: $zipSrc" }
+
+          Copy-Item $setupSrc "release-assets\NSH-Music-v$($env:VERSION)-windows-${{ matrix.arch }}-setup.exe"
+          Copy-Item $zipSrc "release-assets\NSH-Music-v$($env:VERSION)-windows-${{ matrix.arch }}-portable.zip"
+          Get-ChildItem release-assets
+
+      # -----------------------------------------------------------------------
+      # Linux packaging (x86_64 & arm64 -> .AppImage + .tar.gz)
+      # -----------------------------------------------------------------------
+      - name: Install Linux dependencies & appimagetool
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang llvm libclang-dev pkg-config build-essential \
+            libgtk-4-dev libwebkitgtk-6.0-dev libasound2-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            file desktop-file-utils appstream
+
+          APPIMAGETOOL="$RUNNER_TEMP/appimagetool"
+          curl -fsSL \
+            "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${{ matrix.appimage_arch }}.AppImage" \
+            -o "$APPIMAGETOOL"
+          chmod +x "$APPIMAGETOOL"
+          echo "NSH_APPIMAGETOOL=$APPIMAGETOOL" >> "$GITHUB_ENV"
+          echo "APPIMAGE_EXTRACT_AND_RUN=1" >> "$GITHUB_ENV"
+
+      - name: Package Linux (${{ matrix.arch }})
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          nsh package --target linux --format appimage --app-version "${VERSION}" -o .nsh/out -v
+
+          APPIMAGE_SRC=".nsh/out/NSH Music-${{ matrix.appimage_arch }}.AppImage"
+          TAR_SRC=".nsh/out/NSH Music.tar.gz"
+          test -f "$APPIMAGE_SRC"
+          test -f "$TAR_SRC"
+
+          cp "$APPIMAGE_SRC" "release-assets/NSH-Music-v${VERSION}-linux-${{ matrix.arch }}.AppImage"
+          chmod +x "release-assets/NSH-Music-v${VERSION}-linux-${{ matrix.arch }}.AppImage"
+          cp "$TAR_SRC" "release-assets/NSH-Music-v${VERSION}-linux-${{ matrix.arch }}.tar.gz"
+          ls -lh release-assets/
+
+      # -----------------------------------------------------------------------
+      # Android packaging (arm64-v8a .apk + arm64-v8a,x86_64 universal .apk)
+      # -----------------------------------------------------------------------
+      - name: Install host libraries for Android packaging
+        if: matrix.platform == 'android'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang llvm libclang-dev pkg-config build-essential \
+            libgtk-4-dev libwebkitgtk-6.0-dev libasound2-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+
+      - name: Setup Java 17 (for platforms/build.rs javac & d8)
+        if: matrix.platform == 'android'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK, NDK, Rust targets & NSH Android runtime
+        if: matrix.platform == 'android'
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          export ANDROID_HOME="$SDK"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+
+          SDKMANAGER="$(ls "$SDK"/cmdline-tools/latest/bin/sdkmanager* 2>/dev/null | head -n 1 || true)"
+          if [[ -z "$SDKMANAGER" ]]; then
+            echo "::error::Android sdkmanager not found under $SDK"
+            exit 1
+          fi
+
+          # Ensure API 35 platform & build-tools (35.0.0+)
+          if [[ ! -f "$SDK/platforms/android-35/android.jar" ]]; then
+            yes | "$SDKMANAGER" "platforms;android-35" > /dev/null || true
+          fi
+          if ! ls "$SDK"/build-tools/35.*/d8 > /dev/null 2>&1; then
+            yes | "$SDKMANAGER" "build-tools;35.0.0" > /dev/null || true
+          fi
+
+          # Find newest valid NDK carrying linux-x86_64 clang++; install r27 if missing
+          find_valid_ndk() {
+            local candidate
+            for candidate in $(ls -d "$SDK"/ndk/* 2>/dev/null | sort -V -r); do
+              if [[ -x "$candidate/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang++" ]]; then
+                echo "$candidate"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          NDK="$(find_valid_ndk || true)"
+          if [[ -z "$NDK" ]]; then
+            yes | "$SDKMANAGER" "ndk;27.2.12479018" > /dev/null || true
+            NDK="$(find_valid_ndk)"
+          fi
+          echo "Using ANDROID_NDK_HOME=$NDK"
+
+          NDK_BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          {
+            echo "ANDROID_NDK_HOME=$NDK"
+            echo "CC_aarch64_linux_android=$NDK_BIN/aarch64-linux-android26-clang"
+            echo "CXX_aarch64_linux_android=$NDK_BIN/aarch64-linux-android26-clang++"
+            echo "AR_aarch64_linux_android=$NDK_BIN/llvm-ar"
+            echo "CC_x86_64_linux_android=$NDK_BIN/x86_64-linux-android26-clang"
+            echo "CXX_x86_64_linux_android=$NDK_BIN/x86_64-linux-android26-clang++"
+            echo "AR_x86_64_linux_android=$NDK_BIN/llvm-ar"
+          } >> "$GITHUB_ENV"
+
+          rustup target add aarch64-linux-android x86_64-linux-android
+          nsh component add android
+
+      - name: Package Android APKs (arm64-v8a & universal)
+        if: matrix.platform == 'android'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+
+          # 1. arm64-v8a APK (recommended for modern Android phones/tablets)
+          nsh package --target android --abi arm64-v8a --app-version "${VERSION}" -o .nsh/out-arm64 -v
+          cp ".nsh/out-arm64/NSH Music.apk" "release-assets/NSH-Music-v${VERSION}-android-arm64-v8a.apk"
+
+          # 2. Universal APK (arm64-v8a + x86_64 for phones, tablets, Chromebooks & emulators)
+          nsh package --target android --abi arm64-v8a,x86_64 --app-version "${VERSION}" -o .nsh/out-universal -v
+          cp ".nsh/out-universal/NSH Music.apk" "release-assets/NSH-Music-v${VERSION}-android-universal.apk"
+
+          ls -lh release-assets/
+
+      # -----------------------------------------------------------------------
+      # HarmonyOS packaging (arm64 .hap via nsh-platform-harmonyos + ohpm-rs + @ohos-rs/arkdown)
+      # -----------------------------------------------------------------------
+      - name: Install host libraries for HarmonyOS packaging
+        if: matrix.platform == 'harmonyos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang llvm libclang-dev pkg-config build-essential \
+            libgtk-4-dev libwebkitgtk-6.0-dev libasound2-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+
+      - name: Setup Node.js 22 (for @ohos-rs/arkdown)
+        if: matrix.platform == 'harmonyos'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Setup OpenHarmony 6.0 SDK (full components for NDK + arkdown)
+        if: matrix.platform == 'harmonyos'
+        id: setup-ohos-sdk
+        uses: openharmony-rs/setup-ohos-sdk@v0.2
+        with:
+          version: "6.0"
+          components: all
+
+      - name: Cache nsh-platform-harmonyos CLI binary
+        if: matrix.platform == 'harmonyos'
+        id: cache-nsh-harmonyos
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/nsh-platform-harmonyos
+          key: nsh-platform-harmonyos-${{ env.NSH_HARMONYOS_VERSION }}-linux-x64
+
+      - name: Setup HarmonyOS toolchain, ohpm-rs & @ohos-rs/arkdown
+        if: matrix.platform == 'harmonyos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_HOME="${{ steps.setup-ohos-sdk.outputs.ohos-base-sdk-home }}"
+          test -n "$SDK_HOME"
+          test -d "$SDK_HOME/ets/build-tools/ets-loader"
+          test -x "$SDK_HOME/toolchains/restool"
+          {
+            echo "OHOS_BASE_SDK_HOME=$SDK_HOME"
+            echo "OHOS_SDK_HOME=$SDK_HOME"
+            echo "OHOS_NDK_HOME=$SDK_HOME"
+            echo "BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_ohos=--target=aarch64-linux-ohos --sysroot=$SDK_HOME/native/sysroot -D__MUSL__"
+          } >> "$GITHUB_ENV"
+
+          rustup target add aarch64-unknown-linux-ohos
+
+          if [[ ! -x "$HOME/.cargo/bin/nsh-platform-harmonyos" ]]; then
+            cargo install nsh-platform-harmonyos --version "${NSH_HARMONYOS_VERSION}" --locked
+          fi
+          "$HOME/.cargo/bin/nsh-platform-harmonyos" --version
+
+          # Install prebuilt ohpm-rs binary (dependency installer for oh-package.json5)
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL \
+            "https://github.com/harmony-contrib/ohpm-rs/releases/download/ohpm-cli-v${OHPM_RS_VERSION}/ohpm-cli-v${OHPM_RS_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xz -C "$HOME/.local/bin" ohpm-rs
+          chmod +x "$HOME/.local/bin/ohpm-rs"
+          "$HOME/.local/bin/ohpm-rs" --version
+
+          # Install @ohos-rs/arkdown (Rust-based OpenHarmony/HarmonyOS HAP packager)
+          npm install -g "@ohos-rs/arkdown@${ARKDOWN_VERSION}"
+          arkdown --version
+
+      - name: Package HarmonyOS HAP (arm64)
+        if: matrix.platform == 'harmonyos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+
+          # 1. Generate the HarmonyOS project + compile libnsh_platform_harmonyos.so (arm64)
+          PROJ_DIR=".nsh/out-harmonyos"
+          rm -rf "$PROJ_DIR"
+          nsh package --target harmonyos --runtime-os harmonyos --arch arm64 --no-hap -o "$PROJ_DIR" -v
+
+          # 2. Install OHPM workspace/module dependencies via ohpm-rs
+          (cd "$PROJ_DIR" && ohpm-rs install --all)
+
+          # 3. Build & pack unsigned HAP via @ohos-rs/arkdown (no signing required in CI)
+          arkdown build --project "$PROJ_DIR" --target hap --mode release --clearScreen false
+
+          # 4. Collect packaged unsigned HAP
+          HAP_OUT_DIR="$PROJ_DIR/entry/build/default/outputs/default"
+          if [[ -f "$HAP_OUT_DIR/entry-default-unsigned.hap" ]]; then
+            HAP_SRC="$HAP_OUT_DIR/entry-default-unsigned.hap"
+          else
+            HAP_SRC="$(find "$PROJ_DIR/entry/build" -name '*.hap' | head -n 1 || true)"
+          fi
+          if [[ -z "${HAP_SRC:-}" || ! -f "$HAP_SRC" ]]; then
+            echo "::error::arkdown did not produce a .hap artifact under $PROJ_DIR/entry/build"
+            find "$PROJ_DIR/entry/build" -maxdepth 5 || true
+            exit 1
+          fi
+          cp "$HAP_SRC" "release-assets/NSH-Music-v${VERSION}-harmonyos-arm64.hap"
+          ls -lh release-assets/
+
+      # -----------------------------------------------------------------------
+      # Upload packaged artifacts for this platform
+      # -----------------------------------------------------------------------
+      - name: Upload packaged artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: release-assets/*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: [plan, package]
+    if: ${{ needs.plan.outputs.is_release == 'true' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          (
+            cd release-assets
+            sha256sum * > ../SHA256SUMS.txt
+          )
+          mv SHA256SUMS.txt release-assets/SHA256SUMS.txt
+          cat release-assets/SHA256SUMS.txt
+
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.plan.outputs.ref }}
+          name: NSH Music ${{ needs.plan.outputs.ref }}
+          draft: ${{ inputs.draft == true }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: release-assets/*

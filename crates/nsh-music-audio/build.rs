@@ -29,14 +29,15 @@ fn main() {
     // `rustc-link-search`! That directory contains static `libc.a`/`libm.a`/`libdl.a`,
     // which would shadow the API-level dynamic `libc.so`/`libm.so`/`libdl.so` and
     // statically link Bionic into `libnsh.so` (causing SIGSEGV in `getauxval` at load).
-    // Stage ONLY `libc++_static.a` and `libc++abi.a` into a clean subdir of `OUT_DIR`.
+    // Stage ONLY `libc++_static.a`, `libc++abi.a`, and (for 32-bit ARMv7)
+    // `libunwind.a` into a clean subdir of `OUT_DIR`.
     if !sysroot_triple.is_empty()
         && let Some(lib_dir) = find_ndk_sysroot_lib_dir(&env_target, sysroot_triple)
         && let Ok(out_dir) = env::var("OUT_DIR")
     {
         let stage_dir = PathBuf::from(out_dir).join("android-cxx-static");
         let _ = fs::create_dir_all(&stage_dir);
-        for lib_name in ["libc++_static.a", "libc++abi.a"] {
+        for lib_name in ["libc++_static.a", "libc++abi.a", "libunwind.a"] {
             let src = lib_dir.join(lib_name);
             let dst = stage_dir.join(lib_name);
             if src.is_file() {
@@ -52,6 +53,9 @@ fn main() {
     // `operator new/delete`, etc. resolve inside `libnsh.so`.
     println!("cargo:rustc-link-lib=static=c++_static");
     println!("cargo:rustc-link-lib=static=c++abi");
+    if env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("arm") {
+        println!("cargo:rustc-link-lib=static=unwind");
+    }
 }
 
 fn find_ndk_sysroot_lib_dir(env_target: &str, sysroot_triple: &str) -> Option<PathBuf> {

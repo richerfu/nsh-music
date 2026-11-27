@@ -31,6 +31,7 @@ nsh-platform-windows = { version = "0.7", default-features = false, features = [
   "svg",
   "net",
 ] }
+nsh-platform-harmonyos = { version = "0.7", default-features = false }
 
 nsh-music-platforms = { path = "platforms" }
 nsh-music-core = { path = "crates/nsh-music-core" }
