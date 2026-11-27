@@ -637,6 +637,11 @@ mod tests {
             Some("https://cdn.example/a.jpg")
         );
         assert_eq!(
+            mpris_art_url("file:///tmp/my%20cover.png").as_deref(),
+            Some("file:///tmp/my%20cover.png")
+        );
+        #[cfg(unix)]
+        assert_eq!(
             mpris_art_url("/tmp/my cover.png").as_deref(),
             Some("file:///tmp/my%20cover.png")
         );
@@ -678,14 +683,28 @@ mod tests {
         assert_eq!(actions & 16, 0); // ACTION_SKIP_TO_PREVIOUS
         assert_ne!(actions & 256, 0); // ACTION_SEEK_TO
 
-        assert_eq!(
-            artwork_local_path("file:///tmp/cover.png"),
-            Some(PathBuf::from("/tmp/cover.png"))
-        );
-        assert_eq!(
-            artwork_local_path("/var/cache/art.jpg"),
-            Some(PathBuf::from("/var/cache/art.jpg"))
-        );
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                artwork_local_path("file:///tmp/cover.png"),
+                Some(PathBuf::from("/tmp/cover.png"))
+            );
+            assert_eq!(
+                artwork_local_path("/var/cache/art.jpg"),
+                Some(PathBuf::from("/var/cache/art.jpg"))
+            );
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                artwork_local_path("file:///C:/tmp/cover.png"),
+                Some(PathBuf::from(r"C:\tmp\cover.png"))
+            );
+            assert_eq!(
+                artwork_local_path(r"C:\var\cache\art.jpg"),
+                Some(PathBuf::from(r"C:\var\cache\art.jpg"))
+            );
+        }
         assert_eq!(artwork_local_path("https://cdn.example/art.jpg"), None);
         assert_eq!(artwork_local_path(""), None);
 

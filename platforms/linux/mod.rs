@@ -757,25 +757,27 @@ unsafe extern "C" fn on_player_method_call(
             "Stop" => shared.remote.dispatch(RemoteCommand::Stop),
             "Next" => shared.remote.dispatch(RemoteCommand::Next),
             "Previous" => shared.remote.dispatch(RemoteCommand::Prev),
-            "Seek" => {
-                if !parameters.is_null() && unsafe { (a.g_variant_n_children)(parameters) } >= 1 {
-                    let child = unsafe { (a.g_variant_get_child_value)(parameters, 0) };
-                    let offset_us = unsafe { (a.g_variant_get_int64)(child) };
-                    unsafe { (a.g_variant_unref)(child) };
-                    shared
-                        .remote
-                        .dispatch(RemoteCommand::SeekRelative(offset_us / 1_000));
-                }
+            "Seek"
+                if !parameters.is_null()
+                    && unsafe { (a.g_variant_n_children)(parameters) } >= 1 =>
+            {
+                let child = unsafe { (a.g_variant_get_child_value)(parameters, 0) };
+                let offset_us = unsafe { (a.g_variant_get_int64)(child) };
+                unsafe { (a.g_variant_unref)(child) };
+                shared
+                    .remote
+                    .dispatch(RemoteCommand::SeekRelative(offset_us / 1_000));
             }
-            "SetPosition" => {
-                if !parameters.is_null() && unsafe { (a.g_variant_n_children)(parameters) } >= 2 {
-                    let child = unsafe { (a.g_variant_get_child_value)(parameters, 1) };
-                    let pos_us = unsafe { (a.g_variant_get_int64)(child) };
-                    unsafe { (a.g_variant_unref)(child) };
-                    shared
-                        .remote
-                        .dispatch(RemoteCommand::Seek(us_to_ms(pos_us)));
-                }
+            "SetPosition"
+                if !parameters.is_null()
+                    && unsafe { (a.g_variant_n_children)(parameters) } >= 2 =>
+            {
+                let child = unsafe { (a.g_variant_get_child_value)(parameters, 1) };
+                let pos_us = unsafe { (a.g_variant_get_int64)(child) };
+                unsafe { (a.g_variant_unref)(child) };
+                shared
+                    .remote
+                    .dispatch(RemoteCommand::Seek(us_to_ms(pos_us)));
             }
             _ => {}
         }

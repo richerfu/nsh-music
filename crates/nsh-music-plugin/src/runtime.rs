@@ -2079,6 +2079,17 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    fn wait_for_storage_key(host_ctx: &HostContext, key: &str, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while host_ctx.get_storage(key).is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for plugin storage key `{key}`"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     #[test]
     fn high_priority_preempts_queued_low_priority_calls() {
         let root =
@@ -2100,7 +2111,8 @@ mod tests {
             const order = [];
             const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
             export async function search() {
-                await sleep(180);
+                host.storage.set("started", true);
+                await sleep(600);
                 order.push("blocker");
                 return { tracks: [] };
             }
@@ -2128,17 +2140,29 @@ mod tests {
                 .expect("load priority plugin"),
         );
 
-        // 1. Occupy the worker with a 180ms high-priority blocker call.
+        // 1. Occupy the worker with a 600ms high-priority blocker call and wait until it is
+        //    deterministically inside QuickJS (`host.storage.set("started", true)`).
         let s_blocker = Arc::clone(&source);
         let t_blocker = thread::spawn(move || s_blocker.call_raw("search", vec![]));
-        thread::sleep(Duration::from_millis(35));
+        wait_for_storage_key(&source.host_ctx, "started", Duration::from_secs(5));
 
-        // 2. Queue two low-priority calls (`lyrics`, `played`) FIRST, then a high-priority `stream`.
+        // 2. Queue two low-priority calls (`lyrics`, `played`) FIRST, then a high-priority `stream`
+        //    while `search` still has > 500ms of sleep remaining.
+        let lo_ready = Arc::new(std::sync::Barrier::new(3));
         let s_lo1 = Arc::clone(&source);
-        let t_lo1 = thread::spawn(move || s_lo1.call_raw("lyrics", vec![]));
+        let b1 = Arc::clone(&lo_ready);
+        let t_lo1 = thread::spawn(move || {
+            b1.wait();
+            s_lo1.call_raw("lyrics", vec![])
+        });
         let s_lo2 = Arc::clone(&source);
-        let t_lo2 = thread::spawn(move || s_lo2.call_raw("played", vec![]));
-        thread::sleep(Duration::from_millis(20));
+        let b2 = Arc::clone(&lo_ready);
+        let t_lo2 = thread::spawn(move || {
+            b2.wait();
+            s_lo2.call_raw("played", vec![])
+        });
+        lo_ready.wait();
+        thread::sleep(Duration::from_millis(60));
 
         let s_hi = Arc::clone(&source);
         let t_hi = thread::spawn(move || s_hi.call_raw("stream", vec![]));
@@ -2198,7 +2222,8 @@ mod tests {
                 return generation;
             }
             export async function lyrics() {
-                await sleep(300);
+                host.storage.set("started", true);
+                await sleep(500);
                 return { lrc: "late" };
             }
             export async function track() {
@@ -2237,18 +2262,18 @@ mod tests {
             "register_rescue_relay must cap active rescue relays at 3"
         );
 
-        // 1. Start a slow low-priority `lyrics` call with a 140ms timeout (times out while started).
+        // 1. Start a slow low-priority `lyrics` call with a 220ms timeout (times out while started).
         let s_lo = Arc::clone(&source);
         let t_lo = thread::spawn(move || {
-            s_lo.call_raw_with_timeout("lyrics", vec![], Duration::from_millis(140))
+            s_lo.call_raw_with_timeout("lyrics", vec![], Duration::from_millis(220))
         });
 
-        // Wait until `lyrics` is executing, then enqueue a high-priority `track` call with an
-        // explicit 40ms `call_timeout_override` (which caps total wait) so it strictly times out
-        // BEFORE `lyrics` finishes or cancels (`cancelled = true`, `started = false`).
-        thread::sleep(Duration::from_millis(30));
-        source.set_call_timeout_override(Some(Duration::from_millis(40)));
-        let queued_res = source.call_raw_with_timeout("track", vec![], Duration::from_millis(40));
+        // Deterministically wait until `lyrics` is executing, then enqueue a high-priority `track`
+        // call with an explicit 50ms `call_timeout_override` (which caps total wait) so it strictly
+        // times out BEFORE `lyrics` finishes or cancels (`cancelled = true`, `started = false`).
+        wait_for_storage_key(&source.host_ctx, "started", Duration::from_secs(5));
+        source.set_call_timeout_override(Some(Duration::from_millis(50)));
+        let queued_res = source.call_raw_with_timeout("track", vec![], Duration::from_millis(50));
         source.set_call_timeout_override(None);
         assert!(
             queued_res.is_err(),
@@ -2268,8 +2293,7 @@ mod tests {
             "queued and low-priority timeouts must NOT kill active processes"
         );
 
-        // Wait for the in-flight 300ms `lyrics` promise to finish, then confirm the SAME VM instance is alive.
-        thread::sleep(Duration::from_millis(320));
+        // Confirm the SAME VM instance is alive (worker resumes cleanly after `lyrics` cancels).
         assert_eq!(
             source.call_raw("getGen", vec![]).unwrap(),
             serde_json::json!(1),
@@ -2480,7 +2504,8 @@ mod tests {
             r#"
             const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
             export async function search() {
-                await sleep(220);
+                host.storage.set("started", true);
+                await sleep(500);
                 return { tracks: [] };
             }
             export async function lyrics() {
@@ -2488,7 +2513,7 @@ mod tests {
                 return { lrc: "queued-ok" };
             }
             export async function slowLyrics() {
-                await sleep(220);
+                await sleep(400);
                 return { lrc: "too-slow" };
             }
             "#,
@@ -2500,31 +2525,33 @@ mod tests {
                 .expect("load queue-start-timeout plugin"),
         );
 
-        // 1. Occupy the worker with a 220ms active `search` call.
+        // 1. Occupy the worker with a 500ms active `search` call and wait until QuickJS has
+        //    deterministically entered `search()` before starting the queued call timer.
         let s_blocker = Arc::clone(&source);
         let t_blocker = thread::spawn(move || {
             s_blocker.call_raw_with_timeout("search", vec![], Duration::from_secs(5))
         });
-        thread::sleep(Duration::from_millis(35));
+        wait_for_storage_key(&source.host_ctx, "started", Duration::from_secs(5));
 
-        // 2. Enqueue `lyrics` with a 120ms execution timeout (shorter than the remaining ~185ms
-        //    queue wait, but longer than its 30ms execution body). With `call_timeout_override == None`,
-        //    the 120ms timeout must NOT begin until `lyrics` actually starts executing.
+        // 2. Enqueue `lyrics` with a 220ms execution timeout (much shorter than the ~500ms
+        //    queue wait, yet generous for its 30ms execution body even under CI load). With
+        //    `call_timeout_override == None`, the 220ms timeout must NOT begin until `lyrics`
+        //    actually starts executing.
         let t0 = Instant::now();
         let queued = source
-            .call_raw_with_timeout("lyrics", vec![], Duration::from_millis(120))
+            .call_raw_with_timeout("lyrics", vec![], Duration::from_millis(220))
             .expect("queued call must not time out while waiting behind an active call");
         let elapsed = t0.elapsed();
         assert_eq!(queued, serde_json::json!({ "lrc": "queued-ok" }));
         assert!(
-            elapsed >= Duration::from_millis(180),
-            "expected queued call to wait behind blocker (~215ms), elapsed={elapsed:?}"
+            elapsed >= Duration::from_millis(280),
+            "expected queued call to wait behind blocker (~530ms, exceeding 220ms timeout), elapsed={elapsed:?}"
         );
         assert!(t_blocker.join().unwrap().is_ok());
 
         // 3. A call whose own execution exceeds its timeout MUST still time out cleanly.
         let slow_err = source
-            .call_raw_with_timeout("slowLyrics", vec![], Duration::from_millis(90))
+            .call_raw_with_timeout("slowLyrics", vec![], Duration::from_millis(100))
             .expect_err("genuinely slow execution must still time out");
         assert!(slow_err.to_string().contains("in time"), "got {slow_err}");
 
