@@ -246,6 +246,8 @@ jobs:
 
           APP_PATH=".nsh/out/NSH Music.app"
           test -d "$APP_PATH"
+          # Reclaim multi-GB runner build target on macos-15-intel before DMG allocation
+          rm -rf .nsh/rust/target
 
           STAGING="$RUNNER_TEMP/dmg-staging"
           rm -rf "$STAGING"
@@ -253,10 +255,13 @@ jobs:
           cp -R "$APP_PATH" "$STAGING/"
           ln -s /Applications "$STAGING/Applications"
 
+          DMG_SIZE_MB=$(( $(du -sm "$STAGING" | awk '{print $1}') + 128 ))
           DMG_OUT="release-assets/NSH-Music-v${VERSION}-macos-${{ matrix.arch }}.dmg"
           hdiutil create \
             -volname "NSH Music" \
             -srcfolder "$STAGING" \
+            -fs HFS+ \
+            -size "${DMG_SIZE_MB}m" \
             -ov \
             -format UDZO \
             "$DMG_OUT"
@@ -482,21 +487,22 @@ jobs:
           sudo apt-get install -y \
             clang llvm libclang-dev pkg-config build-essential \
             libgtk-4-dev libwebkitgtk-6.0-dev libasound2-dev \
-            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libgl1
+
+      - name: Setup HarmonyOS 26.0.0.821 SDK (complete openharmony + hms)
+        if: matrix.platform == 'harmonyos'
+        id: setup-harmonyos-sdk
+        uses: ErBWs/setup-ohos@v2
+        with:
+          version: "26.0.0.821"
+          cache: true
 
       - name: Setup Node.js 22 (for @ohos-rs/arkdown)
         if: matrix.platform == 'harmonyos'
         uses: actions/setup-node@v4
         with:
           node-version: "22"
-
-      - name: Setup OpenHarmony 6.0 SDK (full components for NDK + arkdown)
-        if: matrix.platform == 'harmonyos'
-        id: setup-ohos-sdk
-        uses: openharmony-rs/setup-ohos-sdk@v0.2
-        with:
-          version: "6.0"
-          components: all
 
       - name: Cache nsh-platform-harmonyos CLI binary
         if: matrix.platform == 'harmonyos'
@@ -511,15 +517,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          SDK_HOME="${{ steps.setup-ohos-sdk.outputs.ohos-base-sdk-home }}"
-          test -n "$SDK_HOME"
-          test -d "$SDK_HOME/ets/build-tools/ets-loader"
-          test -x "$SDK_HOME/toolchains/restool"
+          test -n "${HOS_SDK_HOME:-}"
+          test -d "$HOS_SDK_HOME/default/hms/ets"
+          test -d "$HOS_SDK_HOME/default/openharmony/ets"
+          test -x "$HOS_SDK_HOME/default/openharmony/toolchains/restool"
           {
-            echo "OHOS_BASE_SDK_HOME=$SDK_HOME"
-            echo "OHOS_SDK_HOME=$SDK_HOME"
-            echo "OHOS_NDK_HOME=$SDK_HOME"
-            echo "BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_ohos=--target=aarch64-linux-ohos --sysroot=$SDK_HOME/native/sysroot -D__MUSL__"
+            echo "DEVECO_SDK_HOME=$HOS_SDK_HOME"
+            echo "OHOS_BASE_SDK_HOME=$HOS_SDK_HOME/default/openharmony"
+            echo "OHOS_SDK_HOME=$HOS_SDK_HOME"
+            echo "OHOS_NDK_HOME=$HOS_SDK_HOME/default/openharmony"
+            echo "BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_ohos=--target=aarch64-linux-ohos --sysroot=$HOS_SDK_HOME/default/openharmony/native/sysroot -D__MUSL__"
           } >> "$GITHUB_ENV"
 
           rustup target add aarch64-unknown-linux-ohos
@@ -538,6 +545,7 @@ jobs:
           "$HOME/.local/bin/ohpm-rs" --version
 
           # Install @ohos-rs/arkdown (Rust-based OpenHarmony/HarmonyOS HAP packager)
+          node --version
           npm install -g "@ohos-rs/arkdown@${ARKDOWN_VERSION}"
           arkdown --version
 
@@ -552,6 +560,12 @@ jobs:
           PROJ_DIR=".nsh/out-harmonyos"
           rm -rf "$PROJ_DIR"
           nsh package --target harmonyos --runtime-os harmonyos --arch arm64 --no-hap -o "$PROJ_DIR" -v
+
+          # 1b. Stage full-bleed opaque app icon (`nsh-platform-harmonyos 0.7.0` only reads
+          # string `nsh.json` `"icon"`, so per-platform object `"icon"` falls back to template SVG).
+          grep -q '"\$media:app_icon"' "$PROJ_DIR/AppScope/app.json5"
+          cp assets/app-icon.png "$PROJ_DIR/AppScope/resources/base/media/app_icon.png"
+          rm -f "$PROJ_DIR/AppScope/resources/base/media/app_icon.svg"
 
           # 2. Install OHPM workspace/module dependencies via ohpm-rs
           (cd "$PROJ_DIR" && ohpm-rs install --all)

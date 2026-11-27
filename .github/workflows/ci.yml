@@ -100,11 +100,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang llvm libclang-dev pkg-config build-essential
-      - name: Setup OpenHarmony 6.0 NDK
+      - name: Setup OpenHarmony 7.0 NDK
         id: setup-ohos-sdk
-        uses: openharmony-rs/setup-ohos-sdk@v0.2
+        uses: openharmony-rs/setup-ohos-sdk@v1.0.1
         with:
-          version: "6.0"
+          version: "7.0"
           components: native
       - uses: dtolnay/rust-toolchain@stable
         with:
