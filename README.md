@@ -156,7 +156,7 @@ nsh package --target <platform>
 
 | 平台目标                       | 自动构建产物                                                                                                   |
 | ------------------------------ | -------------------------------------------------------------------------------------------------------------- |
-| **macOS (`arm64`/`x86_64`)**   | `NSH-Music-v<ver>-macos-<arch>.dmg`（拖拽安装）+ `NSH-Music-v<ver>-macos-<arch>.app.tar.gz`                    |
+| **macOS (`arm64`)**            | `NSH-Music-v<ver>-macos-arm64.dmg`（拖拽安装）+ `NSH-Music-v<ver>-macos-arm64.app.tar.gz`                      |
 | **Windows (`x86_64`/`arm64`)** | `NSH-Music-v<ver>-windows-<arch>-setup.exe`（Inno Setup 安装器）+ `-portable.zip`                              |
 | **Linux (`x86_64`/`arm64`)**   | `NSH-Music-v<ver>-linux-<arch>.AppImage` + `NSH-Music-v<ver>-linux-<arch>.tar.gz`                              |
 | **Android**                    | `NSH-Music-v<ver>-android-arm64-v8a.apk` + `NSH-Music-v<ver>-android-universal.apk`（`arm64-v8a` + `x86_64`）  |

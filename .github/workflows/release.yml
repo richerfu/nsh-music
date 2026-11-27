@@ -1,7 +1,7 @@
 name: Release
 
 # Multi-platform release pipeline for NSH Music:
-# - macOS (arm64, x86_64): drag-to-Applications .dmg + .app.tar.gz
+# - macOS (arm64): drag-to-Applications .dmg + .app.tar.gz
 # - Windows (x86_64, arm64): Inno Setup -setup.exe + portable .zip
 # - Linux (x86_64, arm64): .AppImage + .tar.gz
 # - Android: arm64-v8a .apk + universal (arm64-v8a + x86_64) .apk
@@ -28,7 +28,6 @@ on:
         options:
           - all
           - macos-arm64
-          - macos-x86_64
           - windows-x86_64
           - windows-arm64
           - linux-x86_64
@@ -101,7 +100,6 @@ jobs:
 
           all_targets = [
               {"target": "macos-arm64", "os": "macos-15", "platform": "macos", "arch": "arm64"},
-              {"target": "macos-x86_64", "os": "macos-15-intel", "platform": "macos", "arch": "x86_64"},
               {"target": "windows-x86_64", "os": "windows-latest", "platform": "windows", "arch": "x86_64"},
               {"target": "windows-arm64", "os": "windows-11-arm", "platform": "windows", "arch": "arm64"},
               {"target": "linux-x86_64", "os": "ubuntu-24.04", "platform": "linux", "arch": "x86_64", "appimage_arch": "x86_64"},
@@ -234,7 +232,7 @@ jobs:
           & (Join-Path $nshBin 'nsh.exe') --version
 
       # -----------------------------------------------------------------------
-      # macOS packaging (arm64 & x86_64 -> .dmg + .app.tar.gz)
+      # macOS packaging (arm64 -> .dmg + .app.tar.gz)
       # -----------------------------------------------------------------------
       - name: Package macOS (${{ matrix.arch }})
         if: matrix.platform == 'macos'
@@ -246,7 +244,7 @@ jobs:
 
           APP_PATH=".nsh/out/NSH Music.app"
           test -d "$APP_PATH"
-          # Reclaim multi-GB runner build target on macos-15-intel before DMG allocation
+          # Reclaim multi-GB runner build target before DMG allocation
           rm -rf .nsh/rust/target
 
           STAGING="$RUNNER_TEMP/dmg-staging"
@@ -521,11 +519,42 @@ jobs:
           test -d "$HOS_SDK_HOME/default/hms/ets"
           test -d "$HOS_SDK_HOME/default/openharmony/ets"
           test -x "$HOS_SDK_HOME/default/openharmony/toolchains/restool"
+
+          SDK_LIB_DIRS=""
+          for d in \
+            "$HOS_SDK_HOME/default/openharmony/previewer/common/bin" \
+            "$HOS_SDK_HOME/default/hms/toolchains/lib" \
+            "$HOS_SDK_HOME/default/openharmony/toolchains/lib"; do
+            if [[ -d "$d" ]]; then
+              SDK_LIB_DIRS="${SDK_LIB_DIRS:+$SDK_LIB_DIRS:}$d"
+            fi
+          done
+          while IFS= read -r lz4_so; do
+            [[ -n "$lz4_so" ]] || continue
+            lz4_dir="$(dirname "$lz4_so")"
+            case ":$SDK_LIB_DIRS:" in
+              *":$lz4_dir:"*) ;;
+              *) SDK_LIB_DIRS="${SDK_LIB_DIRS:+$SDK_LIB_DIRS:}$lz4_dir" ;;
+            esac
+          done < <(find "$HOS_SDK_HOME" -name 'liblz4_shared.so' 2>/dev/null || true)
+
+          # Fail fast if restool's HMS image transcoder still has unresolved .so deps before the Rust build.
+          TRANSCODER="$HOS_SDK_HOME/default/hms/toolchains/lib/libimage_transcoder_shared.so"
+          if [[ -f "$TRANSCODER" ]]; then
+            LDD_OUT="$(LD_LIBRARY_PATH="${SDK_LIB_DIRS}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ldd "$TRANSCODER")"
+            echo "$LDD_OUT"
+            if grep -q "not found" <<< "$LDD_OUT"; then
+              echo "::error::Unresolved shared library dependency for libimage_transcoder_shared.so"
+              exit 1
+            fi
+          fi
+
           {
             echo "DEVECO_SDK_HOME=$HOS_SDK_HOME"
             echo "OHOS_BASE_SDK_HOME=$HOS_SDK_HOME/default/openharmony"
             echo "OHOS_SDK_HOME=$HOS_SDK_HOME"
             echo "OHOS_NDK_HOME=$HOS_SDK_HOME/default/openharmony"
+            echo "HARMONYOS_RESTOOL_LD_LIBRARY_PATH=$SDK_LIB_DIRS"
             echo "BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_ohos=--target=aarch64-linux-ohos --sysroot=$HOS_SDK_HOME/default/openharmony/native/sysroot -D__MUSL__"
           } >> "$GITHUB_ENV"
 
@@ -571,7 +600,8 @@ jobs:
           (cd "$PROJ_DIR" && ohpm-rs install --all)
 
           # 3. Build & pack unsigned HAP via @ohos-rs/arkdown (no signing required in CI)
-          arkdown build --project "$PROJ_DIR" --target hap --mode release --clearScreen false
+          LD_LIBRARY_PATH="${HARMONYOS_RESTOOL_LD_LIBRARY_PATH}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+            arkdown build --project "$PROJ_DIR" --target hap --mode release --clearScreen false
 
           # 4. Collect packaged unsigned HAP
           HAP_OUT_DIR="$PROJ_DIR/entry/build/default/outputs/default"
