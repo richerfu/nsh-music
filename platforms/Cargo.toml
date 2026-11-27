@@ -1,0 +1,83 @@
+[package]
+name = "nsh-music-platforms"
+description = "Per-platform native media session and system integration drivers for nsh-music."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "nsh_music_platforms"
+path = "src/lib.rs"
+
+[dependencies]
+nsh-music-audio.workspace = true
+url.workspace = true
+log.workspace = true
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+reqwest.workspace = true
+tokio.workspace = true
+objc2 = "0.6.5"
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "CFCGTypes",
+] }
+block2 = "0.6.2"
+dispatch2 = "0.3.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "block2",
+  "NSData",
+  "NSDictionary",
+  "NSGeometry",
+  "NSObject",
+  "NSString",
+  "NSValue",
+] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "NSApplication",
+  "NSImage",
+] }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "block2",
+  "NSData",
+  "NSDictionary",
+  "NSObject",
+  "NSString",
+  "NSValue",
+] }
+objc2-ui-kit = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "objc2-core-foundation",
+  "UIImage",
+] }
+
+[target.'cfg(all(target_os = "linux", not(target_env = "ohos")))'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = [
+  "std",
+  "Foundation",
+  "Media",
+  "Media_Playback",
+  "Storage",
+  "Storage_Streams",
+  "Win32_System_Com",
+  "Win32_System_WinRT",
+] }
+windows-core = "0.62"
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+libc = "0.2"
+
+[target.'cfg(target_env = "ohos")'.dependencies]
+nsh-platform-harmonyos = { path = "../../nsh-platform-harmonyos.worktrees/upgrade-nsh-0.7", default-features = false }

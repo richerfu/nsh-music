@@ -3805,32 +3805,23 @@ dependencies = [
 name = "nsh-app-music"
 version = "0.1.0"
 dependencies = [
- "block2",
  "chrono",
  "dirs",
- "dispatch2",
  "env_logger",
  "image",
- "jni 0.21.1",
- "libc",
  "log",
  "nsh-base",
  "nsh-core",
  "nsh-engine",
  "nsh-music-audio",
  "nsh-music-core",
+ "nsh-music-platforms",
  "nsh-music-plugin",
- "nsh-platform-harmonyos",
  "nsh-platform-linux",
  "nsh-platform-macos",
  "nsh-platform-windows",
  "nsh-testing",
  "nsh-web-signin",
- "objc2",
- "objc2-app-kit",
- "objc2-core-foundation",
- "objc2-foundation",
- "objc2-ui-kit",
  "qrcode",
  "reqwest",
  "serde",
@@ -3838,8 +3829,6 @@ dependencies = [
  "sha2 0.10.9",
  "tokio",
  "url",
- "windows 0.62.2",
- "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -4081,6 +4070,29 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 2.0.21",
  "url",
+]
+
+[[package]]
+name = "nsh-music-platforms"
+version = "0.1.0"
+dependencies = [
+ "block2",
+ "dispatch2",
+ "jni 0.21.1",
+ "libc",
+ "log",
+ "nsh-music-audio",
+ "nsh-platform-harmonyos",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-core-foundation",
+ "objc2-foundation",
+ "objc2-ui-kit",
+ "reqwest",
+ "tokio",
+ "url",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]

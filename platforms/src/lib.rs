@@ -1,15 +1,19 @@
 //! Platform-specific native integrations (media session / notification bar controls).
 
 #[cfg(target_os = "android")]
-mod android_mediasession;
+#[path = "../android/mod.rs"]
+mod android;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-mod apple_now_playing;
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-mod linux_mpris;
+mod apple_common;
 #[cfg(target_env = "ohos")]
-mod ohos_avsession;
+#[path = "../harmonyos/mod.rs"]
+mod harmonyos;
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+#[path = "../linux/mod.rs"]
+mod linux;
 #[cfg(target_os = "windows")]
-mod windows_smtc;
+#[path = "../windows/mod.rs"]
+mod windows;
 
 use std::path::PathBuf;
 
@@ -21,32 +25,32 @@ pub fn install_platform_remote(remote: &RemoteController) {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         remote.set_driver(std::sync::Arc::new(
-            apple_now_playing::AppleNowPlayingDriver::new(remote.clone()),
+            apple_common::AppleNowPlayingDriver::new(remote.clone()),
         ));
     }
     #[cfg(target_os = "windows")]
     {
-        remote.set_driver(std::sync::Arc::new(windows_smtc::WindowsSmtcDriver::new(
+        remote.set_driver(std::sync::Arc::new(windows::WindowsSmtcDriver::new(
             remote.clone(),
         )));
     }
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     {
-        remote.set_driver(std::sync::Arc::new(linux_mpris::LinuxMprisDriver::new(
+        remote.set_driver(std::sync::Arc::new(linux::LinuxMprisDriver::new(
             remote.clone(),
         )));
     }
     #[cfg(target_os = "android")]
     {
         remote.set_driver(std::sync::Arc::new(
-            android_mediasession::AndroidMediaSessionDriver::new(remote.clone()),
+            android::AndroidMediaSessionDriver::new(remote.clone()),
         ));
     }
     #[cfg(target_env = "ohos")]
     {
-        remote.set_driver(std::sync::Arc::new(
-            ohos_avsession::HarmonyAvSessionDriver::new(remote.clone()),
-        ));
+        remote.set_driver(std::sync::Arc::new(harmonyos::HarmonyAvSessionDriver::new(
+            remote.clone(),
+        )));
     }
     #[cfg(not(any(
         target_os = "macos",
