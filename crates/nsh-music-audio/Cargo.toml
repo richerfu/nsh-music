@@ -36,11 +36,24 @@ coreaudio-sys = { version = "0.2", default-features = false, features = ["core_a
 
 [target.'cfg(target_os = "ios")'.dependencies]
 objc2 = "0.6.5"
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSString", "NSValue", "NSDictionary", "NSObject", "NSNotification", "NSOperation"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "block2",
+  "NSString",
+  "NSValue",
+  "NSDictionary",
+  "NSObject",
+  "NSNotification",
+  "NSOperation",
+] }
 block2 = "0.6.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Media_Audio", "Win32_System_Com"] }
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_Media_Audio",
+  "Win32_System_Com",
+] }
 windows-core = "0.62"
 
 [target.'cfg(target_os = "android")'.dependencies]

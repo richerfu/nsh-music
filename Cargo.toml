@@ -71,6 +71,7 @@ quickjs-jit = { version = "=0.14.2", default-features = false, features = [
   "futures",
   "loader",
   "macro",
+  "bindgen",
 ] }
 oxc = { version = "=0.153.0", features = ["transformer", "codegen", "semantic"] }
 lofty = "0.22"
@@ -81,6 +82,7 @@ qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 reqwest = { version = "0.12", default-features = false, features = [
   "rustls-tls",
   "rustls-tls-native-roots",
+  "rustls-tls-webpki-roots",
   "system-proxy",
   "http2",
   "gzip",
