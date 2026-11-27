@@ -8,9 +8,39 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use nsh_core::prelude::*;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::ui::theme;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct CachedAccent {
+    h: f32,
+    s: f32,
+    l: f32,
+    a: f32,
+}
+
+impl From<Hsla> for CachedAccent {
+    fn from(c: Hsla) -> Self {
+        Self {
+            h: c.h,
+            s: c.s,
+            l: c.l,
+            a: c.a,
+        }
+    }
+}
+
+impl CachedAccent {
+    fn into_hsla(self) -> Option<Hsla> {
+        if self.h.is_finite() && self.s.is_finite() && self.l.is_finite() && self.a.is_finite() {
+            Some(hsla(self.h, self.s, self.l, self.a))
+        } else {
+            None
+        }
+    }
+}
 
 /// Resolved artwork entry ready for UI rendering.
 #[derive(Debug, Clone, PartialEq)]
@@ -69,10 +99,50 @@ impl ArtworkLoader {
         &self.cache_dir
     }
 
-    /// Synchronous in-memory cache lookup.
+    /// Synchronous cache lookup checking in-memory cache first, then disk
+    /// cover + persisted `.accent` sidecar (without decoding image pixels on
+    /// the UI thread), populating the in-memory cache on disk hit.
     pub fn cached(&self, raw_url: &str, size_px: u32) -> Option<ResolvedArtwork> {
-        let key = cache_key(raw_url, size_px);
-        self.mem.read().ok().and_then(|m| m.get(&key).cloned())
+        let expanded = Self::resolve_template(raw_url.trim(), size_px);
+        let key = cache_key(&expanded, size_px);
+        if let Some(hit) = self.mem.read().ok().and_then(|m| m.get(&key).cloned()) {
+            return Some(hit);
+        }
+        if expanded.is_empty() {
+            return None;
+        }
+        if let Some(local) = resolve_local_uri(&expanded) {
+            let accent = self.read_accent_sidecar(&key)?;
+            let res = ResolvedArtwork {
+                uri: path_to_file_uri(&local).into(),
+                accent,
+            };
+            self.remember(key, res.clone());
+            return Some(res);
+        }
+        let existing = self.find_cached_file(&key)?;
+        let accent = self.read_accent_sidecar(&key)?;
+        let res = ResolvedArtwork {
+            uri: path_to_file_uri(&existing).into(),
+            accent,
+        };
+        self.remember(key, res.clone());
+        Some(res)
+    }
+
+    /// Clears both the in-memory artwork cache and all cached files on disk.
+    pub fn clear(&self) {
+        if let Ok(mut guard) = self.mem.write() {
+            guard.clear();
+        }
+        if let Ok(entries) = std::fs::read_dir(&self.cache_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
     }
 
     /// Resolves artwork asynchronously (safe to run inside `tokio` / `background`).
@@ -96,7 +166,11 @@ impl ArtworkLoader {
 
         // Local file URI or direct path
         if let Some(local) = resolve_local_uri(&expanded) {
-            let accent = extract_accent_from_path(&local, seed);
+            let accent = self.read_accent_sidecar(&cache_id).unwrap_or_else(|| {
+                let extracted = extract_accent_from_path(&local, seed);
+                self.write_accent_sidecar(&cache_id, extracted);
+                extracted
+            });
             let res = ResolvedArtwork {
                 uri: path_to_file_uri(&local).into(),
                 accent,
@@ -108,7 +182,11 @@ impl ArtworkLoader {
         // Remote HTTP(S) image with plugin requestHeaders
         if expanded.starts_with("http://") || expanded.starts_with("https://") {
             if let Some(existing) = self.find_cached_file(&cache_id) {
-                let accent = extract_accent_from_path(&existing, &expanded);
+                let accent = self.read_accent_sidecar(&cache_id).unwrap_or_else(|| {
+                    let extracted = extract_accent_from_path(&existing, &expanded);
+                    self.write_accent_sidecar(&cache_id, extracted);
+                    extracted
+                });
                 let res = ResolvedArtwork {
                     uri: path_to_file_uri(&existing).into(),
                     accent,
@@ -183,10 +261,32 @@ impl ArtworkLoader {
         }
 
         let accent = extract_accent_from_bytes(&bytes, url);
+        self.write_accent_sidecar(cache_id, accent);
         Ok(ResolvedArtwork {
             uri: path_to_file_uri(&dest).into(),
             accent,
         })
+    }
+
+    fn accent_sidecar_path(&self, cache_id: &str) -> PathBuf {
+        self.cache_dir.join(format!("{cache_id}.accent"))
+    }
+
+    fn read_accent_sidecar(&self, cache_id: &str) -> Option<Hsla> {
+        let bytes = std::fs::read(self.accent_sidecar_path(cache_id)).ok()?;
+        let parsed: CachedAccent = serde_json::from_slice(&bytes).ok()?;
+        parsed.into_hsla()
+    }
+
+    fn write_accent_sidecar(&self, cache_id: &str, accent: Hsla) {
+        let Ok(bytes) = serde_json::to_vec(&CachedAccent::from(accent)) else {
+            return;
+        };
+        let dest = self.accent_sidecar_path(cache_id);
+        let tmp = self.cache_dir.join(format!("{cache_id}.accent.part"));
+        if std::fs::write(&tmp, &bytes).is_ok() {
+            let _ = std::fs::rename(&tmp, &dest);
+        }
     }
 
     fn find_cached_file(&self, cache_id: &str) -> Option<PathBuf> {
@@ -460,5 +560,46 @@ mod tests {
             gray.s < 0.05,
             "neutral gray cover must stay neutral: {gray:?}"
         );
+    }
+
+    #[test]
+    fn cached_resolves_disk_cover_and_accent_sidecar_across_restarts_and_clear_wipes() {
+        let dir = std::env::temp_dir().join(format!(
+            "nsh-music-artwork-cache-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let url = "https://cdn.example.com/album/{size}/cover.png";
+        let expanded = super::ArtworkLoader::resolve_template(url, 600);
+        let key = super::cache_key(&expanded, 600);
+        let blue_png = encode_solid_png(30, 110, 235);
+        let expected_accent = extract_accent_from_bytes(&blue_png, &expanded);
+
+        // Simulate a prior app run having written cover + .accent sidecar to disk.
+        let loader1 = super::ArtworkLoader::new(dir.clone());
+        std::fs::write(dir.join(format!("{key}.png")), &blue_png).expect("write cached png");
+        loader1.write_accent_sidecar(&key, expected_accent);
+
+        // Fresh ArtworkLoader simulates cold app restart (empty mem map).
+        let loader2 = super::ArtworkLoader::new(dir.clone());
+        let hit = loader2
+            .cached(url, 600)
+            .expect("cached() must hit disk cover + accent sidecar synchronously on frame 0");
+        assert!(hit.uri.ends_with(&format!("{key}.png")));
+        assert!((hit.accent.h - expected_accent.h).abs() < 1e-4);
+        assert!((hit.accent.s - expected_accent.s).abs() < 1e-4);
+        assert!((hit.accent.l - expected_accent.l).abs() < 1e-4);
+
+        // clear() wipes both in-memory map and disk cache files.
+        loader2.clear();
+        assert!(loader2.cached(url, 600).is_none());
+        let remaining = std::fs::read_dir(&dir)
+            .expect("read cache dir")
+            .flatten()
+            .count();
+        assert_eq!(remaining, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -19,9 +19,9 @@ use nsh_music_core::{
     local::LocalMusicSource,
     lyrics::{ActiveLyric, ParsedLyrics, parse_lyrics},
     model::{
-        Account, Album, AlbumPage, Artist, ArtistPage, Browse, Comment, PlayerStyle, Playlist,
-        Quality, RemoteDevice, RepeatMode, SearchKind, SearchResult, Show, ShowPage, SignInPrompt,
-        SourceError, SourceInfo, StageStyle, Station, Track,
+        Account, Album, AlbumPage, Artist, ArtistPage, Browse, Comment, CommentPage, PlayerStyle,
+        Playlist, Quality, RemoteDevice, RepeatMode, SearchKind, SearchResult, Show, ShowPage,
+        SignInPrompt, SourceError, SourceInfo, StageStyle, Station, Track,
     },
     session::PlaybackSession,
     settings::{AppSettings, ThemeMode},
@@ -31,9 +31,113 @@ use nsh_music_plugin::{
     PendingPluginInstall, PluginManager, PluginSummary,
     host::{WebSignInRequest, WebSignInResult},
 };
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::state::artwork::ArtworkLoader;
 use crate::ui::{overlays::ToastController, theme};
+
+const LYRICS_MEM_CACHE_MAX: usize = 128;
+const COMMENTS_MEM_CACHE_MAX: usize = 64;
+const DETAIL_MEM_CACHE_MAX: usize = 32;
+const CATALOG_SNAPSHOT_FRESH_TTL: Duration = Duration::from_secs(300);
+
+type CachedLyricsValue = (ParsedLyrics, String);
+
+struct BoundedCache<K, V> {
+    max_entries: usize,
+    tick: u64,
+    map: HashMap<K, (V, u64)>,
+}
+
+impl<K: Eq + std::hash::Hash + Clone, V: Clone> BoundedCache<K, V> {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            max_entries: max_entries.max(1),
+            tick: 0,
+            map: HashMap::new(),
+        }
+    }
+
+    fn get(&mut self, key: &K) -> Option<V> {
+        self.tick = self.tick.wrapping_add(1);
+        let t = self.tick;
+        self.map.get_mut(key).map(|(v, last)| {
+            *last = t;
+            v.clone()
+        })
+    }
+
+    fn insert(&mut self, key: K, val: V) {
+        self.tick = self.tick.wrapping_add(1);
+        let t = self.tick;
+        self.map.insert(key, (val, t));
+        while self.map.len() > self.max_entries {
+            if let Some(oldest_key) = self
+                .map
+                .iter()
+                .min_by_key(|(_, (_, last))| *last)
+                .map(|(k, _)| k.clone())
+            {
+                self.map.remove(&oldest_key);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn remove(&mut self, key: &K) {
+        self.map.remove(key);
+    }
+
+    fn retain<F: FnMut(&K, &V) -> bool>(&mut self, mut keep: F) {
+        self.map.retain(|k, (v, _)| keep(k, v));
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct CachedLyricsDiskEntry {
+    parsed: ParsedLyrics,
+    remote_lrc: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct SourceCatalogSnapshot {
+    home: Browse,
+    playlists: Vec<Playlist>,
+    liked_tracks: Vec<Track>,
+    liked_more: bool,
+    recent_tracks: Vec<Track>,
+    saved_albums: Vec<Album>,
+    saved_albums_more: bool,
+    stations: Vec<Station>,
+    podcasts: Vec<Show>,
+    #[serde(skip)]
+    fetched_at: Option<Instant>,
+}
+
+impl SourceCatalogSnapshot {
+    fn is_empty(&self) -> bool {
+        self.home.sections.is_empty()
+            && self.playlists.is_empty()
+            && self.liked_tracks.is_empty()
+            && self.recent_tracks.is_empty()
+            && self.saved_albums.is_empty()
+            && self.stations.is_empty()
+            && self.podcasts.is_empty()
+    }
+
+    fn is_fresh(&self) -> bool {
+        self.fetched_at
+            .is_some_and(|at| at.elapsed() < CATALOG_SNAPSHOT_FRESH_TTL)
+    }
+}
 
 const CAPABILITY_KEYS: &[&str] = &[
     "home",
@@ -444,6 +548,9 @@ pub struct AppStore {
     session: Stored<PlaybackSession>,
     settings_path: Stored<PathBuf>,
     session_path: Stored<PathBuf>,
+    lyrics_cache_dir: Stored<PathBuf>,
+    catalog_cache_dir: Stored<PathBuf>,
+    last_audio_cache_bytes: Stored<u64>,
     last_track_id: Stored<Option<String>>,
     last_played_reported_id: Stored<Option<String>>,
     last_snapshot: Stored<Option<PlaybackSnapshot>>,
@@ -461,6 +568,13 @@ pub struct AppStore {
     search_suggest_gen: Stored<u64>,
     browse_cache: Stored<HashMap<(String, String), Browse>>,
     browse_req_gen: Stored<u64>,
+    lyrics_cache: Stored<BoundedCache<(String, String), CachedLyricsValue>>,
+    comments_cache: Stored<BoundedCache<(String, String), CommentPage>>,
+    catalog_snapshots: Stored<HashMap<String, SourceCatalogSnapshot>>,
+    playlist_detail_cache: Stored<BoundedCache<(String, String), Playlist>>,
+    album_detail_cache: Stored<BoundedCache<(String, String), AlbumPage>>,
+    artist_detail_cache: Stored<BoundedCache<(String, String), ArtistPage>>,
+    show_detail_cache: Stored<BoundedCache<(String, String), ShowPage>>,
     spectrum_is_zero: Stored<bool>,
     pending_settings_save: Stored<Arc<Mutex<Option<AppSettings>>>>,
     settings_saving: Stored<Arc<AtomicBool>>,
@@ -706,6 +820,10 @@ impl AppStore {
         } else {
             ArtworkLoader::default_location()
         };
+        let lyrics_cache_dir = sandbox.lyrics_cache_dir.clone();
+        let catalog_cache_dir = sandbox.catalog_cache_dir.clone();
+        let _ = std::fs::create_dir_all(&lyrics_cache_dir);
+        let _ = std::fs::create_dir_all(&catalog_cache_dir);
         let initial_cache_bytes = audio.cache_used_bytes();
         let initial_locale = settings.locale;
         let initial_theme = settings.theme_mode;
@@ -731,7 +849,7 @@ impl AppStore {
             sidebar_collapsed: signal(false),
             mobile_drawer_open: signal(false),
 
-            active_source_id: signal(initial_source_id),
+            active_source_id: signal(initial_source_id.clone()),
             sources: signal(Vec::new()),
             plugins: signal(Vec::new()),
             plugin_busy: signal(false),
@@ -828,6 +946,9 @@ impl AppStore {
             session: stored(session),
             settings_path: stored(settings_path),
             session_path: stored(session_path),
+            lyrics_cache_dir: stored(lyrics_cache_dir),
+            catalog_cache_dir: stored(catalog_cache_dir),
+            last_audio_cache_bytes: stored(initial_cache_bytes),
             last_track_id: stored(None),
             last_played_reported_id: stored(None),
             last_snapshot: stored(None),
@@ -845,6 +966,13 @@ impl AppStore {
             search_suggest_gen: stored(0),
             browse_cache: stored(HashMap::new()),
             browse_req_gen: stored(0),
+            lyrics_cache: stored(BoundedCache::new(LYRICS_MEM_CACHE_MAX)),
+            comments_cache: stored(BoundedCache::new(COMMENTS_MEM_CACHE_MAX)),
+            catalog_snapshots: stored(HashMap::new()),
+            playlist_detail_cache: stored(BoundedCache::new(DETAIL_MEM_CACHE_MAX)),
+            album_detail_cache: stored(BoundedCache::new(DETAIL_MEM_CACHE_MAX)),
+            artist_detail_cache: stored(BoundedCache::new(DETAIL_MEM_CACHE_MAX)),
+            show_detail_cache: stored(BoundedCache::new(DETAIL_MEM_CACHE_MAX)),
             spectrum_is_zero: stored(true),
             pending_settings_save: stored(Arc::new(Mutex::new(None))),
             settings_saving: stored(Arc::new(AtomicBool::new(false))),
@@ -857,8 +985,11 @@ impl AppStore {
         store.refresh_sources();
         if initial_is_local {
             store.hydrate_active_source_sync();
+        } else if let Some(snap) = store.load_catalog_snapshot(&initial_source_id) {
+            store.apply_catalog_snapshot(&initial_source_id, &snap);
+            store.hydrate_active_source_async_with_mode(false);
         } else {
-            store.hydrate_active_source_async();
+            store.hydrate_active_source_async_with_mode(true);
         }
         store.refresh_cache_stats();
 
@@ -1304,22 +1435,46 @@ impl AppStore {
         } else {
             source_id.to_owned()
         };
+        let prev_source = self.active_source_id.get_untracked();
+        if prev_source != target {
+            let mut prev_snap = self.capture_current_catalog_snapshot();
+            if !prev_snap.is_empty() {
+                self.catalog_snapshots.with(|map| {
+                    // Preserve original freshness timestamp so cold-disk snapshots still revalidate.
+                    prev_snap.fetched_at = map.get(&prev_source).and_then(|s| s.fetched_at);
+                    map.insert(prev_source, prev_snap);
+                });
+            }
+        }
         self.invalidate_browse_cache();
+
+        let target_snap = if target == LocalMusicSource::SOURCE_ID {
+            None
+        } else {
+            self.load_catalog_snapshot(&target)
+        };
+        let has_snap = target_snap.is_some();
+        let snap_is_fresh = target_snap
+            .as_ref()
+            .is_some_and(SourceCatalogSnapshot::is_fresh);
+
         batch(|| {
             self.active_source_id.set(target.clone());
-            self.home_data.set(Browse::default());
-            self.browse_data.set(Browse::default());
-            self.playlists.set(Vec::new());
-            self.liked_tracks.set(Vec::new());
-            self.liked_ids.set(HashSet::new());
-            self.liked_more.set(false);
-            self.liked_loading_more.set(false);
-            self.recent_tracks.set(Vec::new());
-            self.saved_albums.set(Vec::new());
-            self.saved_albums_more.set(false);
-            self.saved_albums_loading_more.set(false);
-            self.stations.set(Vec::new());
-            self.podcasts.set(Vec::new());
+            if !has_snap {
+                self.home_data.set(Browse::default());
+                self.browse_data.set(Browse::default());
+                self.playlists.set(Vec::new());
+                self.liked_tracks.set(Vec::new());
+                self.liked_ids.set(HashSet::new());
+                self.liked_more.set(false);
+                self.liked_loading_more.set(false);
+                self.recent_tracks.set(Vec::new());
+                self.saved_albums.set(Vec::new());
+                self.saved_albums_more.set(false);
+                self.saved_albums_loading_more.set(false);
+                self.stations.set(Vec::new());
+                self.podcasts.set(Vec::new());
+            }
             self.search_suggestions.set(Vec::new());
             self.search_suggest_open.set(false);
             self.search_results.set(SearchResult::default());
@@ -1332,6 +1487,9 @@ impl AppStore {
             self.remote_devices.set(Vec::new());
             self.active_remote_device.set(None);
         });
+        if let Some(ref snap) = target_snap {
+            self.apply_catalog_snapshot(&target, snap);
+        }
         if self.now_playing_panel.get_untracked() == NowPlayingPanel::Comments
             && !self.active_can("comments")
         {
@@ -1341,11 +1499,13 @@ impl AppStore {
             s.active_source_id = target;
         });
         self.persist_session();
-        self.hydrate_active_source_async();
+        if !snap_is_fresh {
+            self.hydrate_active_source_async_with_mode(!has_snap);
+        }
     }
 
     pub fn refresh_home(&self) {
-        self.hydrate_active_source_async();
+        self.hydrate_active_source_async_with_mode(true);
     }
 
     fn load_browse_if_needed(&self, page: &str, title: &str) {
@@ -1758,6 +1918,7 @@ impl AppStore {
         match res {
             Ok(()) => {
                 self.invalidate_browse_cache();
+                self.invalidate_source_snapshot(plugin_id);
                 if self.active_source_id.get_untracked() == plugin_id {
                     self.select_source(LocalMusicSource::SOURCE_ID);
                 }
@@ -1820,6 +1981,7 @@ impl AppStore {
     /// Immediately applies a freshly authenticated account onto the matching source entry.
     pub fn apply_signed_in_account(&self, source_id: &str, account: Account) {
         self.invalidate_browse_cache();
+        self.invalidate_source_snapshot(source_id);
         self.sources.update(|entries| {
             if let Some(entry) = entries.iter_mut().find(|e| e.info.id == source_id) {
                 entry.account = Some(account);
@@ -1898,6 +2060,7 @@ impl AppStore {
         self.spawn_app(async move {
             let _ = blocking(move || src.sign_out()).await;
             store.invalidate_browse_cache();
+            store.invalidate_source_snapshot(&id);
             store.sources.update(|entries| {
                 if let Some(entry) = entries.iter_mut().find(|e| e.info.id == id) {
                     entry.account = None;
@@ -2444,6 +2607,7 @@ impl AppStore {
             return;
         }
         let src = self.active_source();
+        let source_id = self.active_source_id.get_untracked();
         let name_owned = trimmed.to_owned();
         let store = *self;
         self.spawn_app(async move {
@@ -2459,6 +2623,7 @@ impl AppStore {
             )
             .await;
             if let Ok(Ok(pl)) = res {
+                store.invalidate_playlist_cache(&source_id, &pl.id);
                 store.playlists.update(|list| {
                     list.retain(|p| p.id != pl.id);
                     list.insert(0, pl.clone());
@@ -2475,6 +2640,7 @@ impl AppStore {
             return;
         }
         let src = self.active_source();
+        let source_id = self.active_source_id.get_untracked();
         let pid = id.to_owned();
         let new_name = trimmed.to_owned();
         let store = *self;
@@ -2483,6 +2649,7 @@ impl AppStore {
             let name_bg = new_name.clone();
             let res = blocking(move || src.rename_playlist(&pid_bg, &name_bg)).await;
             if matches!(res, Ok(Ok(()))) {
+                store.invalidate_playlist_cache(&source_id, &pid);
                 batch(|| {
                     store.playlists.update(|list| {
                         if let Some(p) = list.iter_mut().find(|p| p.id == pid) {
@@ -2502,7 +2669,9 @@ impl AppStore {
 
     pub fn delete_playlist(&self, id: &str) {
         let src = self.active_source();
+        let source_id = self.active_source_id.get_untracked();
         let id_owned = id.to_owned();
+        self.invalidate_playlist_cache(&source_id, &id_owned);
         self.playlists
             .update(|list| list.retain(|p| p.id != id_owned));
         let is_viewing = matches!(
@@ -2522,6 +2691,7 @@ impl AppStore {
 
     pub fn add_to_playlist(&self, playlist_id: &str, track: Track) {
         let src = self.active_source();
+        let source_id = self.active_source_id.get_untracked();
         let pid = playlist_id.to_owned();
         let tid = track.id.clone();
         let store = *self;
@@ -2529,6 +2699,7 @@ impl AppStore {
             let pid_bg = pid.clone();
             let res = blocking(move || src.add_to_playlist(&pid_bg, &[tid])).await;
             if matches!(res, Ok(Ok(()))) {
+                store.invalidate_playlist_cache(&source_id, &pid);
                 store.reload_playlist(&pid);
                 store.toasts.success(store.t("playlist.add_to"));
             }
@@ -2537,6 +2708,7 @@ impl AppStore {
 
     pub fn remove_from_playlist(&self, playlist_id: &str, track_id: &str) {
         let src = self.active_source();
+        let source_id = self.active_source_id.get_untracked();
         let pid = playlist_id.to_owned();
         let tid = track_id.to_owned();
         let store = *self;
@@ -2545,6 +2717,7 @@ impl AppStore {
             let tid_bg = tid.clone();
             let res = blocking(move || src.remove_from_playlist(&pid_bg, &[tid_bg])).await;
             if matches!(res, Ok(Ok(()))) {
+                store.invalidate_playlist_cache(&source_id, &pid);
                 store.reload_playlist(&pid);
             }
         });
@@ -2552,12 +2725,14 @@ impl AppStore {
 
     pub fn move_playlist_track(&self, playlist_id: &str, from: usize, to: usize) {
         let src = self.active_source();
+        let source_id = self.active_source_id.get_untracked();
         let pid = playlist_id.to_owned();
         let store = *self;
         self.spawn_app(async move {
             let pid_bg = pid.clone();
             let res = blocking(move || src.move_playlist_track(&pid_bg, from, to)).await;
             if matches!(res, Ok(Ok(()))) {
+                store.invalidate_playlist_cache(&source_id, &pid);
                 store.reload_playlist(&pid);
             }
         });
@@ -2565,11 +2740,15 @@ impl AppStore {
 
     fn reload_playlist(&self, playlist_id: &str) {
         let src = self.active_source();
+        let source_id = self.active_source_id.get_untracked();
         let pid = playlist_id.to_owned();
         let store = *self;
         self.spawn_app(async move {
             let pid_bg = pid.clone();
             if let Ok(Ok(pl)) = blocking(move || src.playlist(&pid_bg)).await {
+                store
+                    .playlist_detail_cache
+                    .with(|c| c.insert((source_id.clone(), pid.clone()), pl.clone()));
                 batch(|| {
                     store.playlists.update(|list| {
                         if let Some(existing) = list.iter_mut().find(|p| p.id == pid) {
@@ -3338,29 +3517,46 @@ impl AppStore {
 
     pub fn refresh_cache_stats(&self) {
         let audio_bytes = self.audio.with(|a| a.cache_used_bytes());
+        self.last_audio_cache_bytes.replace(audio_bytes);
         let art_dir = self.artwork.with(|a| a.cache_dir().to_path_buf());
+        let lyrics_dir = self.lyrics_cache_dir.get();
+        let catalog_dir = self.catalog_cache_dir.get();
         let store = *self;
         self.spawn_app(async move {
-            let art_bytes = blocking(move || dir_file_bytes(&art_dir))
-                .await
-                .unwrap_or(0);
+            let extra_bytes = blocking(move || {
+                dir_file_bytes(&art_dir)
+                    .saturating_add(dir_file_bytes(&lyrics_dir))
+                    .saturating_add(dir_file_bytes(&catalog_dir))
+            })
+            .await
+            .unwrap_or(0);
             store
                 .cache_used_bytes
-                .set(audio_bytes.saturating_add(art_bytes));
+                .set(audio_bytes.saturating_add(extra_bytes));
         });
     }
 
     pub fn clear_audio_cache(&self) {
         let _ = self.audio.with(|a| a.clear_cache());
-        let art_dir = self.artwork.with(|a| a.cache_dir().to_path_buf());
+        self.last_audio_cache_bytes.replace(0);
+        self.invalidate_browse_cache();
+        self.catalog_snapshots.with(HashMap::clear);
+        self.lyrics_cache.with(BoundedCache::clear);
+        self.comments_cache.with(BoundedCache::clear);
+        self.playlist_detail_cache.with(BoundedCache::clear);
+        self.album_detail_cache.with(BoundedCache::clear);
+        self.artist_detail_cache.with(BoundedCache::clear);
+        self.show_detail_cache.with(BoundedCache::clear);
+
+        let artwork = self.artwork.get();
+        let lyrics_dir = self.lyrics_cache_dir.get();
+        let catalog_dir = self.catalog_cache_dir.get();
         let store = *self;
         self.spawn_app(async move {
             let _ = blocking(move || {
-                if let Ok(entries) = std::fs::read_dir(&art_dir) {
-                    for entry in entries.flatten() {
-                        let _ = std::fs::remove_file(entry.path());
-                    }
-                }
+                artwork.clear();
+                clear_dir_files(&lyrics_dir);
+                clear_dir_files(&catalog_dir);
             })
             .await;
             store.refresh_cache_stats();
@@ -3460,6 +3656,37 @@ impl AppStore {
         let downloading_msg = self.t("track.downloading");
 
         self.spawn_app(async move {
+            // Fast path: if this track is already in the logical track-keyed audio disk cache,
+            // open SaveDialog immediately and copy the cached file with zero network wait.
+            let cached_track = store
+                .audio
+                .with(|a| a.cache().get_cached_track(&source_id, &track.id, quality))
+                .filter(|(p, _)| p.is_file());
+            if let Some((cached_path, meta)) = cached_track {
+                let ext = infer_audio_ext(&meta.media_type, &cached_path.to_string_lossy());
+                let dialog = build_download_save_dialog(&track, &ext, title_label, btn_label);
+                let Ok(Some(dest)) = pick_save_path(dialog).await else {
+                    return;
+                };
+                store.toasts.info(downloading_msg);
+                let write_res = blocking(move || -> Result<(), String> {
+                    std::fs::copy(&cached_path, &dest).map_err(|e| e.to_string())?;
+                    Ok(())
+                })
+                .await;
+                match write_res {
+                    Ok(Ok(())) => {
+                        store
+                            .toasts
+                            .success(store.t_fmt("track.downloaded", &[("name", &track.name)]));
+                    }
+                    _ => {
+                        store.toasts.error(store.t("track.download_failed"));
+                    }
+                }
+                return;
+            }
+
             let track_id = track.id.clone();
             let stream_res = blocking(move || src.stream(&track_id, quality)).await;
             let Ok(Ok(stream)) = stream_res else {
@@ -3474,26 +3701,7 @@ impl AppStore {
                 return;
             }
             let ext = infer_audio_ext(&stream.media_type, &stream.url);
-            let artists = track.artist_names();
-            let raw_stem = if artists.is_empty() {
-                track.name.clone()
-            } else {
-                format!("{} - {}", track.name, artists)
-            };
-            let suggested = format!("{}.{}", sanitize_filename(&raw_stem), ext);
-
-            let mut dialog = SaveDialog::new()
-                .file_name(suggested)
-                .title(title_label)
-                .button_label(btn_label)
-                .filter(FileFilter::new(ext.to_ascii_uppercase(), [ext.as_str()]));
-            if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
-            {
-                let dl_dir = PathBuf::from(home).join("Downloads");
-                if dl_dir.is_dir() {
-                    dialog = dialog.directory(dl_dir);
-                }
-            }
+            let dialog = build_download_save_dialog(&track, &ext, title_label, btn_label);
 
             let Ok(Some(dest)) = pick_save_path(dialog).await else {
                 return;
@@ -3716,11 +3924,134 @@ impl AppStore {
         });
     }
 
+    fn capture_current_catalog_snapshot(&self) -> SourceCatalogSnapshot {
+        SourceCatalogSnapshot {
+            home: self.home_data.get_untracked(),
+            playlists: self.playlists.get_untracked(),
+            liked_tracks: self.liked_tracks.get_untracked(),
+            liked_more: self.liked_more.get_untracked(),
+            recent_tracks: self.recent_tracks.get_untracked(),
+            saved_albums: self.saved_albums.get_untracked(),
+            saved_albums_more: self.saved_albums_more.get_untracked(),
+            stations: self.stations.get_untracked(),
+            podcasts: self.podcasts.get_untracked(),
+            fetched_at: None,
+        }
+    }
+
+    fn save_catalog_snapshot(
+        &self,
+        source_id: &str,
+        snap: SourceCatalogSnapshot,
+        persist_disk: bool,
+    ) {
+        if snap.is_empty() {
+            return;
+        }
+        self.catalog_snapshots.with(|map| {
+            map.insert(source_id.to_owned(), snap.clone());
+        });
+        if persist_disk && source_id != LocalMusicSource::SOURCE_ID {
+            let path = catalog_snapshot_disk_path(&self.catalog_cache_dir.get(), source_id);
+            let store = *self;
+            self.spawn_app(async move {
+                let _ = blocking(move || write_json_atomic(&path, &snap)).await;
+                store.refresh_cache_stats();
+            });
+        }
+    }
+
+    fn load_catalog_snapshot(&self, source_id: &str) -> Option<SourceCatalogSnapshot> {
+        if let Some(hit) = self
+            .catalog_snapshots
+            .with(|map| map.get(source_id).cloned())
+            .filter(|s| !s.is_empty())
+        {
+            return Some(hit);
+        }
+        if source_id == LocalMusicSource::SOURCE_ID {
+            return None;
+        }
+        let path = catalog_snapshot_disk_path(&self.catalog_cache_dir.get(), source_id);
+        let bytes = std::fs::read(&path).ok()?;
+        let snap: SourceCatalogSnapshot = serde_json::from_slice(&bytes).ok()?;
+        if snap.is_empty() {
+            return None;
+        }
+        self.catalog_snapshots.with(|map| {
+            map.insert(source_id.to_owned(), snap.clone());
+        });
+        Some(snap)
+    }
+
+    fn apply_catalog_snapshot(&self, source_id: &str, snap: &SourceCatalogSnapshot) {
+        let liked_set: HashSet<String> = snap.liked_tracks.iter().map(|t| t.id.clone()).collect();
+        if let Some(cur) = self.current_track.get_untracked() {
+            let is_fav = liked_set.contains(&cur.id);
+            self.audio
+                .with(|a| a.remote_controller().update_favorite(&cur.id, is_fav));
+        }
+        if !snap.home.sections.is_empty() {
+            self.browse_cache.with(|cache| {
+                cache.insert((source_id.to_owned(), String::new()), snap.home.clone())
+            });
+        }
+        let on_browse_subpage = matches!(
+            self.route.get_untracked(),
+            Route::Browse { ref page, .. } if !page.is_empty()
+        );
+        batch(|| {
+            if self.browse_loading.get_untracked() {
+                self.browse_loading.set(false);
+            }
+            self.home_data.set(snap.home.clone());
+            if !on_browse_subpage {
+                self.browse_data.set(snap.home.clone());
+            }
+            self.playlists.set(snap.playlists.clone());
+            self.liked_tracks.set(snap.liked_tracks.clone());
+            self.liked_ids.set(liked_set);
+            self.liked_more.set(snap.liked_more);
+            self.liked_loading_more.set(false);
+            self.recent_tracks.set(snap.recent_tracks.clone());
+            self.saved_albums.set(snap.saved_albums.clone());
+            self.saved_albums_more.set(snap.saved_albums_more);
+            self.saved_albums_loading_more.set(false);
+            self.stations.set(snap.stations.clone());
+            self.podcasts.set(snap.podcasts.clone());
+        });
+    }
+
+    fn invalidate_source_snapshot(&self, source_id: &str) {
+        self.catalog_snapshots.with(|map| {
+            map.remove(source_id);
+        });
+        self.playlist_detail_cache
+            .with(|c| c.retain(|k, _| k.0 != source_id));
+        self.album_detail_cache
+            .with(|c| c.retain(|k, _| k.0 != source_id));
+        self.artist_detail_cache
+            .with(|c| c.retain(|k, _| k.0 != source_id));
+        self.show_detail_cache
+            .with(|c| c.retain(|k, _| k.0 != source_id));
+        let path = catalog_snapshot_disk_path(&self.catalog_cache_dir.get(), source_id);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn invalidate_playlist_cache(&self, source_id: &str, playlist_id: &str) {
+        let key = (source_id.to_owned(), playlist_id.to_owned());
+        self.playlist_detail_cache.with(|c| c.remove(&key));
+    }
+
     pub fn hydrate_active_source_async(&self) {
+        self.hydrate_active_source_async_with_mode(true);
+    }
+
+    fn hydrate_active_source_async_with_mode(&self, show_loading: bool) {
         let source_id = self.active_source_id.get_untracked();
         let src = self.active_source();
         let store = *self;
-        if !self.browse_loading.get_untracked() {
+        if show_loading && !self.browse_loading.get_untracked() {
             self.browse_loading.set(true);
         }
         self.spawn_app(async move {
@@ -3736,6 +4067,7 @@ impl AppStore {
             let mut home_err: Option<String> = None;
             let mut plugin_err = false;
             let mut plugin_ok = false;
+            let mut home_updated = false;
             batch(|| {
                 if store.browse_loading.get_untracked() {
                     store.browse_loading.set(false);
@@ -3743,33 +4075,44 @@ impl AppStore {
                 match home_res {
                     Ok(Ok(home)) => {
                         plugin_ok = source_id != LocalMusicSource::SOURCE_ID;
-                        if !home.sections.is_empty() || source_id == LocalMusicSource::SOURCE_ID {
+                        let has_sections = !home.sections.is_empty();
+                        if has_sections || source_id == LocalMusicSource::SOURCE_ID {
                             store.browse_cache.with(|cache| {
                                 cache.insert((source_id.clone(), String::new()), home.clone());
                             });
-                        }
-                        if store.home_data.with_untracked(|cur| cur != &home) {
-                            store.home_data.set(home.clone());
-                        }
-                        let on_browse_subpage = matches!(
-                            store.route.get_untracked(),
-                            Route::Browse { ref page, .. } if !page.is_empty()
-                        );
-                        if !on_browse_subpage
-                            && store.browse_data.with_untracked(|cur| cur != &home)
-                        {
-                            store.browse_data.set(home);
+                            if store.home_data.with_untracked(|cur| cur != &home) {
+                                store.home_data.set(home.clone());
+                            }
+                            let on_browse_subpage = matches!(
+                                store.route.get_untracked(),
+                                Route::Browse { ref page, .. } if !page.is_empty()
+                            );
+                            if !on_browse_subpage
+                                && store.browse_data.with_untracked(|cur| cur != &home)
+                            {
+                                store.browse_data.set(home);
+                            }
+                            home_updated = has_sections;
                         }
                     }
                     Ok(Err(err)) => {
                         plugin_err = source_id != LocalMusicSource::SOURCE_ID;
-                        home_err = Some(format!("{source_id}: {err}"));
+                        if show_loading {
+                            home_err = Some(format!("{source_id}: {err}"));
+                        }
                     }
                     Err(err) => {
-                        home_err = Some(format!("{source_id}: {err}"));
+                        if show_loading {
+                            home_err = Some(format!("{source_id}: {err}"));
+                        }
                     }
                 }
             });
+            if home_updated && source_id != LocalMusicSource::SOURCE_ID {
+                let mut snap = store.capture_current_catalog_snapshot();
+                snap.fetched_at = Some(Instant::now());
+                store.save_catalog_snapshot(&source_id, snap, true);
+            }
             if plugin_err
                 || (plugin_ok
                     && store.plugins.with_untracked(|list| {
@@ -3783,48 +4126,114 @@ impl AppStore {
                 store.toasts.error(msg);
             }
 
-            // Phase 2: Hydrate secondary library slices asynchronously after Home settles.
-            let lib_bundle = blocking(move || {
-                (
-                    src.playlists().unwrap_or_default(),
-                    src.liked(0).unwrap_or_default(),
-                    src.recent().unwrap_or_default(),
-                    src.saved_albums(0).unwrap_or_default(),
-                    src.stations().unwrap_or_default(),
-                    src.shows().unwrap_or_default(),
-                )
-            })
-            .await;
+            // Phase 2: Hydrate secondary library slices as separate blocking steps so
+            // interactive user actions (Play, PlaylistDetail) are never queued behind
+            // all 6 background RPCs on a single-worker plugin runtime.
+            let mut any_lib_updated = false;
 
+            if src.can("playlists") {
+                let src_step = Arc::clone(&src);
+                if let Ok(Ok(playlists)) = blocking(move || src_step.playlists()).await {
+                    if store.active_source_id.get_untracked() != source_id {
+                        return;
+                    }
+                    store.playlists.set(playlists);
+                    any_lib_updated = true;
+                }
+            }
             if store.active_source_id.get_untracked() != source_id {
                 return;
             }
 
-            if let Ok((playlists, liked_page, recent, albums_page, stations, shows)) = lib_bundle {
-                let liked = liked_page.tracks;
-                let liked_more = liked_page.more;
-                let albums = albums_page.albums;
-                let albums_more = albums_page.more;
-                let liked_set: HashSet<String> = liked.iter().map(|t| t.id.clone()).collect();
-                if let Some(cur) = store.current_track.get_untracked() {
-                    let is_fav = liked_set.contains(&cur.id);
-                    store
-                        .audio
-                        .with(|a| a.remote_controller().update_favorite(&cur.id, is_fav));
+            if src.can("liked") {
+                let src_step = Arc::clone(&src);
+                if let Ok(Ok(liked_page)) = blocking(move || src_step.liked(0)).await {
+                    if store.active_source_id.get_untracked() != source_id {
+                        return;
+                    }
+                    let liked = liked_page.tracks;
+                    let liked_more = liked_page.more;
+                    let liked_set: HashSet<String> = liked.iter().map(|t| t.id.clone()).collect();
+                    if let Some(cur) = store.current_track.get_untracked() {
+                        let is_fav = liked_set.contains(&cur.id);
+                        store
+                            .audio
+                            .with(|a| a.remote_controller().update_favorite(&cur.id, is_fav));
+                    }
+                    batch(|| {
+                        store.liked_tracks.set(liked);
+                        store.liked_ids.set(liked_set);
+                        store.liked_more.set(liked_more);
+                        store.liked_loading_more.set(false);
+                    });
+                    any_lib_updated = true;
                 }
-                batch(|| {
-                    store.playlists.set(playlists);
-                    store.liked_tracks.set(liked);
-                    store.liked_ids.set(liked_set);
-                    store.liked_more.set(liked_more);
-                    store.liked_loading_more.set(false);
+            }
+            if store.active_source_id.get_untracked() != source_id {
+                return;
+            }
+
+            if src.can("recent") {
+                let src_step = Arc::clone(&src);
+                if let Ok(Ok(recent)) = blocking(move || src_step.recent()).await {
+                    if store.active_source_id.get_untracked() != source_id {
+                        return;
+                    }
                     store.recent_tracks.set(recent);
-                    store.saved_albums.set(albums);
-                    store.saved_albums_more.set(albums_more);
-                    store.saved_albums_loading_more.set(false);
+                    any_lib_updated = true;
+                }
+            }
+            if store.active_source_id.get_untracked() != source_id {
+                return;
+            }
+
+            if src.can("savedAlbums") {
+                let src_step = Arc::clone(&src);
+                if let Ok(Ok(albums_page)) = blocking(move || src_step.saved_albums(0)).await {
+                    if store.active_source_id.get_untracked() != source_id {
+                        return;
+                    }
+                    batch(|| {
+                        store.saved_albums.set(albums_page.albums);
+                        store.saved_albums_more.set(albums_page.more);
+                        store.saved_albums_loading_more.set(false);
+                    });
+                    any_lib_updated = true;
+                }
+            }
+            if store.active_source_id.get_untracked() != source_id {
+                return;
+            }
+
+            if src.can("stations") {
+                let src_step = Arc::clone(&src);
+                if let Ok(Ok(stations)) = blocking(move || src_step.stations()).await {
+                    if store.active_source_id.get_untracked() != source_id {
+                        return;
+                    }
                     store.stations.set(stations);
+                    any_lib_updated = true;
+                }
+            }
+            if store.active_source_id.get_untracked() != source_id {
+                return;
+            }
+
+            if src.can("shows") {
+                let src_step = Arc::clone(&src);
+                if let Ok(Ok(shows)) = blocking(move || src_step.shows()).await {
+                    if store.active_source_id.get_untracked() != source_id {
+                        return;
+                    }
                     store.podcasts.set(shows);
-                });
+                    any_lib_updated = true;
+                }
+            }
+
+            if (any_lib_updated || home_updated) && source_id != LocalMusicSource::SOURCE_ID {
+                let mut snap = store.capture_current_catalog_snapshot();
+                snap.fetched_at = Some(Instant::now());
+                store.save_catalog_snapshot(&source_id, snap, true);
             }
         });
     }
@@ -3847,147 +4256,231 @@ impl AppStore {
             }
             Route::PlaylistDetail { id } => {
                 let id = id.clone();
+                let key = (source_id.clone(), id.clone());
+                let cached = self.playlist_detail_cache.with(|c| c.get(&key));
+                let had_cached = cached.is_some();
+                if let Some(pl) = cached {
+                    self.active_playlist.set(Some(pl));
+                } else {
+                    self.active_playlist.set(None);
+                }
                 self.spawn_app(async move {
                     let id_bg = id.clone();
                     let res = blocking(move || src.playlist(&id_bg)).await;
                     if store.active_source_id.get_untracked() != source_id {
                         return;
                     }
+                    let still_on_route = matches!(
+                        store.route.get_untracked(),
+                        Route::PlaylistDetail { id: ref cur } if cur == &id
+                    );
                     match res {
                         Ok(Ok(mut pl)) => {
                             if pl.id.is_empty() {
-                                pl.id = id;
+                                pl.id = id.clone();
                             }
-                            store.active_playlist.set(Some(pl));
+                            store
+                                .playlist_detail_cache
+                                .with(|c| c.insert((source_id.clone(), id.clone()), pl.clone()));
+                            if still_on_route {
+                                store.active_playlist.set(Some(pl));
+                            }
                         }
                         Ok(Err(err)) => {
-                            store.toasts.error(format!("{source_id}: {err}"));
-                            store.active_playlist.set(Some(Playlist {
-                                id,
-                                ..Default::default()
-                            }));
+                            if !had_cached && still_on_route {
+                                store.toasts.error(format!("{source_id}: {err}"));
+                                store.active_playlist.set(Some(Playlist {
+                                    id,
+                                    ..Default::default()
+                                }));
+                            }
                         }
                         Err(err) => {
-                            store.toasts.error(format!("{source_id}: {err}"));
-                            store.active_playlist.set(Some(Playlist {
-                                id,
-                                ..Default::default()
-                            }));
+                            if !had_cached && still_on_route {
+                                store.toasts.error(format!("{source_id}: {err}"));
+                                store.active_playlist.set(Some(Playlist {
+                                    id,
+                                    ..Default::default()
+                                }));
+                            }
                         }
                     }
                 });
             }
             Route::AlbumDetail { id } => {
                 let id = id.clone();
+                let key = (source_id.clone(), id.clone());
+                let cached = self.album_detail_cache.with(|c| c.get(&key));
+                let had_cached = cached.is_some();
+                if let Some(alb) = cached {
+                    self.active_album.set(Some(alb));
+                } else {
+                    self.active_album.set(None);
+                }
                 self.spawn_app(async move {
                     let id_bg = id.clone();
                     let res = blocking(move || src.album(&id_bg)).await;
                     if store.active_source_id.get_untracked() != source_id {
                         return;
                     }
+                    let still_on_route = matches!(
+                        store.route.get_untracked(),
+                        Route::AlbumDetail { id: ref cur } if cur == &id
+                    );
                     match res {
                         Ok(Ok(mut alb)) => {
                             if alb.album.id.is_empty() {
-                                alb.album.id = id;
+                                alb.album.id = id.clone();
                             }
-                            store.active_album.set(Some(alb));
+                            store
+                                .album_detail_cache
+                                .with(|c| c.insert((source_id.clone(), id.clone()), alb.clone()));
+                            if still_on_route {
+                                store.active_album.set(Some(alb));
+                            }
                         }
                         Ok(Err(err)) => {
-                            store.toasts.error(format!("{source_id}: {err}"));
-                            store.active_album.set(Some(AlbumPage {
-                                album: Album {
-                                    id,
+                            if !had_cached && still_on_route {
+                                store.toasts.error(format!("{source_id}: {err}"));
+                                store.active_album.set(Some(AlbumPage {
+                                    album: Album {
+                                        id,
+                                        ..Default::default()
+                                    },
                                     ..Default::default()
-                                },
-                                ..Default::default()
-                            }));
+                                }));
+                            }
                         }
                         Err(err) => {
-                            store.toasts.error(format!("{source_id}: {err}"));
-                            store.active_album.set(Some(AlbumPage {
-                                album: Album {
-                                    id,
+                            if !had_cached && still_on_route {
+                                store.toasts.error(format!("{source_id}: {err}"));
+                                store.active_album.set(Some(AlbumPage {
+                                    album: Album {
+                                        id,
+                                        ..Default::default()
+                                    },
                                     ..Default::default()
-                                },
-                                ..Default::default()
-                            }));
+                                }));
+                            }
                         }
                     }
                 });
             }
             Route::ArtistDetail { id } => {
                 let id = id.clone();
+                let key = (source_id.clone(), id.clone());
+                let cached = self.artist_detail_cache.with(|c| c.get(&key));
+                let had_cached = cached.is_some();
+                if let Some(art) = cached {
+                    self.active_artist.set(Some(art));
+                } else {
+                    self.active_artist.set(None);
+                }
                 self.spawn_app(async move {
                     let id_bg = id.clone();
                     let res = blocking(move || src.artist(&id_bg)).await;
                     if store.active_source_id.get_untracked() != source_id {
                         return;
                     }
+                    let still_on_route = matches!(
+                        store.route.get_untracked(),
+                        Route::ArtistDetail { id: ref cur } if cur == &id
+                    );
                     match res {
                         Ok(Ok(mut art)) => {
                             if art.artist.id.is_empty() {
-                                art.artist.id = id;
+                                art.artist.id = id.clone();
                             }
-                            store.active_artist.set(Some(art));
+                            store
+                                .artist_detail_cache
+                                .with(|c| c.insert((source_id.clone(), id.clone()), art.clone()));
+                            if still_on_route {
+                                store.active_artist.set(Some(art));
+                            }
                         }
                         Ok(Err(err)) => {
-                            store.toasts.error(format!("{source_id}: {err}"));
-                            store.active_artist.set(Some(ArtistPage {
-                                artist: Artist {
-                                    id,
+                            if !had_cached && still_on_route {
+                                store.toasts.error(format!("{source_id}: {err}"));
+                                store.active_artist.set(Some(ArtistPage {
+                                    artist: Artist {
+                                        id,
+                                        ..Default::default()
+                                    },
                                     ..Default::default()
-                                },
-                                ..Default::default()
-                            }));
+                                }));
+                            }
                         }
                         Err(err) => {
-                            store.toasts.error(format!("{source_id}: {err}"));
-                            store.active_artist.set(Some(ArtistPage {
-                                artist: Artist {
-                                    id,
+                            if !had_cached && still_on_route {
+                                store.toasts.error(format!("{source_id}: {err}"));
+                                store.active_artist.set(Some(ArtistPage {
+                                    artist: Artist {
+                                        id,
+                                        ..Default::default()
+                                    },
                                     ..Default::default()
-                                },
-                                ..Default::default()
-                            }));
+                                }));
+                            }
                         }
                     }
                 });
             }
             Route::ShowDetail { id } => {
                 let id = id.clone();
+                let key = (source_id.clone(), id.clone());
+                let cached = self.show_detail_cache.with(|c| c.get(&key));
+                let had_cached = cached.is_some();
                 self.show_episodes_loading_more.set(false);
+                if let Some(show_page) = cached {
+                    self.active_show.set(Some(show_page));
+                } else {
+                    self.active_show.set(None);
+                }
                 self.spawn_app(async move {
                     let id_bg = id.clone();
                     let res = blocking(move || src.show(&id_bg, 0)).await;
                     if store.active_source_id.get_untracked() != source_id {
                         return;
                     }
+                    let still_on_route = matches!(
+                        store.route.get_untracked(),
+                        Route::ShowDetail { id: ref cur } if cur == &id
+                    );
                     match res {
                         Ok(Ok(mut show_page)) => {
                             if show_page.show.id.is_empty() {
-                                show_page.show.id = id;
+                                show_page.show.id = id.clone();
                             }
-                            store.active_show.set(Some(show_page));
+                            store.show_detail_cache.with(|c| {
+                                c.insert((source_id.clone(), id.clone()), show_page.clone())
+                            });
+                            if still_on_route {
+                                store.active_show.set(Some(show_page));
+                            }
                         }
                         Ok(Err(err)) => {
-                            store.toasts.error(format!("{source_id}: {err}"));
-                            store.active_show.set(Some(ShowPage {
-                                show: Show {
-                                    id,
+                            if !had_cached && still_on_route {
+                                store.toasts.error(format!("{source_id}: {err}"));
+                                store.active_show.set(Some(ShowPage {
+                                    show: Show {
+                                        id,
+                                        ..Default::default()
+                                    },
                                     ..Default::default()
-                                },
-                                ..Default::default()
-                            }));
+                                }));
+                            }
                         }
                         Err(err) => {
-                            store.toasts.error(format!("{source_id}: {err}"));
-                            store.active_show.set(Some(ShowPage {
-                                show: Show {
-                                    id,
+                            if !had_cached && still_on_route {
+                                store.toasts.error(format!("{source_id}: {err}"));
+                                store.active_show.set(Some(ShowPage {
+                                    show: Show {
+                                        id,
+                                        ..Default::default()
+                                    },
                                     ..Default::default()
-                                },
-                                ..Default::default()
-                            }));
+                                }));
+                            }
                         }
                     }
                 });
@@ -4120,21 +4613,57 @@ impl AppStore {
         let can_comments = src_lrc.can("comments");
 
         let liked = self.liked_ids.with_untracked(|s| s.contains(&track.id));
+        let extras_key = (source_id.clone(), track_id.clone());
+        let mem_lyrics = self.lyrics_cache.with(|c| c.get(&extras_key));
+        let mem_comments = if can_comments {
+            self.comments_cache.with(|c| c.get(&extras_key))
+        } else {
+            None
+        };
+        let need_lyrics = mem_lyrics.is_none();
+        let need_comments = can_comments && mem_comments.is_none();
+
         self.audio.with(|a| {
             let remote = a.remote_controller();
             remote.update_favorite(&track.id, liked);
-            remote.update_lyric(&track_id, "");
+            if let Some((_, ref remote_lrc)) = mem_lyrics {
+                remote.update_lyric(&track_id, remote_lrc);
+            } else {
+                remote.update_lyric(&track_id, "");
+            }
         });
 
+        let cur_pos_ms = self.position_ms.get_untracked() as i64;
         batch(|| {
-            self.lyrics.set(ParsedLyrics::default());
-            self.active_lyric.set(None);
-            self.lyrics_loading.set(true);
-            self.comments.set(Vec::new());
-            self.comments_total.set(0);
-            self.comments_more.set(false);
-            self.comments_loading_more.set(false);
-            self.comments_loading.set(can_comments);
+            if let Some((parsed, _)) = mem_lyrics {
+                let active = parsed.active_position(cur_pos_ms);
+                self.lyrics.set(parsed);
+                self.active_lyric.set(active);
+                self.lyrics_loading.set(false);
+            } else {
+                self.lyrics.set(ParsedLyrics::default());
+                self.active_lyric.set(None);
+                self.lyrics_loading.set(true);
+            }
+
+            if let Some(comment_page) = mem_comments {
+                self.comments.set(comment_page.comments);
+                self.comments_total.set(comment_page.total);
+                self.comments_more.set(comment_page.more);
+                self.comments_loading_more.set(false);
+                self.comments_loading.set(false);
+            } else {
+                self.comments.set(Vec::new());
+                self.comments_total.set(0);
+                self.comments_more.set(false);
+                self.comments_loading_more.set(false);
+                self.comments_loading.set(can_comments);
+                if !can_comments
+                    && self.now_playing_panel.get_untracked() == NowPlayingPanel::Comments
+                {
+                    self.now_playing_panel.set(self.preferred_lyrics_panel());
+                }
+            }
         });
 
         let seed = if !track.album.id.is_empty() {
@@ -4159,7 +4688,7 @@ impl AppStore {
         } else {
             // Preserve the previous track's accent until the real cover resolves so the
             // Now Playing backdrop never flashes a random seed color (matching mygo-music).
-            // If already cached in memory, apply immediately without waiting.
+            // If already cached in memory or on disk with an accent sidecar, apply on Frame 0.
             let expanded = ArtworkLoader::resolve_template(trimmed_cover, 600);
             if let Some(hit) = self.artwork.with(|l| l.cached(&expanded, 600)) {
                 artwork_resolved_sync = true;
@@ -4209,79 +4738,146 @@ impl AppStore {
             });
         }
 
+        if !need_lyrics && !need_comments {
+            return;
+        }
+
         let tid_lrc = track.id.clone();
         let tid_check = track.id.clone();
+        let source_for_cache = source_id.clone();
+        let lyrics_dir = self.lyrics_cache_dir.get();
         let store_lrc = *self;
         self.spawn_app(async move {
             let res = blocking(move || {
-                let (lyrics, lrc_for_remote) = match src_lrc.lyrics(&tid_lrc) {
-                    Ok(raw_lyrics) => {
-                        let parsed = parse_lyrics(&raw_lyrics);
-                        let remote_lrc = if !raw_lyrics.lrc.trim().is_empty() {
-                            raw_lyrics.lrc
-                        } else {
-                            parsed.to_lrc_string()
-                        };
-                        (parsed, remote_lrc)
-                    }
-                    Err(err) => {
-                        if !matches!(err, nsh_music_core::model::SourceError::Unsupported) {
-                            log::warn!(
-                                target: "nsh_music",
-                                "lyrics fetch failed for `{}` on `{}`: {err}",
-                                tid_lrc,
-                                source_id
-                            );
+                let lyrics_out = if need_lyrics {
+                    let is_remote = source_id != LocalMusicSource::SOURCE_ID;
+                    let disk_path = lyrics_disk_path(&lyrics_dir, &source_id, &tid_lrc);
+                    if is_remote
+                        && let Ok(bytes) = std::fs::read(&disk_path)
+                        && let Ok(entry) = serde_json::from_slice::<CachedLyricsDiskEntry>(&bytes)
+                    {
+                        Some((entry.parsed, entry.remote_lrc, true, false))
+                    } else {
+                        match src_lrc.lyrics(&tid_lrc) {
+                            Ok(raw_lyrics) => {
+                                let parsed = parse_lyrics(&raw_lyrics);
+                                let remote_lrc = if !raw_lyrics.lrc.trim().is_empty() {
+                                    raw_lyrics.lrc
+                                } else {
+                                    parsed.to_lrc_string()
+                                };
+                                if is_remote {
+                                    write_json_atomic(
+                                        &disk_path,
+                                        &CachedLyricsDiskEntry {
+                                            parsed: parsed.clone(),
+                                            remote_lrc: remote_lrc.clone(),
+                                        },
+                                    );
+                                }
+                                Some((parsed, remote_lrc, true, is_remote))
+                            }
+                            Err(SourceError::Unsupported) => {
+                                if is_remote {
+                                    write_json_atomic(
+                                        &disk_path,
+                                        &CachedLyricsDiskEntry::default(),
+                                    );
+                                }
+                                Some((ParsedLyrics::default(), String::new(), true, is_remote))
+                            }
+                            Err(err) => {
+                                log::warn!(
+                                    target: "nsh_music",
+                                    "lyrics fetch failed for `{}` on `{}`: {err}",
+                                    tid_lrc,
+                                    source_id
+                                );
+                                // Never cache transient errors so retries can succeed later.
+                                Some((ParsedLyrics::default(), String::new(), false, false))
+                            }
                         }
-                        (ParsedLyrics::default(), String::new())
                     }
-                };
-                let comments = if can_comments {
-                    src_lrc.comments(&tid_lrc, 0).unwrap_or_default()
                 } else {
-                    nsh_music_core::model::CommentPage::default()
+                    None
                 };
-                (lyrics, lrc_for_remote, comments)
+
+                let comments_out = if need_comments {
+                    match src_lrc.comments(&tid_lrc, 0) {
+                        Ok(page) => Some((page, true)),
+                        Err(_) => Some((CommentPage::default(), false)),
+                    }
+                } else {
+                    None
+                };
+                (lyrics_out, comments_out)
             })
             .await;
 
-            if store_lrc
+            let still_current = store_lrc
                 .last_track_id
-                .with(|id| id.as_deref() == Some(tid_check.as_str()))
-            {
-                match res {
-                    Ok((parsed, lrc_for_remote, comment_page)) => {
-                        store_lrc.audio.with(|a| {
-                            a.remote_controller()
-                                .update_lyric(&tid_check, &lrc_for_remote);
-                        });
-                        let pos = store_lrc.position_ms.get_untracked();
-                        let active = parsed.active_position(pos as i64);
-                        batch(|| {
-                            store_lrc.lyrics.set(parsed);
-                            store_lrc.active_lyric.set(active);
-                            store_lrc.comments.set(comment_page.comments);
-                            store_lrc.comments_total.set(comment_page.total);
-                            store_lrc.comments_more.set(comment_page.more);
-                            store_lrc.comments_loading_more.set(false);
-                            store_lrc.lyrics_loading.set(false);
-                            store_lrc.comments_loading.set(false);
-                            if !can_comments
-                                && store_lrc.now_playing_panel.get_untracked()
-                                    == NowPlayingPanel::Comments
-                            {
-                                store_lrc
-                                    .now_playing_panel
-                                    .set(store_lrc.preferred_lyrics_panel());
-                            }
-                        });
+                .with(|id| id.as_deref() == Some(tid_check.as_str()));
+
+            match res {
+                Ok((lyrics_out, comments_out)) => {
+                    let mut wrote_disk = false;
+                    if let Some((parsed, remote_lrc, cacheable, did_write)) = &lyrics_out {
+                        if *cacheable {
+                            let key = (source_for_cache.clone(), tid_check.clone());
+                            store_lrc
+                                .lyrics_cache
+                                .with(|c| c.insert(key, (parsed.clone(), remote_lrc.clone())));
+                        }
+                        wrote_disk = *did_write;
                     }
-                    Err(_) => {
+                    if let Some((comment_page, cacheable)) = &comments_out
+                        && *cacheable
+                    {
+                        let key = (source_for_cache.clone(), tid_check.clone());
+                        store_lrc
+                            .comments_cache
+                            .with(|c| c.insert(key, comment_page.clone()));
+                    }
+                    if wrote_disk {
+                        store_lrc.refresh_cache_stats();
+                    }
+
+                    if still_current {
+                        if let Some((parsed, lrc_for_remote, _, _)) = lyrics_out {
+                            store_lrc.audio.with(|a| {
+                                a.remote_controller()
+                                    .update_lyric(&tid_check, &lrc_for_remote);
+                            });
+                            let pos = store_lrc.position_ms.get_untracked();
+                            let active = parsed.active_position(pos as i64);
+                            batch(|| {
+                                store_lrc.lyrics.set(parsed);
+                                store_lrc.active_lyric.set(active);
+                                store_lrc.lyrics_loading.set(false);
+                            });
+                        }
+                        if let Some((comment_page, _)) = comments_out {
+                            batch(|| {
+                                store_lrc.comments.set(comment_page.comments);
+                                store_lrc.comments_total.set(comment_page.total);
+                                store_lrc.comments_more.set(comment_page.more);
+                                store_lrc.comments_loading_more.set(false);
+                                store_lrc.comments_loading.set(false);
+                            });
+                        }
+                    }
+                }
+                Err(_) => {
+                    if still_current {
                         batch(|| {
-                            store_lrc.lyrics_loading.set(false);
-                            store_lrc.comments_loading.set(false);
-                            store_lrc.comments_more.set(false);
-                            store_lrc.comments_loading_more.set(false);
+                            if need_lyrics {
+                                store_lrc.lyrics_loading.set(false);
+                            }
+                            if need_comments {
+                                store_lrc.comments_loading.set(false);
+                                store_lrc.comments_more.set(false);
+                                store_lrc.comments_loading_more.set(false);
+                            }
                         });
                     }
                 }
@@ -4610,6 +5206,16 @@ impl AppStore {
             self.spectrum.set([0.0; SPECTRUM_BANDS]);
             self.spectrum_is_zero.replace(true);
         }
+
+        // Keep Settings -> Cache size live as background audio downloads finish caching.
+        let cur_audio_bytes = self.audio.with(|a| a.cache_used_bytes());
+        if self
+            .last_audio_cache_bytes
+            .with(|prev| *prev != cur_audio_bytes)
+        {
+            self.last_audio_cache_bytes.replace(cur_audio_bytes);
+            self.refresh_cache_stats();
+        }
     }
 }
 
@@ -4651,6 +5257,80 @@ fn dir_file_bytes(dir: &Path) -> u64 {
         .filter(|m| m.is_file())
         .map(|m| m.len())
         .sum()
+}
+
+fn clear_dir_files(dir: &Path) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
+fn sha256_hex(input: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
+}
+
+fn write_json_atomic<T: Serialize>(path: &Path, value: &T) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok(bytes) = serde_json::to_vec(value) else {
+        return;
+    };
+    let tmp = path.with_extension("json.part");
+    if std::fs::write(&tmp, &bytes).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
+fn lyrics_disk_path(dir: &Path, source_id: &str, track_id: &str) -> PathBuf {
+    let hash = sha256_hex(&format!("lyrics:{source_id}:{track_id}"));
+    dir.join(format!("{hash}.json"))
+}
+
+fn catalog_snapshot_disk_path(dir: &Path, source_id: &str) -> PathBuf {
+    let hash = sha256_hex(source_id);
+    dir.join(format!("source_{}.json", &hash[..24]))
+}
+
+fn build_download_save_dialog(
+    track: &Track,
+    ext: &str,
+    title_label: String,
+    btn_label: String,
+) -> SaveDialog {
+    let artists = track.artist_names();
+    let raw_stem = if artists.is_empty() {
+        track.name.clone()
+    } else {
+        format!("{} - {}", track.name, artists)
+    };
+    let suggested = format!("{}.{}", sanitize_filename(&raw_stem), ext);
+
+    let mut dialog = SaveDialog::new()
+        .file_name(suggested)
+        .title(title_label)
+        .button_label(btn_label)
+        .filter(FileFilter::new(ext.to_ascii_uppercase(), [ext]));
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        let dl_dir = PathBuf::from(home).join("Downloads");
+        if dl_dir.is_dir() {
+            dialog = dialog.directory(dl_dir);
+        }
+    }
+    dialog
 }
 
 fn infer_audio_ext(media_type: &str, url: &str) -> String {
@@ -4703,6 +5383,8 @@ struct SandboxPaths {
     plugin_data_dir: PathBuf,
     audio_cache_dir: PathBuf,
     artwork_cache_dir: PathBuf,
+    lyrics_cache_dir: PathBuf,
+    catalog_cache_dir: PathBuf,
 }
 
 fn sandbox_root_dir() -> PathBuf {
@@ -4733,6 +5415,8 @@ fn sandbox_paths_from_root(root: &Path) -> SandboxPaths {
         plugin_data_dir: root.join("plugin-data"),
         audio_cache_dir: root.join("audio-cache"),
         artwork_cache_dir: root.join("artwork-cache"),
+        lyrics_cache_dir: root.join("lyrics-cache"),
+        catalog_cache_dir: root.join("catalog-cache"),
     }
 }
 
@@ -4859,6 +5543,9 @@ impl AppStore {
             session: stored(session),
             settings_path: stored(sandbox.settings_path),
             session_path: stored(sandbox.session_path),
+            lyrics_cache_dir: stored(sandbox.lyrics_cache_dir),
+            catalog_cache_dir: stored(sandbox.catalog_cache_dir),
+            last_audio_cache_bytes: stored(0),
             last_track_id: stored(None),
             last_played_reported_id: stored(None),
             last_snapshot: stored(None),
@@ -4876,6 +5563,13 @@ impl AppStore {
             search_suggest_gen: stored(0),
             browse_cache: stored(HashMap::new()),
             browse_req_gen: stored(0),
+            lyrics_cache: stored(BoundedCache::new(LYRICS_MEM_CACHE_MAX)),
+            comments_cache: stored(BoundedCache::new(COMMENTS_MEM_CACHE_MAX)),
+            catalog_snapshots: stored(HashMap::new()),
+            playlist_detail_cache: stored(BoundedCache::new(DETAIL_MEM_CACHE_MAX)),
+            album_detail_cache: stored(BoundedCache::new(DETAIL_MEM_CACHE_MAX)),
+            artist_detail_cache: stored(BoundedCache::new(DETAIL_MEM_CACHE_MAX)),
+            show_detail_cache: stored(BoundedCache::new(DETAIL_MEM_CACHE_MAX)),
             spectrum_is_zero: stored(true),
             pending_settings_save: stored(Arc::new(Mutex::new(None))),
             settings_saving: stored(Arc::new(AtomicBool::new(false))),
@@ -5147,6 +5841,8 @@ mod tests {
             (&paths.plugin_data_dir, "plugin-data"),
             (&paths.audio_cache_dir, "audio-cache"),
             (&paths.artwork_cache_dir, "artwork-cache"),
+            (&paths.lyrics_cache_dir, "lyrics-cache"),
+            (&paths.catalog_cache_dir, "catalog-cache"),
         ];
         for (path, leaf) in expected {
             assert!(
@@ -5413,5 +6109,169 @@ mod tests {
             nsh_testing::Headless::start(config).expect("headless settings focus seq test starts");
         app.wait_for("id:settings-focus-seq-test-ok")
             .expect("settings focus seq assertions passed");
+    }
+
+    #[test]
+    fn bounded_cache_evicts_least_recently_used_and_supports_retain() {
+        let mut cache: BoundedCache<(String, String), i32> = BoundedCache::new(2);
+        cache.insert(("yt".into(), "a".into()), 1);
+        cache.insert(("yt".into(), "b".into()), 2);
+        // Touch "a" so "b" becomes least recently used.
+        assert_eq!(cache.get(&("yt".into(), "a".into())), Some(1));
+        cache.insert(("bili".into(), "c".into()), 3);
+
+        assert_eq!(cache.get(&("yt".into(), "b".into())), None);
+        assert_eq!(cache.get(&("yt".into(), "a".into())), Some(1));
+        assert_eq!(cache.get(&("bili".into(), "c".into())), Some(3));
+
+        cache.retain(|k, _| k.0 != "yt");
+        assert_eq!(cache.get(&("yt".into(), "a".into())), None);
+        assert_eq!(cache.get(&("bili".into(), "c".into())), Some(3));
+    }
+
+    #[component]
+    fn SwrCachesStoreTestApp() -> impl IntoElement {
+        let root =
+            std::env::temp_dir().join(format!("nsh-music-swr-caches-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = AppStore::new_isolated_for_test(&root);
+
+        // 1. Catalog snapshot written to disk loads synchronously on select_source (browse_loading = false).
+        let snap = SourceCatalogSnapshot {
+            home: Browse {
+                title: "YT Home".into(),
+                sections: vec![nsh_music_core::model::Section {
+                    title: "Quick Picks".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            playlists: vec![Playlist {
+                id: "pl-1".into(),
+                name: "Cached Playlist".into(),
+                ..Default::default()
+            }],
+            liked_tracks: vec![Track {
+                id: "t-liked".into(),
+                source: "youtube-music".into(),
+                name: "Liked Song".into(),
+                ..Default::default()
+            }],
+            liked_more: true,
+            ..Default::default()
+        };
+        let disk_path = catalog_snapshot_disk_path(&store.catalog_cache_dir.get(), "youtube-music");
+        write_json_atomic(&disk_path, &snap);
+        assert!(disk_path.is_file());
+
+        // Loaded from disk -> fetched_at is None (not fresh), yet UI hydrates in 0ms with browse_loading == false.
+        let loaded = store
+            .load_catalog_snapshot("youtube-music")
+            .expect("disk snapshot loads");
+        assert!(!loaded.is_fresh());
+        assert_eq!(loaded.home.title, "YT Home");
+
+        // Mark fresh in memory and switch source -> 0ms instant hydration, browse_loading == false,
+        // and skips re-running hydrate_active_source_async.
+        let mut fresh_snap = loaded;
+        fresh_snap.fetched_at = Some(Instant::now());
+        store.catalog_snapshots.with(|m| {
+            m.insert("youtube-music".into(), fresh_snap);
+        });
+        store.select_source("youtube-music");
+        assert_eq!(store.active_source_id.get_untracked(), "youtube-music");
+        assert!(!store.browse_loading.get_untracked());
+        assert_eq!(
+            store.home_data.with_untracked(|h| h.title.clone()),
+            "YT Home"
+        );
+        assert_eq!(store.playlists.with_untracked(Vec::len), 1);
+        assert!(store.liked_ids.with_untracked(|s| s.contains("t-liked")));
+        assert!(store.liked_more.get_untracked());
+
+        // 2. Detail SWR cache serves PlaylistDetail synchronously on route load & invalidates cleanly.
+        let cached_pl = Playlist {
+            id: "pl-1".into(),
+            name: "Cached Playlist Detail".into(),
+            ..Default::default()
+        };
+        store.playlist_detail_cache.with(|c| {
+            c.insert(("youtube-music".into(), "pl-1".into()), cached_pl.clone());
+        });
+        store.load_data_for_route(&Route::PlaylistDetail { id: "pl-1".into() });
+        assert_eq!(
+            store
+                .active_playlist
+                .with_untracked(|p| p.as_ref().map(|x| x.name.clone())),
+            Some("Cached Playlist Detail".into())
+        );
+
+        // Uncached detail clears stale active_playlist immediately instead of flashing previous playlist.
+        store.load_data_for_route(&Route::PlaylistDetail {
+            id: "pl-uncached".into(),
+        });
+        assert!(store.active_playlist.get_untracked().is_none());
+
+        // Invalidating source snapshot removes disk file and detail cache entries for that source.
+        store.invalidate_source_snapshot("youtube-music");
+        assert!(!disk_path.exists());
+        assert!(
+            store
+                .playlist_detail_cache
+                .with(|c| c.get(&("youtube-music".into(), "pl-1".into())))
+                .is_none()
+        );
+
+        // 3. In-memory lyrics cache hit resolves synchronously in load_track_extras (no spinner flash).
+        let raw_lrc = "[00:01.00]Hello Cached Lyrics";
+        let parsed = parse_lyrics(&nsh_music_core::model::Lyrics {
+            lrc: raw_lrc.into(),
+            ..Default::default()
+        });
+        store.lyrics_cache.with(|c| {
+            c.insert(
+                ("youtube-music".into(), "t-lrc".into()),
+                (parsed, raw_lrc.into()),
+            );
+        });
+        let track = Track {
+            id: "t-lrc".into(),
+            source: "youtube-music".into(),
+            name: "Lyric Track".into(),
+            ..Default::default()
+        };
+        store.load_track_extras(&track);
+        assert!(!store.lyrics_loading.get_untracked());
+        assert_eq!(store.lyrics.with_untracked(|l| l.lines.len()), 1);
+
+        store.audio.with(|a| a.shutdown());
+        let _ = std::fs::remove_dir_all(&root);
+
+        view()
+            .test_id("swr-caches-test-ok")
+            .w(px(120.0))
+            .h(px(40.0))
+            .child(text("ok"))
+    }
+
+    #[test]
+    fn swr_catalog_detail_and_lyrics_caches_hydrate_synchronously() {
+        let viewport = nsh_core::geometry::Size::new(
+            nsh_core::geometry::Points(1280.0),
+            nsh_core::geometry::Points(800.0),
+        );
+        let root = nsh_engine::Root::of::<SwrCachesStoreTestApp>()
+            .tokens(crate::app_tokens())
+            .app_id("com.richerfu.nshmusic.swr_caches_test");
+        let mut config = nsh_engine::EngineConfig::new(root);
+        config.viewport = viewport;
+        config.environment = nsh_engine::Environment {
+            window: viewport,
+            ..nsh_engine::Environment::default()
+        };
+        let mut app =
+            nsh_testing::Headless::start(config).expect("headless swr caches test starts");
+        app.wait_for("id:swr-caches-test-ok")
+            .expect("swr cache assertions passed");
     }
 }

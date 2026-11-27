@@ -6,11 +6,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use nsh_music_core::model::Quality;
 use reqwest::header::{
     ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, HOST, HeaderMap, HeaderName,
     HeaderValue, LOCATION, RANGE,
 };
 use reqwest::{Client, Method, Response};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 use url::Url;
@@ -23,6 +25,9 @@ pub const DEFAULT_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 pub const DEFAULT_CHUNK_SIZE: usize = 64 * 1024;
 /// Maximum HTTP redirect hops followed manually.
 pub const MAX_REDIRECTS: usize = 10;
+/// Safety ceiling (64 MiB) for full-track background prefetches so multi-hour live/podcast
+/// streams never exhaust disk space.
+pub const MAX_FULL_PREFETCH_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Returns a dedicated multi-threaded Tokio runtime handle for background audio I/O
 /// and virtual relay servers. Using a dedicated runtime avoids deadlocks when sync
@@ -296,11 +301,69 @@ pub(crate) fn is_loopback_url(url: &Url) -> bool {
     }
 }
 
+/// Persisted stream metadata stored alongside a cached `.audio` file as `<key>.json`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CachedStreamMeta {
+    pub media_type: String,
+    pub bit_rate: i32,
+    pub gain: f64,
+    pub peak: f64,
+}
+
 /// Computes a deterministic hex SHA-256 cache key for a URL or identifier.
 pub fn cache_key_for_url(url: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(url.as_bytes());
     hex::encode(hasher.finalize())
+}
+
+/// Computes a deterministic logical disk-cache key for a remote streaming track identified by
+/// `(source, track_id, quality)`, independent of expiring CDN query tokens or ephemeral
+/// loopback relay ports.
+///
+/// Returns `None` for local files or invalid/empty identifiers.
+pub fn cache_key_for_track(source: &str, track_id: &str, quality: Quality) -> Option<String> {
+    let src = source.trim();
+    let tid = track_id.trim();
+    if src.is_empty()
+        || src == "local"
+        || tid.is_empty()
+        || tid.starts_with('/')
+        || tid.starts_with("file://")
+    {
+        return None;
+    }
+    let canonical = format!("track:{src}:{tid}:{}", quality.as_str());
+    Some(cache_key_for_url(&canonical))
+}
+
+fn effective_cached_meta(
+    meta: Option<CachedStreamMeta>,
+    http_content_type: Option<&str>,
+) -> Option<CachedStreamMeta> {
+    let http_ct = http_content_type.and_then(|ct| {
+        let base = ct.split(';').next().unwrap_or(ct).trim();
+        if base.is_empty()
+            || base.eq_ignore_ascii_case("application/octet-stream")
+            || base.eq_ignore_ascii_case("binary/octet-stream")
+        {
+            None
+        } else {
+            Some(ct.to_owned())
+        }
+    });
+    match (meta, http_ct) {
+        (Some(mut m), Some(ct)) => {
+            m.media_type = ct;
+            Some(m)
+        }
+        (Some(m), None) => Some(m),
+        (None, Some(ct)) => Some(CachedStreamMeta {
+            media_type: ct,
+            ..CachedStreamMeta::default()
+        }),
+        (None, None) => None,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -309,6 +372,7 @@ struct CacheEntry {
     path: PathBuf,
     size: u64,
     last_accessed: u64,
+    meta: Option<CachedStreamMeta>,
 }
 
 struct AudioCacheInner {
@@ -421,17 +485,37 @@ impl AudioCache {
             .unwrap_or(false)
     }
 
-    /// Returns the cached file path if the URL is completely cached, updating its LRU timestamp.
-    pub fn get_cached_path(&self, url: &str) -> Option<PathBuf> {
-        let key = cache_key_for_url(url);
+    /// Looks up a cached entry by its raw SHA-256 `key`, updating its LRU timestamp.
+    fn get_cached_by_key(&self, key: &str) -> Option<(PathBuf, Option<CachedStreamMeta>)> {
         let mut guard = self.inner.entries.lock().ok()?;
-        let entry = guard.get_mut(&key)?;
+        let entry = guard.get_mut(key)?;
         if !entry.path.exists() {
-            guard.remove(&key);
+            let meta_path = self.meta_path_for_key(key);
+            guard.remove(key);
+            let _ = fs::remove_file(meta_path);
             return None;
         }
         entry.last_accessed = self.next_access_stamp();
-        Some(entry.path.clone())
+        Some((entry.path.clone(), entry.meta.clone()))
+    }
+
+    /// Returns the cached file path if the URL is completely cached, updating its LRU timestamp.
+    pub fn get_cached_path(&self, url: &str) -> Option<PathBuf> {
+        let key = cache_key_for_url(url);
+        self.get_cached_by_key(&key).map(|(path, _)| path)
+    }
+
+    /// Returns the cached audio file path and persisted [`CachedStreamMeta`] for a logical
+    /// remote track `(source, track_id, quality)`, updating its LRU timestamp.
+    pub fn get_cached_track(
+        &self,
+        source: &str,
+        track_id: &str,
+        quality: Quality,
+    ) -> Option<(PathBuf, CachedStreamMeta)> {
+        let key = cache_key_for_track(source, track_id, quality)?;
+        self.get_cached_by_key(&key)
+            .map(|(path, meta)| (path, meta.unwrap_or_default()))
     }
 
     /// Directly inserts raw bytes into the disk cache under `url` (useful for tests or offline saves),
@@ -450,7 +534,7 @@ impl AudioCache {
         Ok(final_path)
     }
 
-    /// Removes all cached entries from disk.
+    /// Removes all cached entries, metadata sidecars, and leftover `.part` files from disk.
     pub fn clear(&self) -> AudioResult<()> {
         let mut guard = self
             .inner
@@ -459,8 +543,21 @@ impl AudioCache {
             .map_err(|_| AudioError::Other("cache mutex poisoned".into()))?;
         for entry in guard.values() {
             let _ = fs::remove_file(&entry.path);
+            let _ = fs::remove_file(self.meta_path_for_key(&entry.key));
         }
         guard.clear();
+        drop(guard);
+        if let Ok(read_dir) = fs::read_dir(&self.inner.cache_dir) {
+            for entry in read_dir.flatten() {
+                let path = entry.path();
+                if matches!(
+                    path.extension().and_then(|s| s.to_str()),
+                    Some("part" | "json" | "audio")
+                ) {
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -488,6 +585,7 @@ impl AudioCache {
             }
             if guard.remove(&candidate.key).is_some() {
                 let _ = fs::remove_file(&candidate.path);
+                let _ = fs::remove_file(self.meta_path_for_key(&candidate.key));
                 total = total.saturating_sub(candidate.size);
                 evicted += 1;
             }
@@ -529,6 +627,22 @@ impl AudioCache {
         url: &str,
         headers: Vec<(String, String)>,
     ) -> AudioResult<ProgressiveStream> {
+        self.open_progressive_with_key(url, headers, None, None)
+    }
+
+    /// Opens a progressive audio stream with an optional logical `cache_key_override` (e.g.
+    /// from [`cache_key_for_track`]) and sidecar [`CachedStreamMeta`].
+    ///
+    /// When `cache_key_override` is `Some(logical_key)`, both signed CDN URLs and ephemeral
+    /// loopback streams (`127.0.0.1:<port>`) check and persist into the disk LRU cache under
+    /// `<logical_key>.audio` + `<logical_key>.json` upon clean completion.
+    pub fn open_progressive_with_key(
+        &self,
+        url: &str,
+        headers: Vec<(String, String)>,
+        cache_key_override: Option<&str>,
+        meta: Option<CachedStreamMeta>,
+    ) -> AudioResult<ProgressiveStream> {
         if let Some(local_path) = resolve_local_path(url) {
             let file = File::open(&local_path)?;
             let len = file.metadata()?.len();
@@ -544,8 +658,24 @@ impl AudioCache {
             )));
         }
 
+        let logical_key = cache_key_override.map(str::trim).filter(|s| !s.is_empty());
         let is_loopback = is_loopback_url(&parsed);
-        if !is_loopback
+
+        if let Some(lk) = logical_key {
+            if let Some((cached_path, cached_meta)) = self.get_cached_by_key(lk)
+                && let Ok(file) = File::open(&cached_path)
+            {
+                let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+                let ct = cached_meta.and_then(|m| {
+                    if m.media_type.contains('/') {
+                        Some(m.media_type)
+                    } else {
+                        None
+                    }
+                });
+                return Ok(ProgressiveStream::from_local_file(file, len, ct));
+            }
+        } else if !is_loopback
             && let Some(cached_path) = self.get_cached_path(url)
             && let Ok(file) = File::open(&cached_path)
         {
@@ -553,7 +683,11 @@ impl AudioCache {
             return Ok(ProgressiveStream::from_local_file(file, len, None));
         }
 
-        let key = cache_key_for_url(url);
+        let key = logical_key
+            .map(str::to_owned)
+            .unwrap_or_else(|| cache_key_for_url(url));
+        let has_key_override = logical_key.is_some();
+        let persist_on_eof = has_key_override || !is_loopback;
         let final_path = self.final_path_for_key(&key);
         let part_path = self.part_path_for_key(&key);
 
@@ -614,21 +748,57 @@ impl AudioCache {
         let bg_key = key.clone();
         let bg_part_path = part_path.clone();
         let bg_final_path = final_path.clone();
+        let bg_meta = effective_cached_meta(meta, redirected.content_type.as_deref());
+        let expected_total = redirected.total_size;
         let mut response = redirected.response;
 
         rt.spawn(async move {
             let mut writer = part_file;
             let mut total_written = 0u64;
-            loop {
-                if bg_shared.cancelled.load(Ordering::Relaxed) {
-                    drop(writer);
+            let promote_or_cleanup = |writer: File, total_written: u64, completed: bool| {
+                let mut writer = writer;
+                if completed {
+                    let _ = writer.flush();
+                }
+                drop(writer);
+                if completed
+                    && persist_on_eof
+                    && bg_cache.max_bytes() > 0
+                    && total_written > 0
+                    && fs::rename(&bg_part_path, &bg_final_path).is_ok()
+                {
+                    let _ = bg_cache.register_complete_entry_with_meta(
+                        bg_key,
+                        bg_final_path,
+                        total_written,
+                        bg_meta,
+                    );
+                } else if !is_loopback
+                    || has_key_override
+                    || bg_shared.cancelled.load(Ordering::Acquire)
+                {
                     let _ = fs::remove_file(&bg_part_path);
+                }
+            };
+
+            loop {
+                if bg_shared.cancelled.load(Ordering::Acquire) {
+                    let full_already =
+                        expected_total.is_some_and(|total| total > 0 && total_written >= total);
+                    promote_or_cleanup(writer, total_written, full_already);
+                    if full_already {
+                        bg_shared.mark_finished(total_written);
+                    }
                     return;
                 }
                 let next_chunk = tokio::select! {
                     _ = bg_shared.cancel_notify.notified() => {
-                        drop(writer);
-                        let _ = fs::remove_file(&bg_part_path);
+                        let full_already =
+                            expected_total.is_some_and(|total| total > 0 && total_written >= total);
+                        promote_or_cleanup(writer, total_written, full_already);
+                        if full_already {
+                            bg_shared.mark_finished(total_written);
+                        }
                         return;
                     }
                     chunk = response.chunk() => chunk,
@@ -646,22 +816,17 @@ impl AudioCache {
                         }
                         total_written += chunk.len() as u64;
                         bg_shared.advance_downloaded(total_written);
+                        if expected_total.is_some_and(|total| total > 0 && total_written >= total) {
+                            promote_or_cleanup(writer, total_written, true);
+                            bg_shared.mark_finished(total_written);
+                            return;
+                        }
                     }
                     Ok(None) => {
-                        let _ = writer.flush();
-                        drop(writer);
-                        if !is_loopback
-                            && bg_cache.max_bytes() > 0
-                            && fs::rename(&bg_part_path, &bg_final_path).is_ok()
-                        {
-                            let _ = bg_cache.register_complete_entry(
-                                bg_key,
-                                bg_final_path,
-                                total_written,
-                            );
-                        } else if !is_loopback || bg_shared.cancelled.load(Ordering::Relaxed) {
-                            let _ = fs::remove_file(&bg_part_path);
-                        }
+                        let clean_eof = !bg_shared.cancelled.load(Ordering::Acquire)
+                            || expected_total
+                                .is_some_and(|total| total > 0 && total_written >= total);
+                        promote_or_cleanup(writer, total_written, clean_eof);
                         bg_shared.mark_finished(total_written);
                         return;
                     }
@@ -675,12 +840,18 @@ impl AudioCache {
             }
         });
 
+        let cleanup_part_path = if is_loopback && !(has_key_override && self.max_bytes() > 0) {
+            Some(part_path)
+        } else {
+            None
+        };
+
         Ok(ProgressiveStream::from_remote(RemoteStreamInner {
             cache: self.clone(),
             final_url: redirected.final_url.to_string(),
             headers,
             read_file: Some(read_file),
-            cleanup_part_path: if is_loopback { Some(part_path) } else { None },
+            cleanup_part_path,
             pos: 0,
             total_size: redirected.total_size,
             accepts_ranges: redirected.accepts_ranges,
@@ -698,63 +869,139 @@ impl AudioCache {
         headers: Vec<(String, String)>,
         max_prefetch_bytes: Option<usize>,
     ) -> tokio::task::JoinHandle<AudioResult<PathBuf>> {
+        self.prefetch_with_key(url, headers, max_prefetch_bytes, None, None)
+    }
+
+    /// Spawns a background prefetch storing the completed file under `cache_key_override`
+    /// (falling back to URL SHA-256) with optional sidecar [`CachedStreamMeta`].
+    ///
+    /// When `max_prefetch_bytes` is `None`, enforces a 64 MiB safety ceiling so normal tracks
+    /// cache to 100% completion while multi-hour streams abort cleanly without leaking `.part`.
+    pub fn prefetch_with_key(
+        &self,
+        url: String,
+        headers: Vec<(String, String)>,
+        max_prefetch_bytes: Option<usize>,
+        cache_key_override: Option<String>,
+        meta: Option<CachedStreamMeta>,
+    ) -> tokio::task::JoinHandle<AudioResult<PathBuf>> {
         let cache = self.clone();
         io_runtime_handle().spawn(async move {
-            if cache.max_bytes() == 0 {
-                return Err(AudioError::Other("audio disk cache is disabled".into()));
-            }
-            if Url::parse(&url).ok().as_ref().is_some_and(is_loopback_url) {
-                return Err(AudioError::Other(
-                    "skipping disk cache prefetch for ephemeral loopback stream".into(),
-                ));
-            }
-            if let Some(existing) = cache.get_cached_path(&url) {
-                return Ok(existing);
-            }
-            let range = max_prefetch_bytes.map(|n| (0u64, Some(n.saturating_sub(1) as u64)));
-            let mut resp = cache.fetch_with_redirects(&url, &headers, range).await?;
-            if !resp.status.is_success() {
-                return Err(AudioError::Http(format!(
-                    "prefetch HTTP {} for {}",
-                    resp.status, resp.final_url
-                )));
-            }
-            let key = cache_key_for_url(&url);
-            let final_path = cache.final_path_for_key(&key);
-            let part_path = cache.part_path_for_key(&key);
-            let mut file = File::create(&part_path)?;
-            let mut written = 0u64;
-            while let Some(chunk) = resp
-                .response
-                .chunk()
+            cache
+                .prefetch_with_key_async(url, headers, max_prefetch_bytes, cache_key_override, meta)
                 .await
-                .map_err(|e| AudioError::Http(format!("prefetch chunk error: {e}")))?
-            {
-                file.write_all(&chunk)?;
-                written += chunk.len() as u64;
-            }
-            file.flush()?;
-            drop(file);
-            // Only promote to complete cache entry if full track was downloaded;
-            // remove partial temp files so they never leak in the cache directory.
-            let is_complete = max_prefetch_bytes.is_none()
-                || resp
-                    .total_size
-                    .map(|total| written >= total)
-                    .unwrap_or(false);
-            if is_complete {
-                fs::rename(&part_path, &final_path)?;
-                cache.register_complete_entry(key, final_path.clone(), written)?;
-                Ok(final_path)
-            } else {
-                let _ = fs::remove_file(&part_path);
-                Ok(final_path)
-            }
         })
+    }
+
+    /// Async implementation of [`Self::prefetch_with_key`]. Cancellation-safe: aborting the
+    /// enclosing task closes the HTTP/loopback socket immediately and cleans up any `.part` file.
+    pub(crate) async fn prefetch_with_key_async(
+        &self,
+        url: String,
+        headers: Vec<(String, String)>,
+        max_prefetch_bytes: Option<usize>,
+        cache_key_override: Option<String>,
+        meta: Option<CachedStreamMeta>,
+    ) -> AudioResult<PathBuf> {
+        if self.max_bytes() == 0 {
+            return Err(AudioError::Other("audio disk cache is disabled".into()));
+        }
+        let logical_key = cache_key_override
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+        let is_loopback = Url::parse(&url).ok().as_ref().is_some_and(is_loopback_url);
+        if is_loopback && logical_key.is_none() {
+            return Err(AudioError::Other(
+                "skipping disk cache prefetch for ephemeral loopback stream".into(),
+            ));
+        }
+        if let Some(ref lk) = logical_key
+            && let Some((existing, _)) = self.get_cached_by_key(lk)
+        {
+            return Ok(existing);
+        }
+        if !is_loopback && let Some(existing) = self.get_cached_path(&url) {
+            return Ok(existing);
+        }
+
+        let range = max_prefetch_bytes.map(|n| (0u64, Some(n.saturating_sub(1) as u64)));
+        let mut resp = self.fetch_with_redirects(&url, &headers, range).await?;
+        if !resp.status.is_success() {
+            return Err(AudioError::Http(format!(
+                "prefetch HTTP {} for {}",
+                resp.status, resp.final_url
+            )));
+        }
+        if max_prefetch_bytes.is_none()
+            && let Some(total) = resp.total_size
+            && total > MAX_FULL_PREFETCH_BYTES
+        {
+            return Err(AudioError::Other(format!(
+                "prefetch skipped: stream size {total} exceeds {} byte ceiling",
+                MAX_FULL_PREFETCH_BYTES
+            )));
+        }
+
+        let key = logical_key.unwrap_or_else(|| cache_key_for_url(&url));
+        let final_path = self.final_path_for_key(&key);
+        let part_path = self.part_path_for_key(&key);
+        // Declared before `file` so on abort/error `file` closes before `part_guard` unlinks `.part`.
+        let mut part_guard = PartFileGuard::new(part_path.clone());
+        let mut file = File::create(&part_path)?;
+        let mut written = 0u64;
+        loop {
+            match resp.response.chunk().await {
+                Ok(Some(chunk)) => {
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    if max_prefetch_bytes.is_none()
+                        && written.saturating_add(chunk.len() as u64) > MAX_FULL_PREFETCH_BYTES
+                    {
+                        return Err(AudioError::Other(
+                            "prefetch aborted: stream exceeded 64 MiB safety ceiling".into(),
+                        ));
+                    }
+                    file.write_all(&chunk)?;
+                    written += chunk.len() as u64;
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    return Err(AudioError::Http(format!("prefetch chunk error: {e}")));
+                }
+            }
+        }
+        file.flush()?;
+        drop(file);
+
+        if written == 0 {
+            return Err(AudioError::Http("prefetch received 0 bytes".into()));
+        }
+
+        // Only promote to complete cache entry if full track was downloaded;
+        // `part_guard` removes partial temp files automatically if not promoted.
+        let is_complete = max_prefetch_bytes.is_none()
+            || resp
+                .total_size
+                .map(|total| written >= total)
+                .unwrap_or(false);
+        if is_complete {
+            fs::rename(&part_path, &final_path)?;
+            part_guard.disarm();
+            let final_meta = effective_cached_meta(meta, resp.content_type.as_deref());
+            self.register_complete_entry_with_meta(key, final_path.clone(), written, final_meta)?;
+            Ok(final_path)
+        } else {
+            Ok(final_path)
+        }
     }
 
     fn final_path_for_key(&self, key: &str) -> PathBuf {
         self.inner.cache_dir.join(format!("{key}.audio"))
+    }
+
+    fn meta_path_for_key(&self, key: &str) -> PathBuf {
+        self.inner.cache_dir.join(format!("{key}.json"))
     }
 
     fn part_path_for_key(&self, key: &str) -> PathBuf {
@@ -765,11 +1012,48 @@ impl AudioCache {
         self.inner.cache_dir.join(format!("{key}.{stamp}.part"))
     }
 
+    fn write_meta_sidecar(&self, key: &str, meta: &CachedStreamMeta) {
+        let Ok(json_bytes) = serde_json::to_vec(meta) else {
+            return;
+        };
+        let tmp_path = self.part_path_for_key(&format!("{key}.meta"));
+        let final_meta_path = self.meta_path_for_key(key);
+        let write_res = (|| -> io::Result<()> {
+            let mut file = File::create(&tmp_path)?;
+            file.write_all(&json_bytes)?;
+            file.flush()?;
+            drop(file);
+            fs::rename(&tmp_path, &final_meta_path)?;
+            Ok(())
+        })();
+        if write_res.is_err() {
+            let _ = fs::remove_file(&tmp_path);
+        }
+    }
+
+    fn read_meta_sidecar(&self, key: &str) -> Option<CachedStreamMeta> {
+        let bytes = fs::read(self.meta_path_for_key(key)).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
     fn next_access_stamp(&self) -> u64 {
         self.inner.access_seq.fetch_add(1, Ordering::Relaxed)
     }
 
     fn register_complete_entry(&self, key: String, path: PathBuf, size: u64) -> AudioResult<()> {
+        self.register_complete_entry_with_meta(key, path, size, None)
+    }
+
+    fn register_complete_entry_with_meta(
+        &self,
+        key: String,
+        path: PathBuf,
+        size: u64,
+        meta: Option<CachedStreamMeta>,
+    ) -> AudioResult<()> {
+        if let Some(ref m) = meta {
+            self.write_meta_sidecar(&key, m);
+        }
         let stamp = self.next_access_stamp();
         {
             let mut guard = self
@@ -784,6 +1068,7 @@ impl AudioCache {
                     path,
                     size,
                     last_accessed: stamp,
+                    meta,
                 },
             );
         }
@@ -796,28 +1081,33 @@ impl AudioCache {
             return Ok(());
         };
         let mut scanned = Vec::new();
+        let mut json_sidecars = Vec::new();
         for entry in read_dir.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("part") {
-                let _ = fs::remove_file(&path);
-                continue;
+            match path.extension().and_then(|s| s.to_str()) {
+                Some("part") => {
+                    let _ = fs::remove_file(&path);
+                }
+                Some("json") => {
+                    json_sidecars.push(path);
+                }
+                Some("audio") => {
+                    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                        continue;
+                    };
+                    let Ok(meta) = entry.metadata() else {
+                        continue;
+                    };
+                    let modified = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    scanned.push((stem.to_owned(), path, meta.len(), modified));
+                }
+                _ => {}
             }
-            if path.extension().and_then(|s| s.to_str()) != Some("audio") {
-                continue;
-            }
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            let Ok(meta) = entry.metadata() else {
-                continue;
-            };
-            let modified = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            scanned.push((stem.to_owned(), path, meta.len(), modified));
         }
         scanned.sort_by_key(|(_, _, _, mtime)| *mtime);
 
@@ -827,6 +1117,7 @@ impl AudioCache {
             .lock()
             .map_err(|_| AudioError::Other("cache mutex poisoned".into()))?;
         for (key, path, size, _) in scanned {
+            let sidecar_meta = self.read_meta_sidecar(&key);
             let stamp = self.next_access_stamp();
             guard.insert(
                 key.clone(),
@@ -835,10 +1126,42 @@ impl AudioCache {
                     path,
                     size,
                     last_accessed: stamp,
+                    meta: sidecar_meta,
                 },
             );
         }
+        for json_path in json_sidecars {
+            let keep = json_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|stem| guard.contains_key(stem));
+            if !keep {
+                let _ = fs::remove_file(&json_path);
+            }
+        }
         Ok(())
+    }
+}
+
+struct PartFileGuard {
+    path: Option<PathBuf>,
+}
+
+impl PartFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn disarm(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for PartFileGuard {
+    fn drop(&mut self) {
+        if let Some(ref p) = self.path {
+            let _ = fs::remove_file(p);
+        }
     }
 }
 
@@ -922,8 +1245,9 @@ struct RemoteStreamInner {
 
 impl Drop for RemoteStreamInner {
     fn drop(&mut self) {
-        self.shared.cancelled.store(true, Ordering::Relaxed);
+        self.shared.cancelled.store(true, Ordering::SeqCst);
         self.shared.cancel_notify.notify_waiters();
+        self.shared.cancel_notify.notify_one();
         // Close read handle before removing ephemeral loopback `.part` files (Windows-safe).
         let _ = self.read_file.take();
         if let Some(ref part_path) = self.cleanup_part_path {
@@ -1677,5 +2001,148 @@ mod tests {
         let _short_lb =
             build_loopback_no_redirect_client(Duration::from_secs(7)).expect("short_lb");
         drop((a1, a2, l1, l2));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_loopback_stream_with_logical_key_persists_and_replays_after_server_closes() {
+        let dir = test_cache_dir("loopback-logical-key");
+        let cache = AudioCache::with_dir(dir.clone(), 4 * 1024 * 1024).expect("cache");
+
+        // Verify cache_key_for_track filtering rules.
+        assert!(cache_key_for_track("", "abc", Quality::High).is_none());
+        assert!(cache_key_for_track("local", "abc", Quality::High).is_none());
+        assert!(cache_key_for_track("youtube-music", "", Quality::High).is_none());
+        assert!(cache_key_for_track("youtube-music", "/tmp/a.mp3", Quality::High).is_none());
+        assert!(cache_key_for_track("youtube-music", "file:///a.mp3", Quality::High).is_none());
+        let logical_key = cache_key_for_track("youtube-music", "loopback-track-1", Quality::High)
+            .expect("valid logical track key");
+
+        // Serve an audio stream over loopback 127.0.0.1 WITHOUT Content-Length (mirroring
+        // VirtualFfmpegShim unwrapped HLS) and close the listener right after serving once.
+        let payload: Vec<u8> = (0..18_000).map(|i| ((i * 19) % 251) as u8).collect();
+        let srv_payload = payload.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let srv = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let hdr = "HTTP/1.1 200 OK\r\nContent-Type: audio/aac\r\nConnection: close\r\n\r\n";
+            socket.write_all(hdr.as_bytes()).await.expect("hdr");
+            socket.write_all(&srv_payload).await.expect("body");
+            let _ = socket.shutdown().await;
+            drop(listener);
+        });
+
+        let meta = CachedStreamMeta {
+            media_type: "mp3".to_owned(), // Should be upgraded to authoritative `audio/aac`!
+            bit_rate: 192_000,
+            gain: -4.2,
+            peak: 0.89,
+        };
+        let url = format!("http://{addr}/");
+        let mut stream = cache
+            .open_progressive_with_key(&url, Vec::new(), Some(&logical_key), Some(meta))
+            .expect("open loopback stream with logical key");
+        let mut read_back = Vec::new();
+        stream.read_to_end(&mut read_back).expect("read to EOF");
+        assert_eq!(read_back, payload);
+        drop(stream);
+        srv.await.expect("server finished and closed");
+
+        // Verify `.audio` and `.json` sidecar were persisted under logical_key.
+        let (cached_path, saved_meta) = cache
+            .get_cached_track("youtube-music", "loopback-track-1", Quality::High)
+            .expect("loopback stream with logical key must persist in disk cache");
+        assert!(cached_path.is_file());
+        assert!(cache.meta_path_for_key(&logical_key).is_file());
+        assert_eq!(saved_meta.media_type, "audio/aac");
+        assert_eq!(saved_meta.bit_rate, 192_000);
+        assert!((saved_meta.gain - (-4.2)).abs() < 1e-6);
+        assert!((saved_meta.peak - 0.89).abs() < 1e-6);
+
+        // Replay via a dead loopback port using the same logical_key -> serves 100% from disk!
+        let mut replay = cache
+            .open_progressive_with_key(
+                "http://127.0.0.1:1/dead-port",
+                Vec::new(),
+                Some(&logical_key),
+                None,
+            )
+            .expect("replay from disk cache after loopback server closed");
+        let mut replayed_bytes = Vec::new();
+        replay
+            .read_to_end(&mut replayed_bytes)
+            .expect("read replay");
+        assert_eq!(replayed_bytes, payload);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_audio_cache_reloads_audio_and_json_sidecar_across_restarts() {
+        let dir = test_cache_dir("sidecar-restart");
+        let payload = b"PERSISTED-TRACK-AUDIO-PAYLOAD-BYTES".to_vec();
+        let expected_meta = CachedStreamMeta {
+            media_type: "audio/mp4".to_owned(),
+            bit_rate: 256_000,
+            gain: -5.25,
+            peak: 0.91,
+        };
+        let logical_key = cache_key_for_track("youtube-music", "restart-track-1", Quality::High)
+            .expect("logical key");
+
+        {
+            let cache1 = AudioCache::with_dir(dir.clone(), 4 * 1024 * 1024).expect("cache1");
+            let srv_payload = payload.clone();
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let srv = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: audio/mp4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    srv_payload.len()
+                );
+                socket.write_all(hdr.as_bytes()).await.expect("hdr");
+                socket.write_all(&srv_payload).await.expect("body");
+                let _ = socket.shutdown().await;
+            });
+
+            let url = format!("http://{addr}/track.m4a");
+            cache1
+                .prefetch_with_key(
+                    url,
+                    Vec::new(),
+                    None,
+                    Some(logical_key.clone()),
+                    Some(expected_meta.clone()),
+                )
+                .await
+                .expect("join prefetch")
+                .expect("prefetch ok");
+            srv.await.expect("srv");
+            assert!(cache1.final_path_for_key(&logical_key).is_file());
+            assert!(cache1.meta_path_for_key(&logical_key).is_file());
+        }
+
+        // Create a fresh AudioCache pointing at the same directory (simulating app restart).
+        let cache2 = AudioCache::with_dir(dir.clone(), 4 * 1024 * 1024).expect("cache2");
+        let (reloaded_path, reloaded_meta) = cache2
+            .get_cached_track("youtube-music", "restart-track-1", Quality::High)
+            .expect("AudioCache::new must reload <key>.audio + <key>.json across restarts");
+        assert_eq!(
+            fs::read(&reloaded_path).expect("read cached audio"),
+            payload
+        );
+        assert_eq!(reloaded_meta, expected_meta);
+
+        // Clearing removes both `.audio` and `.json` sidecar cleanly.
+        cache2.clear().expect("clear");
+        assert!(!reloaded_path.exists());
+        assert!(!cache2.meta_path_for_key(&logical_key).exists());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -51,14 +51,16 @@ pub type AudioResult<T> = Result<T, AudioError>;
 
 // Convenient top-level re-exports.
 pub use cache::{
-    AudioCache, ProgressiveStream, RedirectedResponse, StreamCacheConfig,
-    send_with_preserved_headers,
+    AudioCache, CachedStreamMeta, ProgressiveStream, RedirectedResponse, StreamCacheConfig,
+    cache_key_for_track, send_with_preserved_headers,
 };
 #[cfg(test)]
 pub use decoder::DemoSynthDecoder;
 #[cfg(feature = "audio-symphonia")]
 pub use decoder::SymphoniaDecoder;
-pub use decoder::{AudioDecoder, AudioSpec, DecoderPreference, open_decoder};
+pub use decoder::{
+    AudioDecoder, AudioSpec, DecoderPreference, open_decoder, open_decoder_with_key,
+};
 pub use dsp::{
     DspConfig, DspProcessor, FadeEnvelope, SPECTRUM_BANDS, SoftLimiter, SpectrumAnalyzer,
     compute_replay_gain_linear, db_to_linear, mix_crossfade, mix_crossfade_in_place,

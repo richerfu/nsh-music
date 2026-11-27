@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -8,9 +10,11 @@ use nsh_music_core::model::{Quality, RepeatMode, SourceError, StreamInfo, Track}
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
-use crate::cache::{AudioCache, StreamCacheConfig};
+use crate::cache::{
+    AudioCache, CachedStreamMeta, StreamCacheConfig, cache_key_for_track, is_loopback_url,
+};
 use crate::decoder::{
-    AudioDecoder, AudioSpec, DecoderPreference, infer_extension_hint, open_decoder,
+    AudioDecoder, AudioSpec, DecoderPreference, infer_extension_hint, open_decoder_with_key,
 };
 use crate::dsp::{DspConfig, DspProcessor, SPECTRUM_BANDS, mix_crossfade_in_place};
 use crate::output::{AudioOutput, AudioOutputEvent, OutputConfig, default_audio_output};
@@ -19,6 +23,10 @@ use crate::{AudioError, AudioResult};
 
 /// Fixed power-of-two capacity for the pre-allocated PCM ring buffer (~1.36s stereo @ 48kHz).
 const PCM_RING_CAPACITY: usize = 131_072;
+/// Maximum number of pre-resolved remote `StreamInfo` entries held in memory.
+const RESOLVED_STREAM_CACHE_MAX_ENTRIES: usize = 64;
+/// TTL for pre-resolved remote `StreamInfo` entries before re-resolving via `stream_resolver`.
+const RESOLVED_STREAM_CACHE_TTL: Duration = Duration::from_secs(480);
 
 /// High-level player transport state.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -375,7 +383,9 @@ impl AudioAtomics {
     }
 }
 
+#[cfg(test)]
 type PrefetchTarget = (String, Vec<(String, String)>);
+type ResolvedStreamCache = Arc<Mutex<HashMap<String, (StreamInfo, Instant)>>>;
 
 struct EngineSignals {
     state_tx: watch::Sender<PlaybackSnapshot>,
@@ -390,6 +400,7 @@ struct AudioEngineInner {
     cmd_tx: Sender<EngineCommand>,
     signals: Arc<EngineSignals>,
     cache: AudioCache,
+    resolved_stream_cache: ResolvedStreamCache,
     remote: RemoteController,
     shutdown_called: AtomicBool,
     worker: Mutex<Option<JoinHandle<()>>>,
@@ -473,10 +484,12 @@ impl AudioEngine {
             prefetched_targets: Arc::new(Mutex::new(Vec::new())),
         });
 
+        let resolved_stream_cache: ResolvedStreamCache = Arc::new(Mutex::new(HashMap::new()));
         let inner = Arc::new(AudioEngineInner {
             cmd_tx,
             signals: Arc::clone(&signals),
             cache: cache.clone(),
+            resolved_stream_cache: Arc::clone(&resolved_stream_cache),
             remote: remote.clone(),
             shutdown_called: AtomicBool::new(false),
             worker: Mutex::new(None),
@@ -491,6 +504,7 @@ impl AudioEngine {
                     config,
                     output,
                     cache,
+                    resolved_stream_cache,
                     remote,
                     initial_snapshot,
                     worker_signals,
@@ -548,8 +562,9 @@ impl AudioEngine {
         self.inner.cache.total_bytes()
     }
 
-    /// Removes all cached audio files from disk.
+    /// Removes all cached audio files from disk and clears in-memory resolved stream entries.
     pub fn clear_cache(&self) -> AudioResult<()> {
+        clear_resolved_stream_cache(&self.inner.resolved_stream_cache);
         self.inner.cache.clear()
     }
 
@@ -791,6 +806,7 @@ struct EngineActor {
     output_started: bool,
     output_config: OutputConfig,
     cache: AudioCache,
+    resolved_stream_cache: ResolvedStreamCache,
     remote: RemoteController,
     snapshot: PlaybackSnapshot,
     signals: Arc<EngineSignals>,
@@ -813,6 +829,7 @@ struct EngineActor {
     last_remote_pos_sync: Instant,
     last_published_spectrum: [f32; SPECTRUM_BANDS],
     last_prefetched_id: Option<String>,
+    active_prefetch: Option<(String, tokio::task::JoinHandle<AudioResult<PathBuf>>)>,
     paused_by_interrupt: bool,
     pending_pause_after_load: bool,
     ducked: bool,
@@ -823,6 +840,7 @@ impl EngineActor {
         config: AudioEngineConfig,
         output: Box<dyn AudioOutput>,
         cache: AudioCache,
+        resolved_stream_cache: ResolvedStreamCache,
         remote: RemoteController,
         snapshot: PlaybackSnapshot,
         signals: Arc<EngineSignals>,
@@ -835,6 +853,7 @@ impl EngineActor {
             output_started: false,
             output_config: OutputConfig::default(),
             cache,
+            resolved_stream_cache,
             remote,
             snapshot,
             signals,
@@ -857,6 +876,7 @@ impl EngineActor {
             last_remote_pos_sync: Instant::now(),
             last_published_spectrum: [0.0; SPECTRUM_BANDS],
             last_prefetched_id: None,
+            active_prefetch: None,
             paused_by_interrupt: false,
             pending_pause_after_load: false,
             ducked: false,
@@ -1095,7 +1115,12 @@ impl EngineActor {
                     ));
             }
             EngineCommand::SetQuality(quality) => {
-                self.snapshot.quality = quality;
+                if self.snapshot.quality != quality {
+                    self.snapshot.quality = quality;
+                    clear_resolved_stream_cache(&self.resolved_stream_cache);
+                    self.abort_active_prefetch();
+                    self.last_prefetched_id = None;
+                }
                 self.publish_snapshot();
             }
             EngineCommand::SetReplayGainEnabled(enabled) => {
@@ -1397,88 +1422,207 @@ impl EngineActor {
         // stream resolution so notification bar / Control Center updates right away.
         self.sync_remote_metadata();
 
-        let resolved = match explicit_stream {
-            Some(stream) => Ok(stream),
-            None => self.resolve_track_stream(&track),
-        };
+        // Abort any still-in-flight background prefetch (immediately closing any loopback
+        // `ffmpeg -listen 1` TCP socket so the previous relay exits cleanly without contention).
+        self.abort_active_prefetch();
 
-        let stream_info = match resolved {
-            Ok(info) => {
-                log::info!(
-                    "resolved stream for '{}' ({}): target={} media_type={:?}",
-                    track.name,
-                    track.id,
-                    sanitize_url_for_log(&info.url),
-                    info.media_type
-                );
-                info
-            }
-            Err(err) => {
-                log::warn!(
-                    "failed to resolve stream for '{}' ({}): {err}",
-                    track.name,
-                    track.id
-                );
-                self.decoder = None;
-                self.snapshot.status = PlaybackStatus::Error(err);
-                self.atomics.playing.store(false, Ordering::Release);
-                self.clear_ring_and_timeline(0);
-                self.publish_snapshot();
-                self.remote.update_playback_full(
-                    RemotePlaybackStatus::Stopped,
-                    0,
-                    self.snapshot.duration_ms,
-                    0,
-                );
-                return;
-            }
-        };
-
-        let headers: Vec<(String, String)> = stream_info
-            .headers
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        let media_type = if stream_info.media_type.is_empty() {
-            None
-        } else {
-            Some(stream_info.media_type.as_str())
-        };
         let duration_hint = if track.duration > 0 {
             Some(track.duration as u64)
         } else {
             None
         };
+        let logical_key = cache_key_for_track(&track.source, &track.id, self.snapshot.quality);
 
-        let decoder = match open_decoder(
-            &self.cache,
-            &stream_info.url,
-            headers,
-            media_type,
-            duration_hint,
-            self.config.decoder_preference,
-        ) {
-            Ok(dec) => dec,
-            Err(err) => {
-                log::warn!(
-                    "failed to open decoder for '{}' ({}) target={}: {err}",
-                    track.name,
-                    track.id,
-                    sanitize_url_for_log(&stream_info.url)
-                );
-                self.decoder = None;
-                self.snapshot.status = PlaybackStatus::Error(err.to_string());
-                self.atomics.playing.store(false, Ordering::Release);
-                self.clear_ring_and_timeline(0);
-                self.publish_snapshot();
-                self.remote.update_playback_full(
-                    RemotePlaybackStatus::Stopped,
-                    0,
-                    self.snapshot.duration_ms,
-                    0,
-                );
-                return;
+        // Tier 1: Logical track disk-cache hit (0ms, zero network / stream_resolver calls).
+        let mut opened: Option<(StreamInfo, Box<dyn AudioDecoder>)> = None;
+        if explicit_stream.is_none()
+            && let Some((cached_path, cached_meta)) =
+                self.cache
+                    .get_cached_track(&track.source, &track.id, self.snapshot.quality)
+        {
+            let cached_url = cached_path.to_string_lossy().into_owned();
+            let cached_media_type = if cached_meta.media_type.is_empty() {
+                None
+            } else {
+                Some(cached_meta.media_type.as_str())
+            };
+            match open_decoder_with_key(
+                &self.cache,
+                &cached_url,
+                Vec::new(),
+                cached_media_type,
+                duration_hint,
+                self.config.decoder_preference,
+                None,
+                None,
+            ) {
+                Ok(dec) => {
+                    log::info!(
+                        "audio disk cache hit for '{}' ({}) -> {:?}",
+                        track.name,
+                        track.id,
+                        cached_path
+                    );
+                    let cached_info = StreamInfo {
+                        url: cached_url,
+                        media_type: cached_meta.media_type,
+                        quality: self.snapshot.quality.as_str().to_owned(),
+                        bit_rate: cached_meta.bit_rate as i64,
+                        gain: cached_meta.gain,
+                        peak: cached_meta.peak,
+                        ..StreamInfo::default()
+                    };
+                    opened = Some((cached_info, dec));
+                }
+                Err(err) => {
+                    log::warn!(
+                        "cached audio file {:?} failed to open for '{}' ({}): {err}; falling back to resolver",
+                        cached_path,
+                        track.name,
+                        track.id
+                    );
+                }
             }
+        }
+
+        // Tier 2: Fresh pre-resolved StreamInfo hit from `maybe_prefetch_next` (0ms, skips
+        // duplicate `YouTube.js`/`yt-dlp` extraction; falls back transparently if URL expired).
+        if opened.is_none()
+            && explicit_stream.is_none()
+            && let Some(ref lk) = logical_key
+            && let Some(cached_info) = get_fresh_resolved_stream(&self.resolved_stream_cache, lk)
+        {
+            let headers = collect_stream_headers(&cached_info.headers);
+            let media_type = if cached_info.media_type.is_empty() {
+                None
+            } else {
+                Some(cached_info.media_type.as_str())
+            };
+            let meta = stream_meta_from_info(&cached_info);
+            match open_decoder_with_key(
+                &self.cache,
+                &cached_info.url,
+                headers,
+                media_type,
+                duration_hint,
+                self.config.decoder_preference,
+                Some(lk.as_str()),
+                Some(meta),
+            ) {
+                Ok(dec) => {
+                    log::info!(
+                        "reused pre-resolved stream for '{}' ({}): target={} media_type={:?}",
+                        track.name,
+                        track.id,
+                        sanitize_url_for_log(&cached_info.url),
+                        cached_info.media_type
+                    );
+                    opened = Some((cached_info, dec));
+                }
+                Err(err) => {
+                    log::warn!(
+                        "pre-resolved stream failed for '{}' ({}) target={}: {err}; evicting and re-resolving",
+                        track.name,
+                        track.id,
+                        sanitize_url_for_log(&cached_info.url)
+                    );
+                    evict_resolved_stream(&self.resolved_stream_cache, lk);
+                }
+            }
+        }
+
+        // Tier 3: Caller-supplied explicit stream or fresh `stream_resolver` lookup.
+        let (stream_info, decoder) = if let Some(pair) = opened {
+            pair
+        } else {
+            let resolved = match explicit_stream {
+                Some(stream) => Ok(stream),
+                None => self.resolve_track_stream(&track),
+            };
+
+            let stream_info = match resolved {
+                Ok(info) => {
+                    log::info!(
+                        "resolved stream for '{}' ({}): target={} media_type={:?}",
+                        track.name,
+                        track.id,
+                        sanitize_url_for_log(&info.url),
+                        info.media_type
+                    );
+                    info
+                }
+                Err(err) => {
+                    log::warn!(
+                        "failed to resolve stream for '{}' ({}): {err}",
+                        track.name,
+                        track.id
+                    );
+                    self.decoder = None;
+                    self.snapshot.status = PlaybackStatus::Error(err);
+                    self.atomics.playing.store(false, Ordering::Release);
+                    self.clear_ring_and_timeline(0);
+                    self.publish_snapshot();
+                    self.remote.update_playback_full(
+                        RemotePlaybackStatus::Stopped,
+                        0,
+                        self.snapshot.duration_ms,
+                        0,
+                    );
+                    return;
+                }
+            };
+
+            if let Some(ref lk) = logical_key {
+                insert_resolved_stream(
+                    &self.resolved_stream_cache,
+                    lk.clone(),
+                    stream_info.clone(),
+                );
+            }
+
+            let headers = collect_stream_headers(&stream_info.headers);
+            let media_type = if stream_info.media_type.is_empty() {
+                None
+            } else {
+                Some(stream_info.media_type.as_str())
+            };
+            let meta = logical_key
+                .as_ref()
+                .map(|_| stream_meta_from_info(&stream_info));
+
+            let decoder = match open_decoder_with_key(
+                &self.cache,
+                &stream_info.url,
+                headers,
+                media_type,
+                duration_hint,
+                self.config.decoder_preference,
+                logical_key.as_deref(),
+                meta,
+            ) {
+                Ok(dec) => dec,
+                Err(err) => {
+                    log::warn!(
+                        "failed to open decoder for '{}' ({}) target={}: {err}",
+                        track.name,
+                        track.id,
+                        sanitize_url_for_log(&stream_info.url)
+                    );
+                    self.decoder = None;
+                    self.snapshot.status = PlaybackStatus::Error(err.to_string());
+                    self.atomics.playing.store(false, Ordering::Release);
+                    self.clear_ring_and_timeline(0);
+                    self.publish_snapshot();
+                    self.remote.update_playback_full(
+                        RemotePlaybackStatus::Stopped,
+                        0,
+                        self.snapshot.duration_ms,
+                        0,
+                    );
+                    return;
+                }
+            };
+            (stream_info, decoder)
         };
 
         let spec = decoder.spec();
@@ -1591,6 +1735,7 @@ impl EngineActor {
     }
 
     fn stop_internal(&mut self) {
+        self.abort_active_prefetch();
         self.decoder = None;
         self.crossfade_tail.clear();
         self.crossfade_pos = 0;
@@ -1953,6 +2098,14 @@ impl EngineActor {
         x
     }
 
+    fn abort_active_prefetch(&mut self) {
+        if let Some((_key, handle)) = self.active_prefetch.take()
+            && !handle.is_finished()
+        {
+            handle.abort();
+        }
+    }
+
     fn maybe_prefetch_next(&mut self) {
         if !self.config.prefetch_next || self.cache.max_bytes() == 0 {
             return;
@@ -1966,18 +2119,32 @@ impl EngineActor {
         if is_local_track_for_prefetch(&next_track) {
             return;
         }
-        let prefetch_key = if !next_track.id.is_empty() {
+        let quality = self.snapshot.quality;
+        // Skip network resolution and prefetch entirely if the next track is already cached on disk.
+        if self
+            .cache
+            .get_cached_track(&next_track.source, &next_track.id, quality)
+            .is_some()
+        {
+            return;
+        }
+
+        let logical_key = cache_key_for_track(&next_track.source, &next_track.id, quality);
+        let fallback_key = if !next_track.id.is_empty() {
             next_track.id.as_str()
         } else {
             next_track.url.as_str()
         };
+        let prefetch_key = logical_key.as_deref().unwrap_or(fallback_key);
         if prefetch_key.is_empty() || self.last_prefetched_id.as_deref() == Some(prefetch_key) {
             return;
         }
-        self.last_prefetched_id = Some(prefetch_key.to_owned());
+        let prefetch_key_owned = prefetch_key.to_owned();
+        self.last_prefetched_id = Some(prefetch_key_owned.clone());
+        self.abort_active_prefetch();
 
         let cache = self.cache.clone();
-        let quality = self.snapshot.quality;
+        let resolved_cache = Arc::clone(&self.resolved_stream_cache);
         #[cfg(test)]
         let prefetch_log = Arc::clone(&self.signals.prefetched_targets);
 
@@ -1985,23 +2152,44 @@ impl EngineActor {
             if next_track.id.is_empty() {
                 return;
             }
-            crate::cache::io_runtime_handle().spawn_blocking(move || {
-                if let Some((url, headers)) =
-                    resolve_prefetch_target(Some(&resolver), &next_track, quality)
-                {
-                    #[cfg(test)]
-                    if let Ok(mut log) = prefetch_log.lock() {
-                        log.push((url.clone(), headers.clone()));
-                    }
-                    drop(cache.prefetch(url, headers, Some(512 * 1024)));
+            let handle = crate::cache::io_runtime_handle().spawn(async move {
+                let resolved = tokio::task::spawn_blocking(move || {
+                    resolve_prefetch_stream(Some(&resolver), &next_track, quality)
+                })
+                .await
+                .ok()
+                .flatten();
+                let Some(info) = resolved else {
+                    return Err(AudioError::Other(
+                        "prefetch stream resolution skipped".into(),
+                    ));
+                };
+                let headers = collect_stream_headers(&info.headers);
+                let meta = stream_meta_from_info(&info);
+                if let Some(ref lk) = logical_key {
+                    insert_resolved_stream(&resolved_cache, lk.clone(), info.clone());
                 }
+                #[cfg(test)]
+                if let Ok(mut log) = prefetch_log.lock() {
+                    log.push((info.url.clone(), headers.clone()));
+                }
+                cache
+                    .prefetch_with_key_async(info.url, headers, None, logical_key, Some(meta))
+                    .await
             });
-        } else if let Some((url, headers)) = resolve_prefetch_target(None, &next_track, quality) {
+            self.active_prefetch = Some((prefetch_key_owned, handle));
+        } else if let Some(info) = resolve_prefetch_stream(None, &next_track, quality) {
+            let headers = collect_stream_headers(&info.headers);
+            let meta = stream_meta_from_info(&info);
+            if let Some(ref lk) = logical_key {
+                insert_resolved_stream(&resolved_cache, lk.clone(), info.clone());
+            }
             #[cfg(test)]
             if let Ok(mut log) = prefetch_log.lock() {
-                log.push((url.clone(), headers.clone()));
+                log.push((info.url.clone(), headers.clone()));
             }
-            drop(cache.prefetch(url, headers, Some(512 * 1024)));
+            let handle = cache.prefetch_with_key(info.url, headers, None, logical_key, Some(meta));
+            self.active_prefetch = Some((prefetch_key_owned, handle));
         }
     }
 
@@ -2361,18 +2549,86 @@ fn collect_stream_headers(
     out
 }
 
-/// Resolves the HTTP(S) prefetch target `(url, headers)` for the next queued track.
+fn stream_meta_from_info(info: &StreamInfo) -> CachedStreamMeta {
+    CachedStreamMeta {
+        media_type: info.media_type.clone(),
+        bit_rate: info.bit_rate.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+        gain: info.gain,
+        peak: info.peak,
+    }
+}
+
+fn is_cacheable_resolved_stream_url(url: &str) -> bool {
+    is_http_url(url)
+        && !url::Url::parse(url)
+            .ok()
+            .as_ref()
+            .is_some_and(is_loopback_url)
+}
+
+fn insert_resolved_stream(
+    cache: &Mutex<HashMap<String, (StreamInfo, Instant)>>,
+    key: String,
+    info: StreamInfo,
+) {
+    if !is_cacheable_resolved_stream_url(&info.url) {
+        return;
+    }
+    let Ok(mut guard) = cache.lock() else {
+        return;
+    };
+    let now = Instant::now();
+    guard.retain(|_, (_, ts)| now.saturating_duration_since(*ts) < RESOLVED_STREAM_CACHE_TTL);
+    if !guard.contains_key(&key)
+        && guard.len() >= RESOLVED_STREAM_CACHE_MAX_ENTRIES
+        && let Some(oldest_key) = guard
+            .iter()
+            .min_by_key(|(_, (_, ts))| *ts)
+            .map(|(k, _)| k.clone())
+    {
+        guard.remove(&oldest_key);
+    }
+    guard.insert(key, (info, now));
+}
+
+fn get_fresh_resolved_stream(
+    cache: &Mutex<HashMap<String, (StreamInfo, Instant)>>,
+    key: &str,
+) -> Option<StreamInfo> {
+    let mut guard = cache.lock().ok()?;
+    if let Some((info, ts)) = guard.get(key) {
+        if ts.elapsed() < RESOLVED_STREAM_CACHE_TTL {
+            return Some(info.clone());
+        }
+        guard.remove(key);
+    }
+    None
+}
+
+fn evict_resolved_stream(cache: &Mutex<HashMap<String, (StreamInfo, Instant)>>, key: &str) {
+    if let Ok(mut guard) = cache.lock() {
+        guard.remove(key);
+    }
+}
+
+fn clear_resolved_stream_cache(cache: &Mutex<HashMap<String, (StreamInfo, Instant)>>) {
+    if let Ok(mut guard) = cache.lock() {
+        guard.clear();
+    }
+}
+
+/// Resolves the full [`StreamInfo`] for background prefetching of the next queued track.
 ///
 /// - Skips local tracks (`source == "local"`, `file://`, or `/...`).
 /// - When `stream_resolver` is `Some`, calls it first (when `next_track.id` is non-empty)
 ///   and never falls back to `next_track.url` on error or empty/non-HTTP results (avoiding
 ///   prefetching HTML watch pages like YouTube Music's `track.url`).
 /// - Only uses `next_track.url` directly when `stream_resolver` is `None`.
-fn resolve_prefetch_target(
+fn resolve_prefetch_stream(
     stream_resolver: Option<&StreamResolver>,
     next_track: &Track,
     quality: Quality,
-) -> Option<PrefetchTarget> {
+) -> Option<StreamInfo> {
     if is_local_track_for_prefetch(next_track) {
         return None;
     }
@@ -2384,13 +2640,27 @@ fn resolve_prefetch_target(
         if !is_http_url(&info.url) {
             return None;
         }
-        return Some((info.url, collect_stream_headers(&info.headers)));
+        return Some(info);
     }
     if is_http_url(&next_track.url) {
-        Some((next_track.url.clone(), Vec::new()))
+        Some(StreamInfo {
+            url: next_track.url.clone(),
+            ..StreamInfo::default()
+        })
     } else {
         None
     }
+}
+
+/// Resolves the HTTP(S) prefetch target `(url, headers)` for the next queued track.
+#[cfg(test)]
+fn resolve_prefetch_target(
+    stream_resolver: Option<&StreamResolver>,
+    next_track: &Track,
+    quality: Quality,
+) -> Option<PrefetchTarget> {
+    let info = resolve_prefetch_stream(stream_resolver, next_track, quality)?;
+    Some((info.url, collect_stream_headers(&info.headers)))
 }
 
 fn resolve_track_stream_with_resolver(
@@ -3029,6 +3299,356 @@ mod tests {
         assert!(engine.prefetched_targets_for_test().is_empty());
 
         engine.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "audio-symphonia")]
+    fn make_test_wav_bytes(sample_rate: u32, channels: u16, num_frames: u32) -> Vec<u8> {
+        let data_bytes = num_frames * channels as u32 * 2;
+        let mut wav = Vec::with_capacity(44 + data_bytes as usize);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&channels.to_le_bytes());
+        wav.extend_from_slice(&sample_rate.to_le_bytes());
+        wav.extend_from_slice(&(sample_rate * channels as u32 * 2).to_le_bytes());
+        wav.extend_from_slice(&(channels * 2).to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_bytes.to_le_bytes());
+        for i in 0..num_frames {
+            let t = i as f32 / sample_rate as f32;
+            let sample = ((std::f32::consts::TAU * 440.0 * t).sin() * 12_000.0) as i16;
+            for _ in 0..channels {
+                wav.extend_from_slice(&sample.to_le_bytes());
+            }
+        }
+        wav
+    }
+
+    #[cfg(feature = "audio-symphonia")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_plugin_track_replay_with_changing_signed_urls_hits_disk_cache_without_re_resolving()
+     {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+        use nsh_music_core::model::StreamInfo;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        use crate::cache::StreamCacheConfig;
+        use crate::output::NullOutput;
+
+        use super::{AudioEngine, AudioEngineConfig, PlaybackStatus};
+
+        let wav = Arc::new(make_test_wav_bytes(44_100, 2, 44_100 / 4));
+        let http_hits = Arc::new(AtomicUsize::new(0));
+        let srv_wav = Arc::clone(&wav);
+        let srv_hits = Arc::clone(&http_hits);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                srv_hits.fetch_add(1, Ordering::SeqCst);
+                let data = Arc::clone(&srv_wav);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let _ = socket.read(&mut buf).await;
+                    let hdr = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                        data.len()
+                    );
+                    let _ = socket.write_all(hdr.as_bytes()).await;
+                    let _ = socket.write_all(&data).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "nsh-player-signed-replay-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+
+        let engine = AudioEngine::with_output(
+            AudioEngineConfig {
+                cache: StreamCacheConfig {
+                    cache_dir: dir.clone(),
+                    max_bytes: 8 * 1024 * 1024,
+                    ..StreamCacheConfig::default()
+                },
+                prefetch_next: false,
+                ..AudioEngineConfig::default()
+            },
+            Box::new(NullOutput::with_tick_interval(Duration::from_millis(2))),
+        )
+        .expect("create engine");
+
+        let resolve_calls = Arc::new(AtomicUsize::new(0));
+        let resolve_calls_ref = Arc::clone(&resolve_calls);
+        engine.set_stream_resolver(Some(Arc::new(move |_track, _quality| {
+            let sig = resolve_calls_ref.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(StreamInfo {
+                url: format!("http://{addr}/videoplayback?sig={sig}&expire=999999"),
+                media_type: "audio/wav".to_owned(),
+                bit_rate: 1_411_200,
+                gain: -3.5,
+                peak: 0.88,
+                ..StreamInfo::default()
+            })
+        })));
+
+        let yt_track = Track {
+            id: "yt-signed-1".to_owned(),
+            source: "youtube-music".to_owned(),
+            name: "Signed URL Track".to_owned(),
+            url: "https://music.youtube.com/watch?v=yt-signed-1".to_owned(),
+            ..Track::default()
+        };
+
+        // First play: resolves via `?sig=1` and streams over HTTP, persisting under logical track key.
+        engine.play_track(yt_track.clone());
+        let cache_deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < cache_deadline {
+            if engine
+                .cache()
+                .get_cached_track("youtube-music", "yt-signed-1", Quality::High)
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        assert!(
+            engine
+                .cache()
+                .get_cached_track("youtube-music", "yt-signed-1", Quality::High)
+                .is_some(),
+            "first playback must populate logical track disk cache"
+        );
+        assert_eq!(resolve_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(http_hits.load(Ordering::SeqCst), 1);
+
+        // Stop and replay the same logical track -> must hit disk cache with ZERO resolver/HTTP calls.
+        engine.stop();
+        let stop_deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < stop_deadline {
+            if engine.snapshot().status == PlaybackStatus::Stopped {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(engine.snapshot().status, PlaybackStatus::Stopped);
+
+        engine.play_track(yt_track);
+        let replay_deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < replay_deadline {
+            if engine.snapshot().status == PlaybackStatus::Playing {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(engine.snapshot().status, PlaybackStatus::Playing);
+        assert_eq!(
+            resolve_calls.load(Ordering::SeqCst),
+            1,
+            "replay must hit logical track disk cache with 0 second stream_resolver calls"
+        );
+        assert_eq!(
+            http_hits.load(Ordering::SeqCst),
+            1,
+            "replay must hit logical track disk cache with 0 second HTTP fetches"
+        );
+
+        engine.shutdown();
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "audio-symphonia")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_maybe_prefetch_next_caches_full_large_track_over_512kb_for_zero_network_next() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+        use nsh_music_core::model::StreamInfo;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        use crate::cache::StreamCacheConfig;
+        use crate::output::NullOutput;
+
+        use super::{AudioEngine, AudioEngineConfig, PlaybackStatus};
+
+        // 3.5 seconds @ 44.1kHz stereo 16-bit WAV = 617,444 bytes (> 512 KiB!).
+        let large_wav = Arc::new(make_test_wav_bytes(44_100, 2, 154_350));
+        assert!(
+            large_wav.len() > 512 * 1024,
+            "test track must exceed 512 KiB, got {} bytes",
+            large_wav.len()
+        );
+        let expected_len = large_wav.len() as u64;
+
+        let http_hits = Arc::new(AtomicUsize::new(0));
+        let srv_wav = Arc::clone(&large_wav);
+        let srv_hits = Arc::clone(&http_hits);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                srv_hits.fetch_add(1, Ordering::SeqCst);
+                let data = Arc::clone(&srv_wav);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let _ = socket.read(&mut buf).await;
+                    let hdr = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                        data.len()
+                    );
+                    let _ = socket.write_all(hdr.as_bytes()).await;
+                    let _ = socket.write_all(&data).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "nsh-player-prefetch-full-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+
+        let engine = AudioEngine::with_output(
+            AudioEngineConfig {
+                cache: StreamCacheConfig {
+                    cache_dir: dir.clone(),
+                    max_bytes: 16 * 1024 * 1024,
+                    ..StreamCacheConfig::default()
+                },
+                prefetch_next: true,
+                ..AudioEngineConfig::default()
+            },
+            Box::new(NullOutput::with_tick_interval(Duration::from_millis(2))),
+        )
+        .expect("create engine");
+
+        let resolve_calls_t2 = Arc::new(AtomicUsize::new(0));
+        let resolve_t2_ref = Arc::clone(&resolve_calls_t2);
+        engine.set_stream_resolver(Some(Arc::new(move |track, _quality| {
+            if track.url.starts_with("demo://") {
+                return Err(SourceError::Unsupported);
+            }
+            let sig = resolve_t2_ref.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(StreamInfo {
+                url: format!("http://{addr}/large-next.wav?sig={sig}"),
+                media_type: "audio/wav".to_owned(),
+                bit_rate: 1_411_200,
+                gain: -2.0,
+                peak: 0.95,
+                ..StreamInfo::default()
+            })
+        })));
+
+        let track_1 = Track {
+            id: "demo-lead-1".to_owned(),
+            source: "demo".to_owned(),
+            name: "Demo Lead".to_owned(),
+            duration: 15_000,
+            url: "demo://lead-1?duration=15000".to_owned(),
+            ..Track::default()
+        };
+        let track_2 = Track {
+            id: "yt-large-next".to_owned(),
+            source: "youtube-music".to_owned(),
+            name: "Large Next Track".to_owned(),
+            url: "https://music.youtube.com/watch?v=yt-large-next".to_owned(),
+            ..Track::default()
+        };
+
+        engine.play_queue(vec![track_1, track_2], 0);
+
+        // Wait for `maybe_prefetch_next` to download ALL >512 KiB of track_2 into disk cache.
+        let prefetch_deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < prefetch_deadline {
+            if engine
+                .cache()
+                .get_cached_track("youtube-music", "yt-large-next", Quality::High)
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        let (cached_path, cached_meta) = engine
+            .cache()
+            .get_cached_track("youtube-music", "yt-large-next", Quality::High)
+            .expect("maybe_prefetch_next must cache full >512 KiB track to disk");
+        assert_eq!(
+            std::fs::metadata(&cached_path)
+                .expect("cached metadata")
+                .len(),
+            expected_len,
+            "cached file must contain 100% of the >512 KiB track"
+        );
+        assert_eq!(cached_meta.media_type, "audio/wav");
+        assert_eq!(resolve_calls_t2.load(Ordering::SeqCst), 1);
+        assert_eq!(http_hits.load(Ordering::SeqCst), 1);
+
+        // Advance to next track -> must open directly from disk cache with 0 extra resolver/HTTP calls.
+        engine.next_track();
+        let next_deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < next_deadline {
+            let snap = engine.snapshot();
+            if snap.status == PlaybackStatus::Playing
+                && snap
+                    .current_track
+                    .as_ref()
+                    .is_some_and(|t| t.id == "yt-large-next")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let snap = engine.snapshot();
+        assert_eq!(snap.status, PlaybackStatus::Playing);
+        assert_eq!(
+            snap.current_track.as_ref().map(|t| t.id.as_str()),
+            Some("yt-large-next")
+        );
+        assert_eq!(
+            resolve_calls_t2.load(Ordering::SeqCst),
+            1,
+            "next() on fully prefetched track must make 0 extra stream_resolver calls"
+        );
+        assert_eq!(
+            http_hits.load(Ordering::SeqCst),
+            1,
+            "next() on fully prefetched track must make 0 extra HTTP fetches"
+        );
+
+        engine.shutdown();
+        srv.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

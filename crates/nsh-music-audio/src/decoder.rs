@@ -2,7 +2,7 @@
 use std::f32::consts::TAU;
 
 use crate::AudioResult;
-use crate::cache::AudioCache;
+use crate::cache::{AudioCache, CachedStreamMeta};
 
 /// Decoded audio stream format metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1004,6 +1004,32 @@ pub fn open_decoder(
     duration_hint_ms: Option<u64>,
     preference: DecoderPreference,
 ) -> AudioResult<Box<dyn AudioDecoder>> {
+    open_decoder_with_key(
+        cache,
+        url,
+        headers,
+        media_type,
+        duration_hint_ms,
+        preference,
+        None,
+        None,
+    )
+}
+
+/// Opens the best available [`AudioDecoder`] while optionally tagging the underlying
+/// progressive cache stream with a logical track key (`cache_key_override`) and sidecar
+/// [`CachedStreamMeta`] so signed CDN URLs and loopback relays persist and replay from disk.
+#[allow(clippy::too_many_arguments)]
+pub fn open_decoder_with_key(
+    cache: &AudioCache,
+    url: &str,
+    headers: Vec<(String, String)>,
+    media_type: Option<&str>,
+    duration_hint_ms: Option<u64>,
+    preference: DecoderPreference,
+    cache_key_override: Option<&str>,
+    meta: Option<CachedStreamMeta>,
+) -> AudioResult<Box<dyn AudioDecoder>> {
     #[cfg(test)]
     if url.starts_with("demo://") {
         return Ok(Box::new(DemoSynthDecoder::from_uri(url, duration_hint_ms)));
@@ -1014,7 +1040,9 @@ pub fn open_decoder(
 
     #[cfg(feature = "audio-ffmpeg")]
     if preference == DecoderPreference::FfmpegFirst {
-        if let Ok(stream) = cache.open_progressive(url, headers.clone()) {
+        if let Ok(stream) =
+            cache.open_progressive_with_key(url, headers.clone(), cache_key_override, meta.clone())
+        {
             if let Ok(dec) = crate::ffmpeg_backend::FfmpegDecoder::open(Box::new(stream)) {
                 return Ok(Box::new(dec));
             }
@@ -1023,7 +1051,12 @@ pub fn open_decoder(
 
     #[cfg(feature = "audio-symphonia")]
     {
-        let stream = cache.open_progressive(url, headers.clone())?;
+        let stream = cache.open_progressive_with_key(
+            url,
+            headers.clone(),
+            cache_key_override,
+            meta.clone(),
+        )?;
         let content_type = stream.content_type().map(|s| s.to_owned());
         if let Some(ref ct) = content_type {
             let base_mime = ct
@@ -1086,12 +1119,13 @@ pub fn open_decoder(
                     log::info!(
                         "symphonia decode failed ({symphonia_err}); falling back to static FFmpeg"
                     );
-                    let fallback_stream = cache.open_progressive(url, headers)?;
+                    let fallback_stream =
+                        cache.open_progressive_with_key(url, headers, cache_key_override, meta)?;
                     let dec =
                         crate::ffmpeg_backend::FfmpegDecoder::open(Box::new(fallback_stream))?;
                     return Ok(Box::new(dec));
                 }
-                let _ = preference;
+                let _ = (preference, meta);
                 Err(symphonia_err)
             }
         }
@@ -1100,14 +1134,21 @@ pub fn open_decoder(
     #[cfg(all(not(feature = "audio-symphonia"), feature = "audio-ffmpeg"))]
     {
         let _ = (ext_hint, preference);
-        let stream = cache.open_progressive(url, headers)?;
+        let stream = cache.open_progressive_with_key(url, headers, cache_key_override, meta)?;
         let dec = crate::ffmpeg_backend::FfmpegDecoder::open(Box::new(stream))?;
         return Ok(Box::new(dec));
     }
 
     #[cfg(not(any(feature = "audio-symphonia", feature = "audio-ffmpeg")))]
     {
-        let _ = (cache, headers, ext_hint, preference);
+        let _ = (
+            cache,
+            headers,
+            ext_hint,
+            preference,
+            cache_key_override,
+            meta,
+        );
         Err(crate::AudioError::Unsupported(
             "no audio decoder feature enabled (enable `audio-symphonia` or `audio-ffmpeg`)".into(),
         ))
