@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" fill="none">
+  <defs>
+    <!-- Android Adaptive Icon Foreground (108x108dp transparent RGBA; artwork strictly within 66/108dp r<=313px safe circle) -->
+    <linearGradient id="disc-sheen" x1="232" y1="232" x2="792" y2="792" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.24"/>
+      <stop offset="48%" stop-color="#ffffff" stop-opacity="0.07"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0.16"/>
+    </linearGradient>
+
+    <linearGradient id="note-grad" x1="512" y1="296" x2="512" y2="718" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#fff4f3"/>
+    </linearGradient>
+
+    <filter id="note-shadow" x="200" y="200" width="624" height="624" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="14" stdDeviation="14" flood-color="#7d0f0b" flood-opacity="0.34"/>
+    </filter>
+  </defs>
+
+  <!-- Subtle audiophile vinyl grooves strictly within r=280 (< 313px 66dp safe circle) -->
+  <circle cx="512" cy="512" r="280" fill="url(#disc-sheen)"/>
+  <circle cx="512" cy="512" r="280" stroke="#ffffff" stroke-opacity="0.24" stroke-width="4.5"/>
+  <circle cx="512" cy="512" r="234" stroke="#ffffff" stroke-opacity="0.15" stroke-width="3.2"/>
+  <circle cx="512" cy="512" r="188" stroke="#ffffff" stroke-opacity="0.12" stroke-width="3"/>
+  <circle cx="512" cy="512" r="142" stroke="#ffffff" stroke-opacity="0.10" stroke-width="2.5"/>
+
+  <!-- Diagonal specular light arcs at r=250 -->
+  <path d="M 335.2 335.2 A 250 250 0 0 1 512 262" stroke="#ffffff" stroke-opacity="0.28" stroke-width="8" stroke-linecap="round"/>
+  <path d="M 688.8 688.8 A 250 250 0 0 1 512 762" stroke="#ffffff" stroke-opacity="0.18" stroke-width="7" stroke-linecap="round"/>
+
+  <!-- Bold crisp white beamed eighth-note strictly within 66dp safe circle (0.94x scale, max r≈276px) -->
+  <g filter="url(#note-shadow)" transform="translate(512 512) scale(0.94) translate(-512 -512) translate(8, 0)">
+    <path
+      fill="url(#note-grad)"
+      d="M 436 364
+         C 436 346 449 330 467 326
+         L 653 288
+         C 674 284 694 300 694 322
+         L 694 606
+         C 694 618 684 628 672 628
+         L 654 628
+         C 642 628 632 618 632 606
+         L 632 406
+         L 498 434
+         L 498 650
+         C 498 662 488 672 476 672
+         L 458 672
+         C 446 672 436 662 436 650
+         Z"
+    />
+    <ellipse cx="421" cy="656" rx="80" ry="59" transform="rotate(-17 421 656)" fill="url(#note-grad)"/>
+    <ellipse cx="617" cy="614" rx="80" ry="59" transform="rotate(-17 617 614)" fill="url(#note-grad)"/>
+  </g>
+</svg>

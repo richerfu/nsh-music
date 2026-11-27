@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" fill="none">
+  <defs>
+    <!-- GNOME / KDE HIG rounded squircle inside 80..944 (864x864 body, ~8% outer transparent margin) -->
+    <clipPath id="linux-clip">
+      <path d="M 512 80 C 770 80 834 80 889 135 C 944 190 944 254 944 512 C 944 770 944 834 889 889 C 834 944 770 944 512 944 C 254 944 190 944 135 889 C 80 834 80 770 80 512 C 80 254 80 190 135 135 C 190 80 254 80 512 80 Z"/>
+    </clipPath>
+
+    <linearGradient id="bg-grad" x1="130" y1="80" x2="894" y2="944" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ff6961"/>
+      <stop offset="46%" stop-color="#f24741"/>
+      <stop offset="100%" stop-color="#cf241c"/>
+    </linearGradient>
+
+    <radialGradient id="top-glow" cx="512" cy="215" r="575" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ffb1a6" stop-opacity="0.36"/>
+      <stop offset="55%" stop-color="#ff6e66" stop-opacity="0.06"/>
+      <stop offset="100%" stop-color="#8a1110" stop-opacity="0.20"/>
+    </radialGradient>
+
+    <!-- Adwaita/Breeze subtle top highlight & bottom depth lip -->
+    <linearGradient id="rim-grad" x1="512" y1="80" x2="512" y2="944" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.34"/>
+      <stop offset="22%" stop-color="#ffffff" stop-opacity="0.06"/>
+      <stop offset="82%" stop-color="#000000" stop-opacity="0.0"/>
+      <stop offset="100%" stop-color="#4d0806" stop-opacity="0.30"/>
+    </linearGradient>
+
+    <linearGradient id="disc-sheen" x1="220" y1="220" x2="804" y2="804" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.22"/>
+      <stop offset="48%" stop-color="#ffffff" stop-opacity="0.06"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0.15"/>
+    </linearGradient>
+
+    <linearGradient id="note-grad" x1="512" y1="275" x2="512" y2="735" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#fff4f3"/>
+    </linearGradient>
+
+    <!-- Subtle GNOME/KDE elevation shadow comfortably inside the 80px margin -->
+    <filter id="linux-shadow" x="28" y="38" width="968" height="968" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="16" stdDeviation="18" flood-color="#1a0505" flood-opacity="0.26"/>
+    </filter>
+
+    <filter id="note-shadow" x="200" y="190" width="624" height="640" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="15" stdDeviation="15" flood-color="#7d0f0b" flood-opacity="0.34"/>
+    </filter>
+  </defs>
+
+  <g filter="url(#linux-shadow)">
+    <g clip-path="url(#linux-clip)">
+      <rect x="80" y="80" width="864" height="864" fill="url(#bg-grad)"/>
+      <rect x="80" y="80" width="864" height="864" fill="url(#top-glow)"/>
+
+      <!-- Subtle audiophile vinyl grooves -->
+      <circle cx="512" cy="512" r="312" fill="url(#disc-sheen)"/>
+      <circle cx="512" cy="512" r="312" stroke="#ffffff" stroke-opacity="0.22" stroke-width="4.5"/>
+      <circle cx="512" cy="512" r="260" stroke="#ffffff" stroke-opacity="0.14" stroke-width="3.5"/>
+      <circle cx="512" cy="512" r="208" stroke="#ffffff" stroke-opacity="0.12" stroke-width="3"/>
+      <circle cx="512" cy="512" r="156" stroke="#ffffff" stroke-opacity="0.10" stroke-width="2.5"/>
+
+      <!-- Diagonal specular light arcs -->
+      <path d="M 316.9 316.9 A 276 276 0 0 1 512 236" stroke="#ffffff" stroke-opacity="0.26" stroke-width="8.5" stroke-linecap="round"/>
+      <path d="M 707.1 707.1 A 276 276 0 0 1 512 788" stroke="#ffffff" stroke-opacity="0.18" stroke-width="7.5" stroke-linecap="round"/>
+
+      <!-- Crisp white beamed eighth-note emblem scaled 1.12x -->
+      <g filter="url(#note-shadow)" transform="translate(512 512) scale(1.12) translate(-512 -512) translate(8, 0)">
+        <path
+          fill="url(#note-grad)"
+          d="M 436 364
+             C 436 346 449 330 467 326
+             L 653 288
+             C 674 284 694 300 694 322
+             L 694 606
+             C 694 618 684 628 672 628
+             L 654 628
+             C 642 628 632 618 632 606
+             L 632 406
+             L 498 434
+             L 498 650
+             C 498 662 488 672 476 672
+             L 458 672
+             C 446 672 436 662 436 650
+             Z"
+        />
+        <ellipse cx="421" cy="656" rx="80" ry="59" transform="rotate(-17 421 656)" fill="url(#note-grad)"/>
+        <ellipse cx="617" cy="614" rx="80" ry="59" transform="rotate(-17 617 614)" fill="url(#note-grad)"/>
+      </g>
+    </g>
+
+    <!-- Crisp Adwaita/Breeze inner border -->
+    <path
+      d="M 512 83 C 768 83 831.5 83 886 138 C 941 192.5 941 256 941 512 C 941 768 941 831.5 886 886 C 831.5 941 768 941 512 941 C 256 941 192.5 941 138 886 C 83 831.5 83 768 83 512 C 83 256 83 192.5 138 138 C 192.5 83 256 83 512 83 Z"
+      stroke="url(#rim-grad)"
+      stroke-width="6"
+    />
+  </g>
+</svg>

@@ -1,0 +1,92 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" fill="none">
+  <defs>
+    <!-- Windows 11 Fluent rounded square: 912x912 body inside 56..968 (~5.5% margin, rx=196) -->
+    <clipPath id="win-clip">
+      <rect x="56" y="56" width="912" height="912" rx="196" ry="196"/>
+    </clipPath>
+
+    <linearGradient id="bg-grad" x1="90" y1="56" x2="934" y2="968" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ff6961"/>
+      <stop offset="46%" stop-color="#f24741"/>
+      <stop offset="100%" stop-color="#cf241c"/>
+    </linearGradient>
+
+    <radialGradient id="top-glow" cx="512" cy="196" r="610" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ffb1a6" stop-opacity="0.34"/>
+      <stop offset="55%" stop-color="#ff6e66" stop-opacity="0.06"/>
+      <stop offset="100%" stop-color="#8a1110" stop-opacity="0.18"/>
+    </radialGradient>
+
+    <linearGradient id="rim-grad" x1="512" y1="56" x2="512" y2="968" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.32"/>
+      <stop offset="25%" stop-color="#ffffff" stop-opacity="0.06"/>
+      <stop offset="80%" stop-color="#000000" stop-opacity="0.0"/>
+      <stop offset="100%" stop-color="#000000" stop-opacity="0.20"/>
+    </linearGradient>
+
+    <linearGradient id="disc-sheen" x1="184" y1="184" x2="840" y2="840" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.22"/>
+      <stop offset="48%" stop-color="#ffffff" stop-opacity="0.06"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0.15"/>
+    </linearGradient>
+
+    <linearGradient id="note-grad" x1="512" y1="268" x2="512" y2="744" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#fff4f3"/>
+    </linearGradient>
+
+    <!-- Compact Fluent elevation shadow staying comfortably inside 56px margin -->
+    <filter id="win-shadow" x="12" y="18" width="1000" height="1000" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#1a0505" flood-opacity="0.24"/>
+    </filter>
+
+    <filter id="note-shadow" x="170" y="160" width="684" height="700" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="15" stdDeviation="14" flood-color="#7d0f0b" flood-opacity="0.36"/>
+    </filter>
+  </defs>
+
+  <g filter="url(#win-shadow)">
+    <g clip-path="url(#win-clip)">
+      <rect x="56" y="56" width="912" height="912" fill="url(#bg-grad)"/>
+      <rect x="56" y="56" width="912" height="912" fill="url(#top-glow)"/>
+
+      <!-- Subtle audiophile vinyl grooves -->
+      <circle cx="512" cy="512" r="332" fill="url(#disc-sheen)"/>
+      <circle cx="512" cy="512" r="332" stroke="#ffffff" stroke-opacity="0.22" stroke-width="5"/>
+      <circle cx="512" cy="512" r="278" stroke="#ffffff" stroke-opacity="0.14" stroke-width="3.5"/>
+      <circle cx="512" cy="512" r="224" stroke="#ffffff" stroke-opacity="0.12" stroke-width="3.2"/>
+      <circle cx="512" cy="512" r="168" stroke="#ffffff" stroke-opacity="0.10" stroke-width="2.8"/>
+
+      <!-- Diagonal specular light arcs -->
+      <path d="M 304.2 304.2 A 294 294 0 0 1 512 218" stroke="#ffffff" stroke-opacity="0.26" stroke-width="9" stroke-linecap="round"/>
+      <path d="M 719.8 719.8 A 294 294 0 0 1 512 806" stroke="#ffffff" stroke-opacity="0.18" stroke-width="8" stroke-linecap="round"/>
+
+      <!-- Bold crisp white beamed eighth-note scaled 1.18x for razor-sharp 16px/20px/24px/32px taskbar icons -->
+      <g filter="url(#note-shadow)" transform="translate(512 512) scale(1.18) translate(-512 -512) translate(8, 0)">
+        <path
+          fill="url(#note-grad)"
+          d="M 432 362
+             C 432 343 446 327 465 323
+             L 655 284
+             C 677 280 698 297 698 320
+             L 698 608
+             C 698 620 688 630 676 630
+             L 654 630
+             C 642 630 632 620 632 608
+             L 632 406
+             L 498 434
+             L 498 652
+             C 498 664 488 674 476 674
+             L 454 674
+             C 442 674 432 664 432 652
+             Z"
+        />
+        <ellipse cx="419" cy="658" rx="82" ry="61" transform="rotate(-17 419 658)" fill="url(#note-grad)"/>
+        <ellipse cx="619" cy="616" rx="82" ry="61" transform="rotate(-17 619 616)" fill="url(#note-grad)"/>
+      </g>
+    </g>
+
+    <!-- Crisp Fluent inner highlight rim -->
+    <rect x="59" y="59" width="906" height="906" rx="193" ry="193" stroke="url(#rim-grad)" stroke-width="6"/>
+  </g>
+</svg>

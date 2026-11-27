@@ -2,7 +2,18 @@
   "name": "NSH Music",
   "id": "com.richerfu.nshmusic",
   "version": "0.1.0",
-  "icon": "assets/app-icon.png",
+  "icon": {
+    "macos": "assets/app-icon-macos.png",
+    "linux": "assets/app-icon-linux.png",
+    "windows": "assets/app-icon-windows.png",
+    "ios": "assets/app-icon.png",
+    "web": "assets/app-icon.png",
+    "android": {
+      "foreground": "assets/app-icon-android-foreground.png",
+      "background": "assets/app-icon-android-background.png",
+      "monochrome": "assets/app-icon-android-monochrome.png"
+    }
+  },
   "appearance": "system",
   "theme": "theme.json",
   "rust": ".",

@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" fill="none">
+  <!-- Android 13+ Material You Monochrome & Notification Small Icon (108x108dp canvas; pure #FFFFFF glyph strictly inside 66/108dp safe circle) -->
+  <g transform="translate(512 512) scale(0.96) translate(-512 -512) translate(8, 0)">
+    <path
+      fill="#ffffff"
+      d="M 434 362
+         C 434 344 447 328 465 324
+         L 655 285
+         C 676 281 696 298 696 320
+         L 696 607
+         C 696 619 686 629 674 629
+         L 654 629
+         C 642 629 632 619 632 607
+         L 632 407
+         L 498 435
+         L 498 651
+         C 498 663 488 673 476 673
+         L 456 673
+         C 444 673 434 663 434 651
+         Z"
+    />
+    <ellipse cx="420" cy="657" rx="81" ry="60" transform="rotate(-17 420 657)" fill="#ffffff"/>
+    <ellipse cx="618" cy="615" rx="81" ry="60" transform="rotate(-17 618 615)" fill="#ffffff"/>
+  </g>
+</svg>

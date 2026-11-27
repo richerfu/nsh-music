@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" fill="none">
+  <!-- Colored high-contrast mini badge for Windows 11 & Linux system trays (rasterized to 64x64 RGBA PNG so backends keep full color) -->
+  <defs>
+    <linearGradient id="tray-bg" x1="3" y1="2" x2="29" y2="30" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ff6b63"/>
+      <stop offset="50%" stop-color="#f24741"/>
+      <stop offset="100%" stop-color="#cc221b"/>
+    </linearGradient>
+    <linearGradient id="tray-rim" x1="16" y1="2" x2="16" y2="30" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.38"/>
+      <stop offset="100%" stop-color="#000000" stop-opacity="0.22"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded squircle badge filling 28x28 (~88% of 32x32) for crisp 16px/24px/32px taskbar presence -->
+  <rect x="2" y="2" width="28" height="28" rx="7.5" ry="7.5" fill="url(#tray-bg)"/>
+  <rect x="2.6" y="2.6" width="26.8" height="26.8" rx="7" ry="7" stroke="url(#tray-rim)" stroke-width="1.2"/>
+
+  <!-- Bold simplified pure-white beamed eighth-note legible down to 16x16px -->
+  <path
+    fill="#ffffff"
+    d="M 12.6 10.2
+       C 12.6 9.35 13.2 8.62 14.04 8.44
+       L 22.05 6.72
+       C 23.12 6.49 24.1 7.31 24.1 8.4
+       L 24.1 19.6
+       C 24.1 21.45 22.35 22.9 20.25 22.9
+       C 18.3 22.9 16.85 21.65 16.85 20.05
+       C 16.85 18.45 18.3 17.2 20.25 17.2
+       C 20.85 17.2 21.4 17.32 21.88 17.54
+       L 21.88 11.78
+       L 14.82 13.3
+       L 14.82 21.65
+       C 14.82 23.5 13.07 24.95 10.97 24.95
+       C 9.02 24.95 7.57 23.7 7.57 22.1
+       C 7.57 20.5 9.02 19.25 10.97 19.25
+       C 11.57 19.25 12.12 19.37 12.6 19.59
+       Z"
+  />
+</svg>

@@ -15,9 +15,9 @@ const APP_ICON_FILE: &str = "app-icon-macos.png";
 const APP_ICON_BYTES: &[u8] = include_bytes!("../assets/app-icon-macos.png");
 
 #[cfg(target_os = "windows")]
-const APP_ICON_FILE: &str = "app-icon.png";
+const APP_ICON_FILE: &str = "app-icon-windows.png";
 #[cfg(target_os = "windows")]
-const APP_ICON_BYTES: &[u8] = include_bytes!("../assets/app-icon.png");
+const APP_ICON_BYTES: &[u8] = include_bytes!("../assets/app-icon-windows.png");
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 fn resolve_app_icon_path() -> Option<std::path::PathBuf> {

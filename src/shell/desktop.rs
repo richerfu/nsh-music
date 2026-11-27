@@ -209,12 +209,28 @@ fn resolve_tray_icon_src() -> nsh_core::element::ImageSrc {
 
     use nsh_core::element::ImageSrc;
 
-    let rel = Path::new("assets").join("tray-icon.svg");
+    // macOS NSStatusBar tints monochrome SVG templates natively for light/dark menu bars.
+    // Windows & Linux backends treat SVGs as monochrome templates (repainting all opaque
+    // pixels white/black), so we ship a 64x64 RGBA raster PNG badge there to preserve our
+    // coral-red + white brand contrast across both light and dark taskbars/panels.
+    #[cfg(target_os = "macos")]
+    const TRAY_ICON_FILE: &str = "tray-icon.svg";
+    #[cfg(target_os = "macos")]
+    const TRAY_ICON_BYTES: &[u8] = include_bytes!("../../assets/tray-icon.svg");
+
+    #[cfg(not(target_os = "macos"))]
+    const TRAY_ICON_FILE: &str = "tray-icon-color.png";
+    #[cfg(not(target_os = "macos"))]
+    const TRAY_ICON_BYTES: &[u8] = include_bytes!("../../assets/tray-icon-color.png");
+
+    let rel = Path::new("assets").join(TRAY_ICON_FILE);
     if rel.is_file() {
         return ImageSrc::from(rel.to_string_lossy().into_owned());
     }
 
-    let manifest_icon = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/tray-icon.svg");
+    let manifest_icon = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join(TRAY_ICON_FILE);
     if manifest_icon.is_file() {
         return ImageSrc::from(manifest_icon.to_string_lossy().into_owned());
     }
@@ -223,9 +239,9 @@ fn resolve_tray_icon_src() -> nsh_core::element::ImageSrc {
         && let Some(dir) = exe.parent()
     {
         for candidate in [
-            dir.join("assets/tray-icon.svg"),
-            dir.join("../assets/tray-icon.svg"),
-            dir.join("../Resources/tray-icon.svg"),
+            dir.join("assets").join(TRAY_ICON_FILE),
+            dir.join("../assets").join(TRAY_ICON_FILE),
+            dir.join("../Resources").join(TRAY_ICON_FILE),
         ] {
             if candidate.is_file() {
                 return ImageSrc::from(candidate.to_string_lossy().into_owned());
@@ -233,20 +249,21 @@ fn resolve_tray_icon_src() -> nsh_core::element::ImageSrc {
         }
     }
 
-    let bytes = include_bytes!("../../assets/tray-icon.svg");
     let cache_dir = dirs::cache_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("nsh-music");
-    let cached = cache_dir.join("tray-icon.svg");
+    let cached = cache_dir.join(TRAY_ICON_FILE);
     let needs_write = std::fs::metadata(&cached)
-        .map(|m| m.len() != bytes.len() as u64)
+        .map(|m| m.len() != TRAY_ICON_BYTES.len() as u64)
         .unwrap_or(true);
     if !needs_write
-        || (std::fs::create_dir_all(&cache_dir).is_ok() && std::fs::write(&cached, bytes).is_ok())
+        || (std::fs::create_dir_all(&cache_dir).is_ok()
+            && std::fs::write(&cached, TRAY_ICON_BYTES).is_ok())
     {
         return ImageSrc::from(cached.to_string_lossy().into_owned());
     }
 
+    // Fallback when cache_dir is unwritable: inline monochrome template SVG (valid on all 3 OSes).
     ImageSrc::svg_markup(include_str!("../../assets/tray-icon.svg"))
 }
 

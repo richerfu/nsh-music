@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" fill="none">
+  <defs>
+    <!-- Android Adaptive Icon Background (108x108dp full-bleed opaque coral-red gradient) -->
+    <linearGradient id="bg-grad" x1="0" y1="0" x2="1024" y2="1024" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ff6961"/>
+      <stop offset="48%" stop-color="#f24741"/>
+      <stop offset="100%" stop-color="#cf241c"/>
+    </linearGradient>
+
+    <!-- Soft upper luminous radial glow visible across full 108dp parallax bleed -->
+    <radialGradient id="top-glow" cx="512" cy="240" r="680" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ffb1a6" stop-opacity="0.34"/>
+      <stop offset="56%" stop-color="#ff6e66" stop-opacity="0.06"/>
+      <stop offset="100%" stop-color="#8a1110" stop-opacity="0.20"/>
+    </radialGradient>
+  </defs>
+
+  <rect x="0" y="0" width="1024" height="1024" fill="url(#bg-grad)"/>
+  <rect x="0" y="0" width="1024" height="1024" fill="url(#top-glow)"/>
+</svg>
