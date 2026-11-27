@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -340,10 +340,7 @@ pub async fn fetch_or_cached_tv_player_with_options(
         _ => vec!["tv", "tv_es6", "es5"],
     };
 
-    let player_id = if let Some(ov) = version_override
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
+    let player_id = if let Some(ov) = version_override.map(str::trim).filter(|s| !s.is_empty()) {
         ov.to_owned()
     } else {
         discover_player_id(client, video_id, timeout).await?
@@ -456,7 +453,8 @@ pub async fn fetch_or_cached_tv_player_with_options(
         };
 
         let Some(sts) = extract_sts_from_player_js(&raw_player) else {
-            last_err = format!("could not extract signatureTimestamp from player {player_id} ({var})");
+            last_err =
+                format!("could not extract signatureTimestamp from player {player_id} ({var})");
             log::warn!(target: "nsh_music_plugin", "yt-ejs {last_err}");
             continue;
         };
@@ -514,28 +512,71 @@ struct WorkerSolveOutput {
     responses: Vec<Value>,
 }
 
+#[derive(Clone)]
 struct YtEjsWorker {
+    id: u64,
     tx: mpsc::Sender<EjsJob>,
+    abort_flag: Arc<AtomicBool>,
 }
 
-fn global_ejs_worker() -> Result<&'static YtEjsWorker, String> {
-    static WORKER: OnceLock<Result<YtEjsWorker, String>> = OnceLock::new();
-    WORKER
-        .get_or_init(YtEjsWorker::spawn)
-        .as_ref()
-        .map_err(Clone::clone)
+enum EjsExecError {
+    ChannelClosed,
+    DroppedReply,
+    Poisoned(String),
+    SolveError(String),
+}
+
+fn global_ejs_worker_slot() -> &'static Mutex<Option<YtEjsWorker>> {
+    static WORKER: OnceLock<Mutex<Option<YtEjsWorker>>> = OnceLock::new();
+    WORKER.get_or_init(|| Mutex::new(None))
+}
+
+fn reset_ejs_worker(failed_id: u64) {
+    if let Ok(mut guard) = global_ejs_worker_slot().lock()
+        && let Some(ref existing) = *guard
+        && existing.id == failed_id
+    {
+        existing.abort_flag.store(true, Ordering::Relaxed);
+        *guard = None;
+    }
+}
+
+fn global_ejs_worker() -> Result<YtEjsWorker, String> {
+    let mut guard = global_ejs_worker_slot()
+        .lock()
+        .map_err(|_| "nsh-yt-ejs worker mutex poisoned".to_owned())?;
+    if let Some(ref existing) = *guard
+        && !existing.abort_flag.load(Ordering::Relaxed)
+    {
+        return Ok(existing.clone());
+    }
+    let fresh = YtEjsWorker::spawn()?;
+    *guard = Some(fresh.clone());
+    Ok(fresh)
 }
 
 impl YtEjsWorker {
     fn spawn() -> Result<Self, String> {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel::<EjsJob>();
         let (boot_tx, boot_rx) = mpsc::sync_channel::<Result<(), String>>(1);
+        let abort_flag = Arc::new(AtomicBool::new(false));
+        let abort_worker = Arc::clone(&abort_flag);
 
         thread::Builder::new()
-            .name("nsh-yt-ejs".to_owned())
+            .name(format!("nsh-yt-ejs-{id}"))
             .stack_size(EJS_STACK_SIZE)
             .spawn(move || {
-                run_ejs_worker(rx, boot_tx);
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_ejs_worker(rx, boot_tx, abort_worker);
+                }));
+                if res.is_err() {
+                    log::error!(
+                        target: "nsh_music_plugin",
+                        "nsh-yt-ejs worker #{id} panicked; will transparently respawn on next solve"
+                    );
+                }
             })
             .map_err(|e| format!("failed to spawn nsh-yt-ejs worker thread: {e}"))?;
 
@@ -543,22 +584,33 @@ impl YtEjsWorker {
             .recv()
             .map_err(|_| "nsh-yt-ejs worker exited during boot".to_owned())??;
 
-        Ok(Self { tx })
+        Ok(Self { id, tx, abort_flag })
     }
 
-    fn execute(&self, job: EjsJob) -> Result<WorkerSolveOutput, String> {
+    fn execute(&self, job: EjsJob) -> Result<WorkerSolveOutput, EjsExecError> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         let wait_timeout = Duration::from_millis(job.deadline_ms.saturating_add(2_000));
         let sent_job = EjsJob {
             reply: reply_tx,
             ..job
         };
-        self.tx
-            .send(sent_job)
-            .map_err(|_| "nsh-yt-ejs worker channel closed".to_owned())?;
-        reply_rx
-            .recv_timeout(wait_timeout)
-            .map_err(|_| "nsh-yt-ejs worker timed out waiting for result".to_owned())?
+        if self.tx.send(sent_job).is_err() {
+            return Err(EjsExecError::ChannelClosed);
+        }
+        match reply_rx.recv_timeout(wait_timeout) {
+            Ok(Ok(out)) => Ok(out),
+            Ok(Err(msg)) => {
+                if msg.to_ascii_lowercase().contains("interrupted") {
+                    Err(EjsExecError::Poisoned(msg))
+                } else {
+                    Err(EjsExecError::SolveError(msg))
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(EjsExecError::DroppedReply),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(EjsExecError::Poisoned(
+                "nsh-yt-ejs worker timed out waiting for result".to_owned(),
+            )),
+        }
     }
 }
 
@@ -615,7 +667,11 @@ globalThis.__yt_ejs_solve = function(cacheKey, rawPlayer, preprocPlayer, request
 };
 "#;
 
-fn run_ejs_worker(rx: mpsc::Receiver<EjsJob>, boot_tx: mpsc::SyncSender<Result<(), String>>) {
+fn run_ejs_worker(
+    rx: mpsc::Receiver<EjsJob>,
+    boot_tx: mpsc::SyncSender<Result<(), String>>,
+    abort_flag: Arc<AtomicBool>,
+) {
     let rt = match Runtime::new() {
         Ok(r) => r,
         Err(e) => {
@@ -629,7 +685,11 @@ fn run_ejs_worker(rx: mpsc::Receiver<EjsJob>, boot_tx: mpsc::SyncSender<Result<(
     let boot_instant = Instant::now();
     let active_deadline_ms = Arc::new(AtomicU64::new(0));
     let dl_cb = Arc::clone(&active_deadline_ms);
+    let abort_cb = Arc::clone(&abort_flag);
     rt.set_interrupt_handler(Some(Box::new(move || {
+        if abort_cb.load(Ordering::Relaxed) {
+            return true;
+        }
         let dl = dl_cb.load(Ordering::Relaxed);
         dl != 0 && (boot_instant.elapsed().as_millis() as u64) >= dl
     })));
@@ -646,15 +706,23 @@ fn run_ejs_worker(rx: mpsc::Receiver<EjsJob>, boot_tx: mpsc::SyncSender<Result<(
         let now_ms = boot_instant.elapsed().as_millis() as u64;
         active_deadline_ms.store(now_ms.saturating_add(15_000), Ordering::Relaxed);
         let res = (|| -> Result<(), String> {
-            ctx.eval::<(), _>(YT_EJS_LIB_JS)
-                .catch(&ctx)
-                .map_err(|e| format!("yt.solver.lib.min.js boot failed: {}", format_qjs_caught(e)))?;
+            ctx.eval::<(), _>(YT_EJS_LIB_JS).catch(&ctx).map_err(|e| {
+                format!("yt.solver.lib.min.js boot failed: {}", format_qjs_caught(e))
+            })?;
             ctx.eval::<(), _>("Object.assign(globalThis, lib);")
                 .catch(&ctx)
-                .map_err(|e| format!("Object.assign(globalThis, lib) failed: {}", format_qjs_caught(e)))?;
-            ctx.eval::<(), _>(YT_EJS_CORE_JS)
-                .catch(&ctx)
-                .map_err(|e| format!("yt.solver.core.min.js boot failed: {}", format_qjs_caught(e)))?;
+                .map_err(|e| {
+                    format!(
+                        "Object.assign(globalThis, lib) failed: {}",
+                        format_qjs_caught(e)
+                    )
+                })?;
+            ctx.eval::<(), _>(YT_EJS_CORE_JS).catch(&ctx).map_err(|e| {
+                format!(
+                    "yt.solver.core.min.js boot failed: {}",
+                    format_qjs_caught(e)
+                )
+            })?;
             ctx.eval::<(), _>(EJS_BRIDGE_JS)
                 .catch(&ctx)
                 .map_err(|e| format!("EJS bridge boot failed: {}", format_qjs_caught(e)))?;
@@ -721,11 +789,18 @@ fn run_ejs_worker(rx: mpsc::Receiver<EjsJob>, boot_tx: mpsc::SyncSender<Result<(
             })
         });
 
+        let was_interrupted = parsed_out
+            .as_ref()
+            .is_err_and(|e| e.to_ascii_lowercase().contains("interrupted"));
+
         if parsed_out.as_ref().is_ok_and(|o| o.cold) {
             rt.run_gc();
         }
 
         let _ = job.reply.send(parsed_out);
+        if was_interrupted || abort_flag.load(Ordering::Relaxed) {
+            break;
+        }
     }
 }
 
@@ -769,16 +844,41 @@ pub fn solve_challenges(
         EJS_WARM_DEADLINE_MS
     };
 
-    let worker = global_ejs_worker()?;
-    let (dummy_tx, _) = mpsc::sync_channel(1);
-    let out = worker.execute(EjsJob {
-        cache_key: bundle.cache_key(),
-        raw_player: bundle.raw_player.clone(),
-        preprocessed_player: bundle.preprocessed_player.clone(),
-        requests_json,
-        deadline_ms,
-        reply: dummy_tx,
-    })?;
+    let out = {
+        let mut attempt = 0;
+        loop {
+            let worker = global_ejs_worker()?;
+            let (dummy_tx, _) = mpsc::sync_channel(1);
+            let job = EjsJob {
+                cache_key: bundle.cache_key(),
+                raw_player: bundle.raw_player.clone(),
+                preprocessed_player: bundle.preprocessed_player.clone(),
+                requests_json: requests_json.clone(),
+                deadline_ms,
+                reply: dummy_tx,
+            };
+            match worker.execute(job) {
+                Ok(out) => break out,
+                Err(EjsExecError::ChannelClosed | EjsExecError::DroppedReply) if attempt == 0 => {
+                    reset_ejs_worker(worker.id);
+                    attempt += 1;
+                }
+                Err(EjsExecError::ChannelClosed) => {
+                    reset_ejs_worker(worker.id);
+                    return Err("nsh-yt-ejs worker channel closed".to_owned());
+                }
+                Err(EjsExecError::DroppedReply) => {
+                    reset_ejs_worker(worker.id);
+                    return Err("nsh-yt-ejs worker dropped reply".to_owned());
+                }
+                Err(EjsExecError::Poisoned(msg)) => {
+                    reset_ejs_worker(worker.id);
+                    return Err(msg);
+                }
+                Err(EjsExecError::SolveError(msg)) => return Err(msg),
+            }
+        }
+    };
 
     if let Some(ref preproc) = out.preprocessed_player {
         update_cached_preprocessed(
@@ -882,10 +982,8 @@ mod tests {
         );
 
         // Verify disk cache separates variants for the same player_id cleanly.
-        let cache_dir = std::env::temp_dir().join(format!(
-            "nsh-yt-ejs-variant-cache-{}",
-            std::process::id()
-        ));
+        let cache_dir =
+            std::env::temp_dir().join(format!("nsh-yt-ejs-variant-cache-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&cache_dir);
         save_disk_cache(&cache_dir, "deadbeef", "tv_es6", 20779, "/* preproc */");
         assert!(load_disk_cache(&cache_dir, "deadbeef", "tv_es6").is_some());
@@ -953,6 +1051,47 @@ mod tests {
             solved.ns.get("xyz789").map(String::as_str),
             Some("SOLVED_N_xyz789")
         );
+    }
+
+    #[test]
+    fn ejs_worker_interrupts_infinite_loop_and_self_heals_next_solve() {
+        let initial_id = global_ejs_worker().expect("boot ejs worker").id;
+
+        // Trigger a synchronous infinite loop inside a synthetic preprocessed player with a short deadline.
+        let worker = global_ejs_worker().expect("ejs worker");
+        let (dummy_tx, _) = mpsc::sync_channel(1);
+        let loop_res = worker.execute(EjsJob {
+            cache_key: "unit-test-inf-loop:tv".to_owned(),
+            raw_player: None,
+            preprocessed_player: Some(
+                "_result.sig = (s) => { while (true) {} return s; };".to_owned(),
+            ),
+            requests_json: r#"[{"type":"sig","challenges":["loop1"]}]"#.to_owned(),
+            deadline_ms: 1_000,
+            reply: dummy_tx,
+        });
+        assert!(
+            matches!(loop_res, Err(EjsExecError::Poisoned(_))),
+            "infinite loop must be interrupted and marked poisoned"
+        );
+        reset_ejs_worker(worker.id);
+
+        // The very next solve must transparently respawn a fresh healthy worker and succeed.
+        let healed_id = global_ejs_worker().expect("respawn ejs worker").id;
+        assert_ne!(
+            healed_id, initial_id,
+            "poisoned EJS worker must be replaced with a fresh instance"
+        );
+        let good_bundle = TvPlayerBundle {
+            player_id: "unit-test-healed-001".to_owned(),
+            variant: "tv".to_owned(),
+            sts: 20185,
+            raw_player: None,
+            preprocessed_player: Some("_result.n = (n) => 'HEALED_' + n;".to_owned()),
+        };
+        let solved = solve_challenges(&good_bundle, &[], &["ok1".to_owned()], None)
+            .expect("healed EJS worker must solve cleanly");
+        assert_eq!(solved.ns.get("ok1").map(String::as_str), Some("HEALED_ok1"));
     }
 
     #[test]

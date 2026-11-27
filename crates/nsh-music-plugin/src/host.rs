@@ -629,6 +629,12 @@ impl VirtualPipeHandle {
         self.killed.load(Ordering::SeqCst)
     }
 
+    /// Exposes the underlying cancellation atomic flag so in-process shims can abort
+    /// in-flight async work immediately when [`Self::kill`] is called.
+    pub fn cancel_flag(&self) -> &AtomicBool {
+        &self.killed
+    }
+
     pub fn wait(&self) -> i32 {
         let Ok(mut guard) = self.exit_code.lock() else {
             return -1;

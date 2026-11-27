@@ -5,11 +5,11 @@
 //! assembly with official `YouTube.js` (`Innertube`, `Session`, `Actions`, `HTTPClient`,
 //! `Player`, `Parser`, `Format`), paired with `yt-dlp/ejs` (`yt_ejs.rs`) dual deciphering.
 
-use std::collections::HashMap;
 use std::collections::hash_map::RandomState;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{BuildHasher, Hasher};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc as std_mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -34,6 +34,8 @@ const YTJS_THREAD_STACK_SIZE: usize = 16 * 1024 * 1024;
 const YTJS_MEMORY_LIMIT: usize = 512 * 1024 * 1024;
 const YTJS_JS_STACK_SIZE: usize = 8 * 1024 * 1024;
 const YTJS_CACHE_SUBDIR: &str = "youtubejs_cache";
+const YTJS_MEM_CACHE_MAX_ENTRIES: usize = 16;
+const YTJS_MEM_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
 const YTJS_PLAYER_FETCH_CAP: Duration = Duration::from_secs(15);
 const YTJS_API_FETCH_CAP: Duration = Duration::from_secs(8);
 
@@ -288,13 +290,25 @@ pub(crate) struct YtJsExtractRequest {
     pub ytjs_client: String,
     pub cookie: Option<String>,
     pub lang: Option<String>,
+    pub location: Option<String>,
     pub visitor_data: Option<String>,
     pub po_token: Option<String>,
     pub user_agent_override: Option<String>,
+    pub extra_headers: Vec<(String, String)>,
     pub skip_hls: bool,
+    pub skip_dash: bool,
     pub loopback_origin: Option<String>,
     pub cache_dir: Option<PathBuf>,
     pub timeout: Duration,
+}
+
+/// Thumbnail descriptor extracted from `YouTube.js` `basic_info.thumbnail`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub(crate) struct YtJsThumbnail {
+    pub url: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
 }
 
 /// Extracted format item returned from `YouTube.js` (`Format` + `format.decipher(player)`).
@@ -336,10 +350,116 @@ pub(crate) struct YtJsExtractResponse {
     pub title: String,
     pub duration_secs: Option<u64>,
     pub uploader: String,
+    pub channel: String,
     pub channel_id: String,
+    pub is_live: bool,
+    pub live_status: String,
     pub thumbnail: String,
+    pub thumbnails: Vec<YtJsThumbnail>,
     pub hls_manifest_url: Option<String>,
+    pub dash_manifest_url: Option<String>,
     pub formats: Vec<YtJsExtractedFormat>,
+}
+
+/// Collection query type (`ytsearch<N>:` or YouTube/YTM playlist) routed through `YouTube.js`.
+#[derive(Debug, Clone)]
+pub(crate) enum YtJsCollectionKind {
+    Search {
+        query: String,
+        limit: usize,
+    },
+    Playlist {
+        list_id: String,
+        is_music: bool,
+        limit: usize,
+    },
+}
+
+/// Request parameters for extracting search or playlist entries via `YouTube.js`.
+#[derive(Debug, Clone)]
+pub(crate) struct YtJsCollectionRequest {
+    pub kind: YtJsCollectionKind,
+    pub cookie: Option<String>,
+    pub lang: Option<String>,
+    pub location: Option<String>,
+    pub extra_headers: Vec<(String, String)>,
+    pub loopback_origin: Option<String>,
+    pub cache_dir: Option<PathBuf>,
+    pub timeout: Duration,
+}
+
+/// Flat entry returned for each item in a `YouTube.js` search or playlist collection.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub(crate) struct YtJsCollectionEntry {
+    pub id: String,
+    pub title: String,
+    pub uploader: String,
+    pub channel_id: String,
+    pub duration_secs: Option<u64>,
+    pub thumbnail: String,
+    pub url: String,
+}
+
+/// Collection extraction response returned by `YouTube.js` (`yt.search` / `yt.getPlaylist`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub(crate) struct YtJsCollectionResponse {
+    pub ok: bool,
+    pub id: String,
+    pub title: String,
+    pub uploader: String,
+    pub webpage_url: String,
+    pub entries: Vec<YtJsCollectionEntry>,
+    pub error: Option<String>,
+}
+
+/// Bounded in-memory LRU cache (`<= 16` entries and `<= 32 MiB` total bytes) for `YouTube.js` cache blobs.
+#[derive(Default)]
+struct BoundedMemCache {
+    order: VecDeque<String>,
+    entries: HashMap<String, Vec<u8>>,
+    total_bytes: usize,
+}
+
+impl BoundedMemCache {
+    fn get(&mut self, key: &str) -> Option<Vec<u8>> {
+        let bytes = self.entries.get(key)?.clone();
+        if let Some(pos) = self.order.iter().position(|k| k == key) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(key.to_owned());
+        Some(bytes)
+    }
+
+    fn insert(&mut self, key: String, bytes: Vec<u8>) {
+        self.remove(&key);
+        if bytes.len() > YTJS_MEM_CACHE_MAX_BYTES {
+            return;
+        }
+        while self.entries.len() >= YTJS_MEM_CACHE_MAX_ENTRIES
+            || self.total_bytes.saturating_add(bytes.len()) > YTJS_MEM_CACHE_MAX_BYTES
+        {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(evicted) = self.entries.remove(&oldest) {
+                self.total_bytes = self.total_bytes.saturating_sub(evicted.len());
+            }
+        }
+        self.total_bytes = self.total_bytes.saturating_add(bytes.len());
+        self.order.push_back(key.clone());
+        self.entries.insert(key, bytes);
+    }
+
+    fn remove(&mut self, key: &str) {
+        if let Some(prev) = self.entries.remove(key) {
+            self.total_bytes = self.total_bytes.saturating_sub(prev.len());
+        }
+        if let Some(pos) = self.order.iter().position(|k| k == key) {
+            self.order.remove(pos);
+        }
+    }
 }
 
 struct ActiveBridgeContext {
@@ -350,34 +470,95 @@ struct ActiveBridgeContext {
     last_player_ua: Option<String>,
 }
 
+enum YtJsJobPayload {
+    Extract {
+        req: YtJsExtractRequest,
+        reply: tokio::sync::oneshot::Sender<Result<YtJsExtractResponse, String>>,
+    },
+    Collection {
+        req: YtJsCollectionRequest,
+        reply: tokio::sync::oneshot::Sender<Result<YtJsCollectionResponse, String>>,
+    },
+    #[cfg(test)]
+    EvalTest {
+        script: String,
+        timeout: Duration,
+        reply: tokio::sync::oneshot::Sender<(Result<String, String>, Duration)>,
+    },
+}
+
 struct YtJsJob {
-    req: YtJsExtractRequest,
+    payload: YtJsJobPayload,
     http_client: reqwest::Client,
-    reply: tokio::sync::oneshot::Sender<Result<YtJsExtractResponse, String>>,
 }
 
+#[derive(Clone)]
 struct YtJsWorkerHandle {
+    id: u64,
     tx: tokio_mpsc::UnboundedSender<YtJsJob>,
+    abort_flag: Arc<AtomicBool>,
 }
 
-fn global_ytjs_worker() -> Result<&'static YtJsWorkerHandle, String> {
-    static WORKER: OnceLock<Result<YtJsWorkerHandle, String>> = OnceLock::new();
-    WORKER
-        .get_or_init(YtJsWorkerHandle::spawn)
-        .as_ref()
-        .map_err(Clone::clone)
+fn global_ytjs_worker_slot() -> &'static Mutex<Option<YtJsWorkerHandle>> {
+    static WORKER: OnceLock<Mutex<Option<YtJsWorkerHandle>>> = OnceLock::new();
+    WORKER.get_or_init(|| Mutex::new(None))
+}
+
+fn global_ytjs_worker() -> Result<YtJsWorkerHandle, String> {
+    let mut guard = global_ytjs_worker_slot()
+        .lock()
+        .map_err(|_| "nsh-youtubejs worker mutex poisoned".to_owned())?;
+    if let Some(ref existing) = *guard
+        && !existing.tx.is_closed()
+        && !existing.abort_flag.load(Ordering::Relaxed)
+    {
+        return Ok(existing.clone());
+    }
+    let fresh = YtJsWorkerHandle::spawn()?;
+    *guard = Some(fresh.clone());
+    Ok(fresh)
+}
+
+fn reset_ytjs_worker(failed_id: u64) {
+    if let Ok(mut guard) = global_ytjs_worker_slot().lock()
+        && let Some(ref existing) = *guard
+        && existing.id == failed_id
+    {
+        existing.abort_flag.store(true, Ordering::Relaxed);
+        *guard = None;
+    }
+}
+
+fn should_reset_worker_on_err(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("interrupted")
+        || lower.contains("timed out")
+        || lower.contains("dropped reply")
+        || lower.contains("channel closed")
 }
 
 impl YtJsWorkerHandle {
     fn spawn() -> Result<Self, String> {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = tokio_mpsc::unbounded_channel::<YtJsJob>();
         let (boot_tx, boot_rx) = std_mpsc::sync_channel::<Result<(), String>>(1);
+        let abort_flag = Arc::new(AtomicBool::new(false));
+        let abort_worker = Arc::clone(&abort_flag);
 
         thread::Builder::new()
-            .name("nsh-youtubejs".to_owned())
+            .name(format!("nsh-youtubejs-{id}"))
             .stack_size(YTJS_THREAD_STACK_SIZE)
             .spawn(move || {
-                run_ytjs_worker(rx, boot_tx);
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_ytjs_worker(rx, boot_tx, abort_worker);
+                }));
+                if res.is_err() {
+                    log::error!(
+                        target: "nsh_music_plugin",
+                        "nsh-youtubejs worker #{id} panicked; will transparently respawn on next request"
+                    );
+                }
             })
             .map_err(|e| format!("failed to spawn nsh-youtubejs worker thread: {e}"))?;
 
@@ -385,31 +566,169 @@ impl YtJsWorkerHandle {
             .recv()
             .map_err(|_| "nsh-youtubejs worker exited during boot".to_owned())??;
 
-        Ok(Self { tx })
+        Ok(Self { id, tx, abort_flag })
     }
 }
 
-/// Runs one `YouTube.js` client extraction on the persistent `quickjs-jit` worker.
+/// Runs one `YouTube.js` client extraction on the self-healing persistent `quickjs-jit` worker.
 pub(crate) async fn extract_via_youtubejs(
     http_client: &reqwest::Client,
     req: YtJsExtractRequest,
 ) -> Result<YtJsExtractResponse, String> {
-    let worker = global_ytjs_worker()?;
     let wait_budget = req.timeout.saturating_add(Duration::from_secs(2));
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    worker
-        .tx
-        .send(YtJsJob {
-            req,
+    let mut attempt = 0;
+    loop {
+        let worker = global_ytjs_worker()?;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let job = YtJsJob {
+            payload: YtJsJobPayload::Extract {
+                req: req.clone(),
+                reply: reply_tx,
+            },
             http_client: http_client.clone(),
-            reply: reply_tx,
-        })
-        .map_err(|_| "nsh-youtubejs worker channel closed".to_owned())?;
+        };
+        if worker.tx.send(job).is_err() {
+            reset_ytjs_worker(worker.id);
+            if attempt == 0 {
+                attempt += 1;
+                continue;
+            }
+            return Err("nsh-youtubejs worker channel closed".to_owned());
+        }
 
-    match tokio::time::timeout(wait_budget, reply_rx).await {
-        Ok(Ok(res)) => res,
-        Ok(Err(_)) => Err("nsh-youtubejs worker dropped reply".to_owned()),
-        Err(_) => Err("YouTube.js extraction timed out".to_owned()),
+        match tokio::time::timeout(wait_budget, reply_rx).await {
+            Ok(Ok(Ok(res))) => return Ok(res),
+            Ok(Ok(Err(msg))) => {
+                if should_reset_worker_on_err(&msg) {
+                    reset_ytjs_worker(worker.id);
+                }
+                return Err(msg);
+            }
+            Ok(Err(_)) => {
+                reset_ytjs_worker(worker.id);
+                if attempt == 0 {
+                    attempt += 1;
+                    continue;
+                }
+                return Err("nsh-youtubejs worker dropped reply".to_owned());
+            }
+            Err(_) => {
+                reset_ytjs_worker(worker.id);
+                return Err("YouTube.js extraction timed out".to_owned());
+            }
+        }
+    }
+}
+
+/// Runs a `YouTube.js` search (`ytsearch<N>:`) or playlist extraction on the persistent worker.
+pub(crate) async fn extract_collection_via_youtubejs(
+    http_client: &reqwest::Client,
+    req: YtJsCollectionRequest,
+) -> Result<YtJsCollectionResponse, String> {
+    let wait_budget = req.timeout.saturating_add(Duration::from_secs(2));
+    let mut attempt = 0;
+    loop {
+        let worker = global_ytjs_worker()?;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let job = YtJsJob {
+            payload: YtJsJobPayload::Collection {
+                req: req.clone(),
+                reply: reply_tx,
+            },
+            http_client: http_client.clone(),
+        };
+        if worker.tx.send(job).is_err() {
+            reset_ytjs_worker(worker.id);
+            if attempt == 0 {
+                attempt += 1;
+                continue;
+            }
+            return Err("nsh-youtubejs worker channel closed".to_owned());
+        }
+
+        match tokio::time::timeout(wait_budget, reply_rx).await {
+            Ok(Ok(Ok(res))) => return Ok(res),
+            Ok(Ok(Err(msg))) => {
+                if should_reset_worker_on_err(&msg) {
+                    reset_ytjs_worker(worker.id);
+                }
+                return Err(msg);
+            }
+            Ok(Err(_)) => {
+                reset_ytjs_worker(worker.id);
+                if attempt == 0 {
+                    attempt += 1;
+                    continue;
+                }
+                return Err("nsh-youtubejs worker dropped reply".to_owned());
+            }
+            Err(_) => {
+                reset_ytjs_worker(worker.id);
+                return Err("YouTube.js collection extraction timed out".to_owned());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+async fn eval_script_for_test(
+    script: &str,
+    timeout: Duration,
+) -> (Result<String, String>, Duration) {
+    // Allow sufficient queue wait budget when other unit tests run concurrently on the shared worker,
+    // while `timeout` strictly bounds actual QuickJS execution via `set_interrupt_handler`.
+    let wait_budget = timeout.saturating_add(Duration::from_secs(15));
+    let mut attempt = 0;
+    loop {
+        let worker = match global_ytjs_worker() {
+            Ok(w) => w,
+            Err(e) => return (Err(e), Duration::ZERO),
+        };
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let job = YtJsJob {
+            payload: YtJsJobPayload::EvalTest {
+                script: script.to_owned(),
+                timeout,
+                reply: reply_tx,
+            },
+            http_client: reqwest::Client::new(),
+        };
+        if worker.tx.send(job).is_err() {
+            reset_ytjs_worker(worker.id);
+            if attempt == 0 {
+                attempt += 1;
+                continue;
+            }
+            return (
+                Err("nsh-youtubejs worker channel closed".to_owned()),
+                Duration::ZERO,
+            );
+        }
+
+        match tokio::time::timeout(wait_budget, reply_rx).await {
+            Ok(Ok((Ok(val), exec_elapsed))) => return (Ok(val), exec_elapsed),
+            Ok(Ok((Err(msg), exec_elapsed))) => {
+                if should_reset_worker_on_err(&msg) {
+                    reset_ytjs_worker(worker.id);
+                }
+                return (Err(msg), exec_elapsed);
+            }
+            Ok(Err(_)) => {
+                reset_ytjs_worker(worker.id);
+                if attempt == 0 {
+                    attempt += 1;
+                    continue;
+                }
+                return (
+                    Err("nsh-youtubejs worker dropped reply".to_owned()),
+                    Duration::ZERO,
+                );
+            }
+            Err(_) => {
+                reset_ytjs_worker(worker.id);
+                return (Err("YouTube.js eval timed out".to_owned()), wait_budget);
+            }
+        }
     }
 }
 
@@ -539,6 +858,7 @@ fn js_val_to_raw_bytes<'js>(val: Value<'js>) -> Option<Vec<u8>> {
 fn run_ytjs_worker(
     mut rx: tokio_mpsc::UnboundedReceiver<YtJsJob>,
     boot_tx: std_mpsc::SyncSender<Result<(), String>>,
+    abort_flag: Arc<AtomicBool>,
 ) {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -562,6 +882,20 @@ fn run_ytjs_worker(
         qjs_rt.set_memory_limit(YTJS_MEMORY_LIMIT).await;
         qjs_rt.set_max_stack_size(YTJS_JS_STACK_SIZE).await;
 
+        let boot_instant = Instant::now();
+        let active_deadline_ms = Arc::new(AtomicU64::new(0));
+        let dl_cb = Arc::clone(&active_deadline_ms);
+        let abort_cb = Arc::clone(&abort_flag);
+        qjs_rt
+            .set_interrupt_handler(Some(Box::new(move || {
+                if abort_cb.load(Ordering::Relaxed) {
+                    return true;
+                }
+                let dl = dl_cb.load(Ordering::Relaxed);
+                dl != 0 && (boot_instant.elapsed().as_millis() as u64) >= dl
+            })))
+            .await;
+
         let qjs_ctx = match AsyncContext::full(&qjs_rt).await {
             Ok(c) => c,
             Err(e) => {
@@ -571,14 +905,17 @@ fn run_ytjs_worker(
         };
 
         let active_bridge: Arc<Mutex<Option<ActiveBridgeContext>>> = Arc::new(Mutex::new(None));
-        let mem_cache: Arc<Mutex<HashMap<String, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let mem_cache: Arc<Mutex<BoundedMemCache>> =
+            Arc::new(Mutex::new(BoundedMemCache::default()));
         let timer_cancels: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<()>>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let boot_instant = Instant::now();
 
         let bridge_for_init = Arc::clone(&active_bridge);
         let cache_for_init = Arc::clone(&mem_cache);
         let timers_for_init = Arc::clone(&timer_cancels);
+
+        let boot_now_ms = boot_instant.elapsed().as_millis() as u64;
+        active_deadline_ms.store(boot_now_ms.saturating_add(15_000).max(1), Ordering::Relaxed);
 
         let boot_res: Result<(), String> = qjs_ctx
             .async_with(async move |ctx| {
@@ -622,6 +959,8 @@ fn run_ytjs_worker(
             })
             .await;
 
+        active_deadline_ms.store(0, Ordering::Relaxed);
+
         if let Err(err) = boot_res {
             let _ = boot_tx.send(Err(err));
             return;
@@ -629,65 +968,273 @@ fn run_ytjs_worker(
         let _ = boot_tx.send(Ok(()));
 
         while let Some(job) = rx.recv().await {
-            let deadline = Instant::now() + job.req.timeout;
-            if let Ok(mut guard) = active_bridge.lock() {
-                *guard = Some(ActiveBridgeContext {
-                    http_client: job.http_client,
-                    loopback_origin: job.req.loopback_origin.clone(),
-                    cache_dir: job.req.cache_dir.clone(),
-                    deadline,
-                    last_player_ua: None,
-                });
+            if abort_flag.load(Ordering::Relaxed) {
+                break;
             }
-
-            let req_json = serde_json::json!({
-                "videoId": job.req.video_id,
-                "ytjsClient": job.req.ytjs_client,
-                "cookie": job.req.cookie,
-                "lang": job.req.lang,
-                "visitorData": job.req.visitor_data,
-                "poToken": job.req.po_token,
-                "userAgentOverride": job.req.user_agent_override,
-                "skipHls": job.req.skip_hls,
-                "isLoopback": job.req.loopback_origin.is_some(),
-            })
-            .to_string();
-
-            let bridge_ref = Arc::clone(&active_bridge);
-            let run_timeout = job.req.timeout;
-            let result: Result<YtJsExtractResponse, String> = qjs_ctx
-                .async_with(async move |ctx| {
-                    let globals = ctx.globals();
-                    let extract_fn: Function<'_> = globals
-                        .get("__nshYtJsExtract")
-                        .catch(&ctx)
-                        .map_err(|e| format_qjs_caught(e))?;
-                    let promise: Promise<'_> = extract_fn
-                        .call((req_json,))
-                        .catch(&ctx)
-                        .map_err(|e| format_qjs_caught(e))?;
-                    let fut = promise.into_future::<String>();
-                    let json_str = match tokio::time::timeout(run_timeout, fut).await {
-                        Ok(res) => res.catch(&ctx).map_err(|e| format_qjs_caught(e))?,
-                        Err(_) => return Err("YouTube.js extraction timed out".to_owned()),
-                    };
-                    let mut parsed: YtJsExtractResponse = serde_json::from_str(&json_str)
-                        .map_err(|e| format!("YouTube.js invalid response JSON: {e}"))?;
-                    if let Ok(guard) = bridge_ref.lock()
-                        && let Some(ref active) = *guard
-                        && let Some(ref captured_ua) = active.last_player_ua
-                        && !captured_ua.is_empty()
-                    {
-                        parsed.user_agent = captured_ua.clone();
+            let was_interrupted = match job.payload {
+                YtJsJobPayload::Extract { req, mut reply } => {
+                    if reply.is_closed() {
+                        continue;
                     }
-                    Ok(parsed)
-                })
-                .await;
+                    let run_timeout = req.timeout;
+                    let deadline = Instant::now() + run_timeout;
+                    if let Ok(mut guard) = active_bridge.lock() {
+                        *guard = Some(ActiveBridgeContext {
+                            http_client: job.http_client,
+                            loopback_origin: req.loopback_origin.clone(),
+                            cache_dir: req.cache_dir.clone(),
+                            deadline,
+                            last_player_ua: None,
+                        });
+                    }
+
+                    let extra_hdrs: Vec<Vec<&str>> = req
+                        .extra_headers
+                        .iter()
+                        .map(|(k, v)| vec![k.as_str(), v.as_str()])
+                        .collect();
+                    let req_json = serde_json::json!({
+                        "videoId": req.video_id,
+                        "ytjsClient": req.ytjs_client,
+                        "cookie": req.cookie,
+                        "lang": req.lang,
+                        "location": req.location,
+                        "visitorData": req.visitor_data,
+                        "poToken": req.po_token,
+                        "userAgentOverride": req.user_agent_override,
+                        "extraHeaders": extra_hdrs,
+                        "skipHls": req.skip_hls,
+                        "skipDash": req.skip_dash,
+                        "isLoopback": req.loopback_origin.is_some(),
+                    })
+                    .to_string();
+
+                    let now_ms = boot_instant.elapsed().as_millis() as u64;
+                    let dl_ms = now_ms
+                        .saturating_add((run_timeout.as_millis() as u64).max(50))
+                        .max(1);
+                    active_deadline_ms.store(dl_ms, Ordering::Relaxed);
+
+                    let bridge_ref = Arc::clone(&active_bridge);
+                    let (result, reply): (Result<YtJsExtractResponse, String>, _) = qjs_ctx
+                        .async_with(async move |ctx| {
+                            let globals = ctx.globals();
+                            let extract_fn: Function<'_> = match globals
+                                .get("__nshYtJsExtract")
+                                .catch(&ctx)
+                                .map_err(|e| format_qjs_caught(e))
+                            {
+                                Ok(f) => f,
+                                Err(e) => return (Err(e), reply),
+                            };
+                            let promise: Promise<'_> = match extract_fn
+                                .call((req_json,))
+                                .catch(&ctx)
+                                .map_err(|e| format_qjs_caught(e))
+                            {
+                                Ok(p) => p,
+                                Err(e) => return (Err(e), reply),
+                            };
+                            let fut = promise.into_future::<String>();
+                            let json_str = tokio::select! {
+                                biased;
+                                _ = reply.closed() => {
+                                    return (Err("YouTube.js extraction cancelled".to_owned()), reply);
+                                }
+                                res = tokio::time::timeout(run_timeout, fut) => match res {
+                                    Ok(inner) => match inner.catch(&ctx).map_err(|e| format_qjs_caught(e)) {
+                                        Ok(s) => s,
+                                        Err(e) => return (Err(e), reply),
+                                    },
+                                    Err(_) => return (Err("YouTube.js extraction timed out".to_owned()), reply),
+                                }
+                            };
+                            let mut parsed: YtJsExtractResponse = match serde_json::from_str(&json_str)
+                                .map_err(|e| format!("YouTube.js invalid response JSON: {e}"))
+                            {
+                                Ok(p) => p,
+                                Err(e) => return (Err(e), reply),
+                            };
+                            if let Ok(guard) = bridge_ref.lock()
+                                && let Some(ref active) = *guard
+                                && let Some(ref captured_ua) = active.last_player_ua
+                                && !captured_ua.is_empty()
+                            {
+                                parsed.user_agent = captured_ua.clone();
+                            }
+                            (Ok(parsed), reply)
+                        })
+                        .await;
+
+                    active_deadline_ms.store(0, Ordering::Relaxed);
+                    let interrupted = result
+                        .as_ref()
+                        .is_err_and(|e| should_reset_worker_on_err(e));
+                    let _ = reply.send(result);
+                    interrupted
+                }
+                YtJsJobPayload::Collection { req, mut reply } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    let run_timeout = req.timeout;
+                    let deadline = Instant::now() + run_timeout;
+                    if let Ok(mut guard) = active_bridge.lock() {
+                        *guard = Some(ActiveBridgeContext {
+                            http_client: job.http_client,
+                            loopback_origin: req.loopback_origin.clone(),
+                            cache_dir: req.cache_dir.clone(),
+                            deadline,
+                            last_player_ua: None,
+                        });
+                    }
+
+                    let extra_hdrs: Vec<Vec<&str>> = req
+                        .extra_headers
+                        .iter()
+                        .map(|(k, v)| vec![k.as_str(), v.as_str()])
+                        .collect();
+                    let req_json = match &req.kind {
+                        YtJsCollectionKind::Search { query, limit } => serde_json::json!({
+                            "kind": "search",
+                            "query": query,
+                            "limit": limit,
+                            "cookie": req.cookie,
+                            "lang": req.lang,
+                            "location": req.location,
+                            "extraHeaders": extra_hdrs,
+                            "isLoopback": req.loopback_origin.is_some(),
+                            "needPlayer": false,
+                        }),
+                        YtJsCollectionKind::Playlist {
+                            list_id,
+                            is_music,
+                            limit,
+                        } => serde_json::json!({
+                            "kind": "playlist",
+                            "listId": list_id,
+                            "isMusic": is_music,
+                            "limit": limit,
+                            "cookie": req.cookie,
+                            "lang": req.lang,
+                            "location": req.location,
+                            "extraHeaders": extra_hdrs,
+                            "isLoopback": req.loopback_origin.is_some(),
+                            "needPlayer": false,
+                        }),
+                    }
+                    .to_string();
+
+                    let now_ms = boot_instant.elapsed().as_millis() as u64;
+                    let dl_ms = now_ms
+                        .saturating_add((run_timeout.as_millis() as u64).max(50))
+                        .max(1);
+                    active_deadline_ms.store(dl_ms, Ordering::Relaxed);
+
+                    let (result, reply): (Result<YtJsCollectionResponse, String>, _) = qjs_ctx
+                        .async_with(async move |ctx| {
+                            let globals = ctx.globals();
+                            let coll_fn: Function<'_> = match globals
+                                .get("__nshYtJsCollection")
+                                .catch(&ctx)
+                                .map_err(|e| format_qjs_caught(e))
+                            {
+                                Ok(f) => f,
+                                Err(e) => return (Err(e), reply),
+                            };
+                            let promise: Promise<'_> = match coll_fn
+                                .call((req_json,))
+                                .catch(&ctx)
+                                .map_err(|e| format_qjs_caught(e))
+                            {
+                                Ok(p) => p,
+                                Err(e) => return (Err(e), reply),
+                            };
+                            let fut = promise.into_future::<String>();
+                            let json_str = tokio::select! {
+                                biased;
+                                _ = reply.closed() => {
+                                    return (Err("YouTube.js collection cancelled".to_owned()), reply);
+                                }
+                                res = tokio::time::timeout(run_timeout, fut) => match res {
+                                    Ok(inner) => match inner.catch(&ctx).map_err(|e| format_qjs_caught(e)) {
+                                        Ok(s) => s,
+                                        Err(e) => return (Err(e), reply),
+                                    },
+                                    Err(_) => return (Err("YouTube.js collection timed out".to_owned()), reply),
+                                }
+                            };
+                            let parsed: YtJsCollectionResponse = match serde_json::from_str(&json_str)
+                                .map_err(|e| format!("YouTube.js invalid collection JSON: {e}"))
+                            {
+                                Ok(p) => p,
+                                Err(e) => return (Err(e), reply),
+                            };
+                            (Ok(parsed), reply)
+                        })
+                        .await;
+
+                    active_deadline_ms.store(0, Ordering::Relaxed);
+                    let interrupted = result
+                        .as_ref()
+                        .is_err_and(|e| should_reset_worker_on_err(e));
+                    let _ = reply.send(result);
+                    interrupted
+                }
+                #[cfg(test)]
+                YtJsJobPayload::EvalTest {
+                    script,
+                    timeout,
+                    reply,
+                } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    let eval_started = Instant::now();
+                    let now_ms = boot_instant.elapsed().as_millis() as u64;
+                    let dl_ms = now_ms
+                        .saturating_add((timeout.as_millis() as u64).max(50))
+                        .max(1);
+                    active_deadline_ms.store(dl_ms, Ordering::Relaxed);
+
+                    let result: Result<String, String> = qjs_ctx
+                        .async_with(async move |ctx| {
+                            ctx.eval::<String, _>(script)
+                                .catch(&ctx)
+                                .map_err(|e| format_qjs_caught(e))
+                        })
+                        .await;
+
+                    active_deadline_ms.store(0, Ordering::Relaxed);
+                    let eval_elapsed = eval_started.elapsed();
+                    let interrupted = result
+                        .as_ref()
+                        .is_err_and(|e| should_reset_worker_on_err(e));
+                    let _ = reply.send((result, eval_elapsed));
+                    interrupted
+                }
+            };
 
             if let Ok(mut guard) = active_bridge.lock() {
                 *guard = None;
             }
-            let _ = job.reply.send(result);
+            if let Ok(mut guard) = timer_cancels.lock() {
+                for (_, tx) in guard.drain() {
+                    let _ = tx.send(());
+                }
+            }
+
+            if was_interrupted || abort_flag.load(Ordering::Relaxed) {
+                break;
+            }
+
+            let _ = qjs_ctx
+                .async_with(async move |ctx| {
+                    if let Ok(clear_fn) = ctx.globals().get::<_, Function<'_>>("__ytjsClearAllTimers") {
+                        let _ = clear_fn.call::<_, ()>(());
+                    }
+                })
+                .await;
         }
 
         let _ = tokio::time::timeout(Duration::from_millis(200), qjs_rt.idle()).await;
@@ -697,7 +1244,7 @@ fn run_ytjs_worker(
 fn install_ytjs_natives<'js>(
     ctx: &Ctx<'js>,
     active_bridge: Arc<Mutex<Option<ActiveBridgeContext>>>,
-    mem_cache: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    mem_cache: Arc<Mutex<BoundedMemCache>>,
     timer_cancels: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<()>>>>,
     boot_instant: Instant,
 ) -> rquickjs::Result<()> {
@@ -890,7 +1437,7 @@ fn install_ytjs_natives<'js>(
         })?,
     )?;
 
-    // 9. Persistent disk + in-memory binary `Cache` backend (`<cache_dir>/youtubejs_cache/<key>.bin`).
+    // 9. Persistent disk + bounded LRU in-memory binary `Cache` backend (`<cache_dir>/youtubejs_cache/<key>.bin`).
     let b_get = Arc::clone(&active_bridge);
     let m_get = Arc::clone(&mem_cache);
     globals.set(
@@ -899,10 +1446,10 @@ fn install_ytjs_natives<'js>(
             ctx.clone(),
             move |ctx: Ctx<'js>, key: String, persistent: bool| -> rquickjs::Result<Value<'js>> {
                 let safe_key = sanitize_cache_key(&key);
-                if let Ok(guard) = m_get.lock()
+                if let Ok(mut guard) = m_get.lock()
                     && let Some(bytes) = guard.get(&safe_key)
                 {
-                    let ab = ArrayBuffer::new(ctx.clone(), bytes.clone())?;
+                    let ab = ArrayBuffer::new(ctx.clone(), bytes)?;
                     return Ok(ab.into_value());
                 }
                 if persistent
@@ -1238,15 +1785,19 @@ const YOUTUBEJS_POLYFILLS_JS: &str = r#"
   }
   let _nextTimer = 1;
   const _intervals = new Set();
+  const _activeTimers = new Set();
   globalThis.setTimeout = (fn, ms, ...args) => {
     const id = _nextTimer++;
+    _activeTimers.add(id);
     const delay = Math.max(0, Number(ms) || 0);
     __ytjsTimer(id, delay).then((fired) => {
-      if (fired && typeof fn === "function") fn(...args);
+      const stillActive = _activeTimers.delete(id);
+      if (fired && stillActive && typeof fn === "function") fn(...args);
     });
     return id;
   };
   globalThis.clearTimeout = (id) => {
+    _activeTimers.delete(id);
     if (typeof id === "number") __ytjsClearTimer(id);
   };
   globalThis.setInterval = (fn, ms, ...args) => {
@@ -1268,6 +1819,10 @@ const YOUTUBEJS_POLYFILLS_JS: &str = r#"
   globalThis.clearInterval = (id) => {
     _intervals.delete(id);
     if (typeof id === "number") __ytjsClearTimer(id);
+  };
+  globalThis.__ytjsClearAllTimers = () => {
+    _intervals.clear();
+    _activeTimers.clear();
   };
 
   // TextEncoder / TextDecoder (handles TypedArray/DataView subarrays cleanly)
@@ -1990,6 +2545,7 @@ const YOUTUBEJS_DRIVER_JS: &str = r#"
 
   let lastPlayerVisitorData = "";
   let lastPlayerRawPlayability = null;
+  let activeExtraHeaders = [];
 
   function extractTextNode(val) {
     if (!val) return "";
@@ -1998,10 +2554,24 @@ const YOUTUBEJS_DRIVER_JS: &str = r#"
     if (Array.isArray(val.runs)) {
       return val.runs.map((r) => (r && typeof r.text === "string" ? r.text : "")).join("").trim();
     }
+    if (typeof val.text === "string") return val.text.trim();
     if (typeof val.toString === "function" && val.toString !== Object.prototype.toString) {
-      return String(val.toString()).trim();
+      const s = String(val.toString()).trim();
+      if (s && s !== "[object Object]") return s;
     }
     return "";
+  }
+
+  function parseDurationText(raw) {
+    const s = String(raw || "").trim();
+    if (!s) return null;
+    const parts = s.split(":").map((p) => Number(p.trim()));
+    if (parts.length < 2 || parts.length > 3 || parts.some((n) => !Number.isFinite(n) || n < 0)) {
+      return null;
+    }
+    let total = 0;
+    for (const p of parts) total = total * 60 + Math.floor(p);
+    return total > 0 ? total : null;
   }
 
   async function nshYtjsFetch(input, init) {
@@ -2021,7 +2591,8 @@ const YOUTUBEJS_DRIVER_JS: &str = r#"
     const redirect = (init && init.redirect) || (isReq && input.redirect) || "follow";
 
     // Enrich authenticated InnerTube web requests with multi-scheme SAPISIDHASH + bootstrap flag,
-    // and ensure TV client User-Agent header matches its context.client.userAgent.
+    // forward custom headers (e.g. X-Goog-PageId, Accept-Language), and ensure TV client
+    // User-Agent header matches its context.client.userAgent.
     if (urlStr.includes("/youtubei/v1/")) {
       const cookieHdr = headers.get("cookie");
       if (cookieHdr) {
@@ -2031,6 +2602,13 @@ const YOUTUBEJS_DRIVER_JS: &str = r#"
         if (auth) {
           headers.set("authorization", auth);
           if (!headers.has("x-goog-authuser")) headers.set("x-goog-authuser", "0");
+        }
+      }
+      if (Array.isArray(activeExtraHeaders)) {
+        for (const pair of activeExtraHeaders) {
+          if (Array.isArray(pair) && pair.length >= 2 && pair[0] && pair[1]) {
+            headers.set(String(pair[0]), String(pair[1]));
+          }
         }
       }
       if (typeof body === "string" && body.includes('"clientName":"TVHTML5"')) {
@@ -2095,29 +2673,38 @@ const YOUTUBEJS_DRIVER_JS: &str = r#"
     CustomEvent,
   });
 
-  // Warm Innertube session cache (keyed by auth/UA/lang/visitor/loopback, 20 min TTL).
+  // Warm Innertube session cache (keyed by auth/UA/lang/location/visitor/player/loopback, 20 min TTL).
   const SESSION_TTL_MS = 20 * 60 * 1000;
   const sessionPool = new Map();
 
-  async function getOrCreateInnertube(opts) {
+  function buildSessionCacheKey(opts) {
     const isLoopback = !!opts.isLoopback;
     const cookieStr = opts.cookie ? String(opts.cookie).trim() : "";
     const cookieKey = cookieStr ? __ytjsSha1Hex(cookieStr) : "anon";
     const uaKey = opts.userAgentOverride || "";
     const langKey = opts.lang || "";
+    const locKey = opts.location ? String(opts.location).trim().toUpperCase() : "US";
     const vdKey = opts.visitorData || "";
-    const cacheKey = `${isLoopback ? "lb" : "live"}|${cookieKey}|${uaKey}|${langKey}|${vdKey}`;
+    const needPlayer = opts.needPlayer !== false ? "p1" : "p0";
+    return `${isLoopback ? "lb" : "live"}|${cookieKey}|${uaKey}|${langKey}|${locKey}|${vdKey}|${needPlayer}`;
+  }
+
+  async function getOrCreateInnertube(opts) {
+    const isLoopback = !!opts.isLoopback;
+    const needPlayer = opts.needPlayer !== false;
+    const cookieStr = opts.cookie ? String(opts.cookie).trim() : "";
+    const cacheKey = buildSessionCacheKey(opts);
 
     if (!isLoopback) {
       const hit = sessionPool.get(cacheKey);
       if (hit && (Date.now() - hit.createdAt) < SESSION_TTL_MS) {
-        return hit.yt;
+        return { yt: hit.yt, cacheKey };
       }
     }
 
     const baseCfg = {
       lang: opts.lang || "en",
-      location: "US",
+      location: opts.location ? String(opts.location).trim().toUpperCase() : "US",
       retrieve_innertube_config: false,
       cache: isLoopback ? undefined : new NshDiskCache(true),
       enable_session_cache: !isLoopback,
@@ -2128,7 +2715,7 @@ const YOUTUBEJS_DRIVER_JS: &str = r#"
     if (opts.visitorData) baseCfg.visitor_data = opts.visitorData;
 
     let yt;
-    if (isLoopback) {
+    if (isLoopback || !needPlayer) {
       yt = await Innertube.create({ ...baseCfg, retrieve_player: false });
     } else {
       try {
@@ -2147,7 +2734,7 @@ const YOUTUBEJS_DRIVER_JS: &str = r#"
       }
       sessionPool.set(cacheKey, { yt, createdAt: Date.now() });
     }
-    return yt;
+    return { yt, cacheKey };
   }
 
   function extractReasonFromPlayability(ps, rawPs) {
@@ -2174,8 +2761,12 @@ const YOUTUBEJS_DRIVER_JS: &str = r#"
     const req = JSON.parse(reqJson);
     lastPlayerVisitorData = "";
     lastPlayerRawPlayability = null;
+    activeExtraHeaders = Array.isArray(req.extraHeaders) ? req.extraHeaders : [];
+    let activeCacheKey = null;
     try {
-      const yt = await getOrCreateInnertube(req);
+      const created = await getOrCreateInnertube(req);
+      const yt = created.yt;
+      activeCacheKey = created.cacheKey;
       const clientOpts = { client: req.ytjsClient };
       if (req.poToken) clientOpts.po_token = req.poToken;
 
@@ -2191,6 +2782,10 @@ const YOUTUBEJS_DRIVER_JS: &str = r#"
       );
       const sessionUa = String(req.userAgentOverride || yt.session?.user_agent || "");
 
+      if (status === "LOGIN_REQUIRED" && activeCacheKey) {
+        sessionPool.delete(activeCacheKey);
+      }
+
       if (status && status !== "OK") {
         return JSON.stringify({
           ok: false,
@@ -2202,8 +2797,22 @@ const YOUTUBEJS_DRIVER_JS: &str = r#"
       }
 
       const basic = info.basic_info || {};
-      const thumbs = Array.isArray(basic.thumbnail) ? basic.thumbnail : [];
-      const thumbnail = thumbs.length > 0 ? String(thumbs[thumbs.length - 1].url || "") : "";
+      const rawThumbs = Array.isArray(basic.thumbnail) ? basic.thumbnail : [];
+      const thumbnails = rawThumbs
+        .filter((t) => t && typeof t.url === "string" && t.url.length > 0)
+        .map((t) => ({
+          url: String(t.url),
+          width: Number.isFinite(Number(t.width)) && Number(t.width) > 0 ? Math.floor(Number(t.width)) : null,
+          height: Number.isFinite(Number(t.height)) && Number(t.height) > 0 ? Math.floor(Number(t.height)) : null,
+        }));
+      const thumbnail = thumbnails.length > 0 ? thumbnails[thumbnails.length - 1].url : "";
+      const isLive = !!basic.is_live;
+      const isUpcoming = !!basic.is_upcoming;
+      const liveStatus = isLive
+        ? "is_live"
+        : (isUpcoming ? "is_upcoming" : (basic.is_post_live_dvr ? "was_live" : "not_live"));
+      const uploader = String(basic.author || "");
+      const channel = String(basic.channel?.name || uploader || "");
       const sd = info.streaming_data || {};
       const player = yt.session?.player;
 
@@ -2285,6 +2894,7 @@ const YOUTUBEJS_DRIVER_JS: &str = r#"
       }
 
       const hlsUrl = (!req.skipHls && sd.hls_manifest_url) ? String(sd.hls_manifest_url) : null;
+      const dashUrl = (!req.skipDash && sd.dash_manifest_url) ? String(sd.dash_manifest_url) : null;
       return JSON.stringify({
         ok: true,
         playabilityStatus: status || "OK",
@@ -2299,13 +2909,21 @@ const YOUTUBEJS_DRIVER_JS: &str = r#"
         durationSecs: Number.isFinite(Number(basic.duration)) && Number(basic.duration) > 0
           ? Math.floor(Number(basic.duration))
           : null,
-        uploader: String(basic.author || ""),
+        uploader,
+        channel,
         channelId: String(basic.channel_id || ""),
+        isLive,
+        liveStatus,
         thumbnail,
+        thumbnails,
         hlsManifestUrl: hlsUrl,
+        dashManifestUrl: dashUrl,
         formats: outFormats,
       });
     } catch (err) {
+      if (activeCacheKey) {
+        sessionPool.delete(activeCacheKey);
+      }
       const info = err && err.info && typeof err.info === "object" ? err.info : null;
       const psStatus = String((info && info.status) || lastPlayerRawPlayability?.status || "");
       const psReason = extractReasonFromPlayability(info, lastPlayerRawPlayability);
@@ -2318,6 +2936,172 @@ const YOUTUBEJS_DRIVER_JS: &str = r#"
         visitorData: lastPlayerVisitorData || req.visitorData || "",
         userAgent: req.userAgentOverride || "",
       });
+    } finally {
+      activeExtraHeaders = [];
+    }
+  };
+
+  function normalizeCollectionEntry(item) {
+    if (!item || typeof item !== "object") return null;
+    const id = String(item.video_id || item.id || "").trim();
+    if (!id) return null;
+    const title = extractTextNode(item.title) || extractTextNode(item.name) || "";
+    let uploader = "";
+    let channelId = "";
+    if (item.author && typeof item.author === "object") {
+      uploader = extractTextNode(item.author.name) || extractTextNode(item.author) || "";
+      channelId = String(item.author.id || item.author.channel_id || "");
+    } else if (typeof item.author === "string") {
+      uploader = item.author.trim();
+    } else if (Array.isArray(item.artists) && item.artists.length > 0) {
+      uploader = item.artists.map((a) => extractTextNode(a?.name || a)).filter(Boolean).join(", ");
+      channelId = String(item.artists[0]?.channel_id || item.artists[0]?.id || "");
+    }
+    let durationSecs = null;
+    if (item.duration && typeof item.duration === "object" && Number.isFinite(Number(item.duration.seconds))) {
+      const s = Math.floor(Number(item.duration.seconds));
+      if (s > 0) durationSecs = s;
+    } else if (Number.isFinite(Number(item.duration)) && Number(item.duration) > 0) {
+      durationSecs = Math.floor(Number(item.duration));
+    } else if (item.duration) {
+      durationSecs = parseDurationText(extractTextNode(item.duration));
+    } else if (item.length_text) {
+      durationSecs = parseDurationText(extractTextNode(item.length_text));
+    }
+    let thumbnail = "";
+    if (item.best_thumbnail && typeof item.best_thumbnail.url === "string") {
+      thumbnail = item.best_thumbnail.url;
+    } else if (Array.isArray(item.thumbnails) && item.thumbnails.length > 0) {
+      thumbnail = String(item.thumbnails[item.thumbnails.length - 1]?.url || item.thumbnails[0]?.url || "");
+    } else if (Array.isArray(item.thumbnail) && item.thumbnail.length > 0) {
+      thumbnail = String(item.thumbnail[item.thumbnail.length - 1]?.url || item.thumbnail[0]?.url || "");
+    }
+    return {
+      id,
+      title,
+      uploader,
+      channelId,
+      durationSecs,
+      thumbnail,
+      url: `https://www.youtube.com/watch?v=${id}`,
+    };
+  }
+
+  globalThis.__nshYtJsCollection = async function (reqJson) {
+    const req = JSON.parse(reqJson);
+    activeExtraHeaders = Array.isArray(req.extraHeaders) ? req.extraHeaders : [];
+    const maxItems = Math.max(1, Math.min(200, Number(req.limit) || 20));
+    let activeCacheKey = null;
+    try {
+      const created = await getOrCreateInnertube({ ...req, needPlayer: false });
+      const yt = created.yt;
+      activeCacheKey = created.cacheKey;
+
+      const entries = [];
+      const seenIds = new Set();
+      const pushItems = (list) => {
+        if (!list) return;
+        const arr = Array.isArray(list) ? list : (typeof list[Symbol.iterator] === "function" ? Array.from(list) : []);
+        for (const raw of arr) {
+          if (entries.length >= maxItems) break;
+          const norm = normalizeCollectionEntry(raw);
+          if (norm && !seenIds.has(norm.id)) {
+            seenIds.add(norm.id);
+            entries.push(norm);
+          }
+        }
+      };
+
+      if (req.kind === "search") {
+        const query = String(req.query || "").trim();
+        let page = await yt.search(query, { type: "video" });
+        pushItems(page?.videos || page?.results);
+        let hops = 0;
+        while (entries.length < maxItems && page && page.has_continuation && hops < 3) {
+          hops += 1;
+          try {
+            page = await page.getContinuation();
+            pushItems(page?.videos || page?.results);
+          } catch {
+            break;
+          }
+        }
+        return JSON.stringify({
+          ok: true,
+          id: query,
+          title: query,
+          uploader: "",
+          webpageUrl: `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`,
+          entries,
+        });
+      }
+
+      // Playlist (regular YouTube or YouTube Music).
+      const listId = String(req.listId || "").trim();
+      let pl = null;
+      if (req.isMusic && yt.music && typeof yt.music.getPlaylist === "function") {
+        try {
+          pl = await yt.music.getPlaylist(listId);
+        } catch {
+          pl = null;
+        }
+      }
+      if (!pl) {
+        try {
+          pl = await yt.getPlaylist(listId);
+        } catch (err) {
+          if (!req.isMusic && yt.music && typeof yt.music.getPlaylist === "function") {
+            pl = await yt.music.getPlaylist(listId);
+          } else {
+            throw err;
+          }
+        }
+      }
+
+      const plTitle = extractTextNode(pl?.info?.title)
+        || extractTextNode(pl?.header?.title)
+        || listId;
+      const plUploader = extractTextNode(pl?.info?.author?.name || pl?.info?.author)
+        || extractTextNode(pl?.header?.author?.name || pl?.header?.author)
+        || "";
+      pushItems(pl?.items || pl?.videos || pl?.contents);
+      let hops = 0;
+      while (entries.length < maxItems && pl && pl.has_continuation && typeof pl.getContinuation === "function" && hops < 3) {
+        hops += 1;
+        try {
+          pl = await pl.getContinuation();
+          pushItems(pl?.items || pl?.videos || pl?.contents);
+        } catch {
+          break;
+        }
+      }
+
+      return JSON.stringify({
+        ok: true,
+        id: listId,
+        title: plTitle,
+        uploader: plUploader,
+        webpageUrl: req.isMusic
+          ? `https://music.youtube.com/playlist?list=${encodeURIComponent(listId)}`
+          : `https://www.youtube.com/playlist?list=${encodeURIComponent(listId)}`,
+        entries,
+      });
+    } catch (err) {
+      if (activeCacheKey) {
+        sessionPool.delete(activeCacheKey);
+      }
+      const msg = (err && err.message) ? String(err.message) : String(err);
+      return JSON.stringify({
+        ok: false,
+        id: String(req.listId || req.query || ""),
+        title: "",
+        uploader: "",
+        webpageUrl: "",
+        entries: [],
+        error: msg,
+      });
+    } finally {
+      activeExtraHeaders = [];
     }
   };
 })();
@@ -2364,6 +3148,83 @@ mod tests {
         assert_eq!(
             lookup_ytjs_client("web_safari").and_then(|c| c.user_agent_override),
             Some(SAFARI_WEB_UA)
+        );
+    }
+
+    #[test]
+    fn bounded_mem_cache_enforces_entry_and_byte_limits_with_lru_eviction() {
+        let mut cache = BoundedMemCache::default();
+        // 1. Entry cap (`<= 16`) with LRU touch keeping `k0` alive and evicting `k1`.
+        for i in 0..16 {
+            cache.insert(format!("k{i}"), vec![i as u8; 1024]);
+        }
+        assert_eq!(cache.entries.len(), YTJS_MEM_CACHE_MAX_ENTRIES);
+        assert!(cache.get("k0").is_some(), "touch k0 to make it MRU");
+        cache.insert("k16".to_owned(), vec![16u8; 1024]);
+        assert_eq!(cache.entries.len(), YTJS_MEM_CACHE_MAX_ENTRIES);
+        assert!(
+            cache.get("k0").is_some(),
+            "recently touched k0 must survive"
+        );
+        assert!(cache.get("k1").is_none(), "LRU k1 must be evicted");
+
+        // 2. Byte cap (`<= 32 MiB`): inserting three 12 MiB entries keeps total_bytes <= 32 MiB.
+        let mut byte_cache = BoundedMemCache::default();
+        let twelve_mib = 12 * 1024 * 1024;
+        byte_cache.insert("a".to_owned(), vec![1u8; twelve_mib]);
+        byte_cache.insert("b".to_owned(), vec![2u8; twelve_mib]);
+        assert_eq!(byte_cache.total_bytes, 2 * twelve_mib);
+        byte_cache.insert("c".to_owned(), vec![3u8; twelve_mib]);
+        assert!(byte_cache.total_bytes <= YTJS_MEM_CACHE_MAX_BYTES);
+        assert!(
+            byte_cache.get("a").is_none(),
+            "oldest 12 MiB entry must be evicted"
+        );
+        assert!(byte_cache.get("b").is_some());
+        assert!(byte_cache.get("c").is_some());
+
+        // 3. Single item larger than 32 MiB is rejected cleanly without panicking.
+        byte_cache.insert("huge".to_owned(), vec![0u8; YTJS_MEM_CACHE_MAX_BYTES + 1]);
+        assert!(byte_cache.get("huge").is_none());
+        assert!(byte_cache.total_bytes <= YTJS_MEM_CACHE_MAX_BYTES);
+    }
+
+    #[test]
+    fn youtubejs_worker_interrupts_sync_infinite_loop_and_self_heals_next_request() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        let before_id = global_ytjs_worker().expect("boot YouTube.js worker").id;
+
+        // 1. Run a synchronous infinite JS loop inside the persistent YouTube.js worker.
+        //    QuickJS `set_interrupt_handler` must break out promptly (~150ms), never wedging.
+        let (loop_res, exec_elapsed) = rt.block_on(eval_script_for_test(
+            "while (true) {}",
+            Duration::from_millis(150),
+        ));
+        let loop_err = loop_res.expect_err("synchronous infinite loop must be interrupted");
+        assert!(
+            loop_err.to_ascii_lowercase().contains("interrupted"),
+            "expected QuickJS interrupt error, got: {loop_err}"
+        );
+        assert!(
+            exec_elapsed < Duration::from_secs(2),
+            "interrupt handler must abort infinite loop promptly, took {exec_elapsed:?}"
+        );
+
+        // 2. Very next request must transparently respawn a fresh worker and succeed cleanly.
+        let (healed_res, _) = rt.block_on(eval_script_for_test(
+            "typeof globalThis.__nshYtJsExtract === 'function' ? 'healed_ok' : 'broken'",
+            Duration::from_secs(5),
+        ));
+        let healed_out = healed_res.expect("self-healed worker must serve next request cleanly");
+        assert_eq!(healed_out, "healed_ok");
+        let after_id = global_ytjs_worker().expect("fresh worker").id;
+        assert_ne!(
+            after_id, before_id,
+            "interrupted YouTube.js worker must be replaced by a fresh worker instance"
         );
     }
 }

@@ -9,6 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -23,11 +24,13 @@ use crate::mobile_compat::{
 };
 use crate::yt_ejs;
 use crate::yt_format_selector::{
-    CandidateFormatMeta, FormatSelector, PoTokenContext, YoutubeExtractorArgs,
+    CandidateFormatMeta, FormatSelector, FormatSortSpec, PoTokenContext, YoutubeExtractorArgs,
 };
 use crate::yt_youtubejs::{
-    RESILIENT_FALLBACK_CLIENTS, YtJsClientSpec, YtJsExtractRequest, YtJsExtractResponse,
-    extract_via_youtubejs, lookup_ytjs_client, resolve_requested_ytjs_clients,
+    RESILIENT_FALLBACK_CLIENTS, YtJsClientSpec, YtJsCollectionEntry, YtJsCollectionKind,
+    YtJsCollectionRequest, YtJsCollectionResponse, YtJsExtractRequest, YtJsExtractResponse,
+    extract_collection_via_youtubejs, extract_via_youtubejs, lookup_ytjs_client,
+    resolve_requested_ytjs_clients,
 };
 
 const DEFAULT_INNERTUBE_ORIGIN: &str = "https://music.youtube.com";
@@ -62,8 +65,10 @@ pub enum YtdlpOutputMode {
     PrintUrlAndHeadersJson,
     /// `-g`, `--get-url`, `--print url`, or `--print %(url)s` (raw URL line).
     PrintUrl,
-    /// `-j` or `--dump-json` (full track info JSON object).
+    /// `-j` or `--dump-json` (full track info JSON object, NDJSON for collections).
     DumpJson,
+    /// `-J` or `--dump-single-json` (single JSON object, playlist envelope for collections).
+    DumpSingleJson,
 }
 
 /// Parsed `yt-dlp` CLI + stdin config options.
@@ -73,10 +78,20 @@ pub struct YtdlpParsedArgs {
     pub reads_stdin_config: bool,
     pub output_mode: YtdlpOutputMode,
     pub print_template: Option<String>,
+    pub print_templates: Vec<String>,
     pub format_expr: Option<String>,
+    pub format_sort: Vec<String>,
     pub extractor_args: Vec<String>,
     pub headers: HashMap<String, String>,
     pub cookies_file: Option<String>,
+    pub proxy: Option<String>,
+    pub no_check_certificates: bool,
+    pub socket_timeout_secs: Option<u64>,
+    pub geo_bypass_country: Option<String>,
+    pub flat_playlist: bool,
+    pub no_playlist: bool,
+    pub yes_playlist: bool,
+    pub playlist_items: Option<String>,
     pub target: Option<String>,
 }
 
@@ -87,10 +102,20 @@ impl Default for YtdlpParsedArgs {
             reads_stdin_config: false,
             output_mode: YtdlpOutputMode::PrintUrl,
             print_template: None,
+            print_templates: Vec::new(),
             format_expr: None,
+            format_sort: Vec::new(),
             extractor_args: Vec::new(),
             headers: HashMap::new(),
             cookies_file: None,
+            proxy: None,
+            no_check_certificates: false,
+            socket_timeout_secs: None,
+            geo_bypass_country: None,
+            flat_playlist: false,
+            no_playlist: false,
+            yes_playlist: false,
+            playlist_items: None,
             target: None,
         }
     }
@@ -116,11 +141,40 @@ pub fn merge_ytdlp_stdin_config(parsed: &mut YtdlpParsedArgs, stdin: &str) {
     apply_ytdlp_tokens(parsed, &tokens, false);
 }
 
+fn parse_socket_timeout_secs(raw: &str) -> Option<u64> {
+    let trimmed = raw.trim();
+    if let Ok(n) = trimmed.parse::<u64>() {
+        return Some(n.max(1));
+    }
+    if let Ok(f) = trimmed.parse::<f64>()
+        && f.is_finite()
+        && f > 0.0
+    {
+        return Some((f.ceil() as u64).max(1));
+    }
+    None
+}
+
 fn apply_ytdlp_tokens(parsed: &mut YtdlpParsedArgs, tokens: &[String], allow_positional: bool) {
     let mut i = 0;
+    let mut end_of_options = false;
     while i < tokens.len() {
         let tok = tokens[i].as_str();
         let next = tokens.get(i + 1).map(String::as_str);
+
+        if end_of_options {
+            if allow_positional {
+                parsed.target = Some(tok.to_owned());
+            }
+            i += 1;
+            continue;
+        }
+
+        if tok == "--" {
+            end_of_options = true;
+            i += 1;
+            continue;
+        }
 
         if tok == "--version" || tok == "-version" {
             parsed.is_version = true;
@@ -151,7 +205,12 @@ fn apply_ytdlp_tokens(parsed: &mut YtdlpParsedArgs, tokens: &[String], allow_pos
             i += 1;
             continue;
         }
-        if tok == "--print" {
+        if tok == "-J" || tok == "--dump-single-json" {
+            parsed.output_mode = YtdlpOutputMode::DumpSingleJson;
+            i += 1;
+            continue;
+        }
+        if tok == "-O" || tok == "--print" {
             if let Some(tpl) = next {
                 apply_print_template(parsed, tpl);
                 i += 2;
@@ -176,6 +235,20 @@ fn apply_ytdlp_tokens(parsed: &mut YtdlpParsedArgs, tokens: &[String], allow_pos
         }
         if let Some(fmt) = tok.strip_prefix("--format=") {
             parsed.format_expr = Some(fmt.to_owned());
+            i += 1;
+            continue;
+        }
+        if tok == "-S" || tok == "--format-sort" {
+            if let Some(spec) = next {
+                parsed.format_sort.push(spec.to_owned());
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if let Some(spec) = tok.strip_prefix("--format-sort=") {
+            parsed.format_sort.push(spec.to_owned());
             i += 1;
             continue;
         }
@@ -224,6 +297,20 @@ fn apply_ytdlp_tokens(parsed: &mut YtdlpParsedArgs, tokens: &[String], allow_pos
             i += 1;
             continue;
         }
+        if tok == "--referer" {
+            if let Some(r) = next {
+                upsert_header(&mut parsed.headers, "Referer", r);
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if let Some(r) = tok.strip_prefix("--referer=") {
+            upsert_header(&mut parsed.headers, "Referer", r);
+            i += 1;
+            continue;
+        }
         if tok == "--cookies" {
             if let Some(path) = next {
                 parsed.cookies_file = Some(path.to_owned());
@@ -238,25 +325,154 @@ fn apply_ytdlp_tokens(parsed: &mut YtdlpParsedArgs, tokens: &[String], allow_pos
             i += 1;
             continue;
         }
+        if tok == "--proxy" {
+            if let Some(p) = next {
+                parsed.proxy = Some(p.to_owned());
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if let Some(p) = tok.strip_prefix("--proxy=") {
+            parsed.proxy = Some(p.to_owned());
+            i += 1;
+            continue;
+        }
+        if tok == "--no-check-certificates" || tok == "--no-check-certificate" {
+            parsed.no_check_certificates = true;
+            i += 1;
+            continue;
+        }
+        if tok == "--socket-timeout" {
+            if let Some(s) = next {
+                parsed.socket_timeout_secs = parse_socket_timeout_secs(s);
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if let Some(s) = tok.strip_prefix("--socket-timeout=") {
+            parsed.socket_timeout_secs = parse_socket_timeout_secs(s);
+            i += 1;
+            continue;
+        }
+        if tok == "--geo-bypass-country" {
+            if let Some(cc) = next {
+                let norm = cc.trim().to_ascii_uppercase();
+                if norm.len() == 2 && norm.bytes().all(|b| b.is_ascii_uppercase()) {
+                    parsed.geo_bypass_country = Some(norm);
+                }
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if let Some(cc) = tok.strip_prefix("--geo-bypass-country=") {
+            let norm = cc.trim().to_ascii_uppercase();
+            if norm.len() == 2 && norm.bytes().all(|b| b.is_ascii_uppercase()) {
+                parsed.geo_bypass_country = Some(norm);
+            }
+            i += 1;
+            continue;
+        }
+        if tok == "--flat-playlist" {
+            parsed.flat_playlist = true;
+            i += 1;
+            continue;
+        }
+        if tok == "--no-playlist" {
+            parsed.no_playlist = true;
+            parsed.yes_playlist = false;
+            i += 1;
+            continue;
+        }
+        if tok == "--yes-playlist" {
+            parsed.yes_playlist = true;
+            parsed.no_playlist = false;
+            i += 1;
+            continue;
+        }
+        if tok == "-I" || tok == "--playlist-items" {
+            if let Some(spec) = next {
+                parsed.playlist_items = Some(spec.to_owned());
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if let Some(spec) = tok.strip_prefix("--playlist-items=") {
+            parsed.playlist_items = Some(spec.to_owned());
+            i += 1;
+            continue;
+        }
+
+        // Known 2-arg `yt-dlp` flags whose values must be consumed so `parsed.target` is never overwritten.
         if matches!(
             tok,
             "--js-runtimes"
-                | "--proxy"
-                | "--referer"
-                | "--socket-timeout"
-                | "--retries"
                 | "-o"
                 | "--output"
+                | "--cookies-from-browser"
+                | "--retries"
+                | "-R"
+                | "--fragment-retries"
+                | "--extractor-retries"
+                | "--file-access-retries"
+                | "--concurrent-fragments"
+                | "-N"
+                | "--buffer-size"
+                | "--http-chunk-size"
+                | "--throttled-rate"
+                | "--limit-rate"
+                | "-r"
+                | "--sleep-interval"
+                | "--max-sleep-interval"
+                | "--sleep-requests"
+                | "--sleep-subtitles"
+                | "--max-downloads"
+                | "--impersonate"
+                | "--download-sections"
+                | "--paths"
+                | "-P"
+                | "--temp-dir"
+                | "--cache-dir"
+                | "--ffmpeg-location"
+                | "--audio-format"
+                | "--audio-quality"
+                | "--merge-output-format"
+                | "--remux-video"
+                | "--recode-video"
+                | "--match-filter"
+                | "--min-filesize"
+                | "--max-filesize"
+                | "--sub-langs"
+                | "--sub-format"
+                | "--source-address"
+                | "--xff"
+                | "--download-archive"
+                | "--batch-file"
+                | "-a"
+                | "--playlist-start"
+                | "--playlist-end"
+                | "--compat-options"
+                | "--color"
+                | "--use-extractors"
+                | "--default-search"
         ) {
-            if tok == "--referer"
-                && let Some(r) = next
-            {
-                upsert_header(&mut parsed.headers, "Referer", r);
-            }
             i += if next.is_some() { 2 } else { 1 };
             continue;
         }
+
+        // 1/64th of YouTube's 11-char base64url video IDs start with `-` (e.g. `-dQw4w9WgXc`).
+        // Before discarding a single-dash token as an unknown flag, accept bare 11-char IDs as target.
         if tok.starts_with('-') {
+            if !tok.starts_with("--") && allow_positional && is_bare_youtube_id(tok) {
+                parsed.target = Some(tok.to_owned());
+            }
             i += 1;
             continue;
         }
@@ -267,15 +483,41 @@ fn apply_ytdlp_tokens(parsed: &mut YtdlpParsedArgs, tokens: &[String], allow_pos
     }
 }
 
-fn apply_print_template(parsed: &mut YtdlpParsedArgs, tpl: &str) {
-    let t = tpl.trim();
-    if !t.is_empty() {
-        parsed.print_template = Some(t.to_owned());
+fn strip_ytdlp_print_when_prefix(raw: &str) -> &str {
+    const WHEN_STAGES: &[&str] = &[
+        "pre_process",
+        "after_filter",
+        "video",
+        "before_dl",
+        "post_process",
+        "after_move",
+        "after_video",
+        "playlist",
+    ];
+    let trimmed = raw.trim();
+    if let Some((prefix, rest)) = trimmed.split_once(':') {
+        let p = prefix.trim();
+        if WHEN_STAGES.iter().any(|s| p.eq_ignore_ascii_case(s)) {
+            return rest.trim();
+        }
     }
-    if t.contains("http_headers") || t.ends_with("}j") || t.ends_with(")j") {
-        parsed.output_mode = YtdlpOutputMode::PrintUrlAndHeadersJson;
-    } else if t == "url" || t == "%(url)s" {
-        parsed.output_mode = YtdlpOutputMode::PrintUrl;
+    trimmed
+}
+
+fn apply_print_template(parsed: &mut YtdlpParsedArgs, tpl: &str) {
+    let cleaned = strip_ytdlp_print_when_prefix(tpl);
+    if !cleaned.is_empty() {
+        parsed.print_templates.push(cleaned.to_owned());
+        parsed.print_template = Some(cleaned.to_owned());
+    }
+    if parsed.output_mode != YtdlpOutputMode::DumpJson
+        && parsed.output_mode != YtdlpOutputMode::DumpSingleJson
+    {
+        if cleaned.contains("http_headers") || cleaned.ends_with("}j") || cleaned.ends_with(")j") {
+            parsed.output_mode = YtdlpOutputMode::PrintUrlAndHeadersJson;
+        } else if cleaned == "url" || cleaned == "%(url)s" {
+            parsed.output_mode = YtdlpOutputMode::PrintUrl;
+        }
     }
 }
 
@@ -356,8 +598,25 @@ fn tokenize_config_line(line: &str) -> Vec<String> {
 }
 
 /// Extracts a YouTube video ID from `music.youtube.com/watch?v=...`, `www.youtube.com/watch?v=...`,
-/// `youtu.be/<id>`, `youtube.com/shorts/<id>`, `/embed/<id>`, or a bare 11-char video ID.
+/// `youtube-nocookie.com/embed/<id>`, `youtu.be/<id>`, `youtube.com/shorts/<id>`, `/embed/<id>`,
+/// `/e/<id>`, `/live/<id>`, `/attribution_link?...u=...`, or a bare 11-char video ID (including IDs starting with `-`).
 pub fn extract_youtube_video_id(input: &str) -> Option<String> {
+    extract_youtube_video_id_depth(input, 0)
+}
+
+fn is_youtube_host(host: &str) -> bool {
+    host == "youtube.com"
+        || host.ends_with(".youtube.com")
+        || host == "youtu.be"
+        || host.ends_with(".youtu.be")
+        || host == "youtube-nocookie.com"
+        || host.ends_with(".youtube-nocookie.com")
+}
+
+fn extract_youtube_video_id_depth(input: &str, depth: u8) -> Option<String> {
+    if depth > 2 {
+        return None;
+    }
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return None;
@@ -367,17 +626,28 @@ pub fn extract_youtube_video_id(input: &str) -> Option<String> {
     }
     let parsed = url::Url::parse(trimmed).ok()?;
     let host = parsed.host_str()?.to_ascii_lowercase();
-    let is_yt = host == "youtube.com"
-        || host.ends_with(".youtube.com")
-        || host == "youtu.be"
-        || host.ends_with(".youtu.be");
-    if !is_yt {
+    if !is_youtube_host(&host) {
         return None;
     }
 
     if host == "youtu.be" || host.ends_with(".youtu.be") {
         let seg = parsed.path_segments()?.find(|s| !s.is_empty())?;
         return Some(seg.to_owned());
+    }
+
+    if parsed.path().eq_ignore_ascii_case("/attribution_link") {
+        for (k, v) in parsed.query_pairs() {
+            if k == "u" && !v.is_empty() {
+                let target = if v.starts_with("http://") || v.starts_with("https://") {
+                    v.into_owned()
+                } else {
+                    format!("https://www.youtube.com/{}", v.trim_start_matches('/'))
+                };
+                if let Some(id) = extract_youtube_video_id_depth(&target, depth + 1) {
+                    return Some(id);
+                }
+            }
+        }
     }
 
     for (k, v) in parsed.query_pairs() {
@@ -387,7 +657,7 @@ pub fn extract_youtube_video_id(input: &str) -> Option<String> {
     }
 
     let segs: Vec<&str> = parsed.path_segments()?.filter(|s| !s.is_empty()).collect();
-    if segs.len() >= 2 && matches!(segs[0], "shorts" | "embed" | "v" | "live") {
+    if segs.len() >= 2 && matches!(segs[0], "shorts" | "embed" | "v" | "e" | "live") {
         return Some(segs[1].to_owned());
     }
     None
@@ -397,6 +667,174 @@ fn is_bare_youtube_id(s: &str) -> bool {
     s.len() == 11
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Classified `yt-dlp` target expression (single video, `ytsearch<N>:`, or playlist URL).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum YtdlpTarget {
+    Video(String),
+    Search { query: String, count: usize },
+    Playlist { list_id: String, is_music: bool },
+}
+
+/// Classifies a `yt-dlp` positional target into a single video, `ytsearch`, or playlist.
+pub fn classify_ytdlp_target(target: &str, parsed: &YtdlpParsedArgs) -> Option<YtdlpTarget> {
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // 1. `ytsearch:<query>`, `ytsearch<N>:<query>`, `ytsearchall:<query>`
+    if let Some((prefix, query_raw)) = trimmed.split_once(':') {
+        let lower = prefix.trim().to_ascii_lowercase();
+        if let Some(suffix) = lower.strip_prefix("ytsearch") {
+            let query = query_raw.trim();
+            if query.is_empty() {
+                return None;
+            }
+            let count = if suffix.is_empty() {
+                1
+            } else if suffix == "all" {
+                20
+            } else if let Ok(n) = suffix.parse::<usize>() {
+                n.clamp(1, 50)
+            } else {
+                return None;
+            };
+            return Some(YtdlpTarget::Search {
+                query: query.to_owned(),
+                count,
+            });
+        }
+    }
+
+    // 2. YouTube / YouTube Music playlist URLs (`list=...`).
+    if let Ok(url) = url::Url::parse(trimmed)
+        && let Some(host) = url.host_str().map(str::to_ascii_lowercase)
+        && is_youtube_host(&host)
+    {
+        let list_id = url
+            .query_pairs()
+            .find(|(k, v)| k == "list" && !v.is_empty())
+            .map(|(_, v)| v.into_owned());
+        let video_id = extract_youtube_video_id(trimmed);
+        let is_music = host == "music.youtube.com";
+        let is_playlist_path = url
+            .path()
+            .trim_end_matches('/')
+            .eq_ignore_ascii_case("/playlist");
+
+        if let Some(lid) = list_id {
+            if is_playlist_path || (video_id.is_none() && !parsed.no_playlist) {
+                return Some(YtdlpTarget::Playlist {
+                    list_id: lid,
+                    is_music,
+                });
+            }
+            if parsed.yes_playlist && !parsed.no_playlist {
+                return Some(YtdlpTarget::Playlist {
+                    list_id: lid,
+                    is_music,
+                });
+            }
+        }
+        if let Some(vid) = video_id {
+            return Some(YtdlpTarget::Video(vid));
+        }
+        return None;
+    }
+
+    extract_youtube_video_id(trimmed).map(YtdlpTarget::Video)
+}
+
+/// Parses a `yt-dlp` `-I` / `--playlist-items` specification (1-based indices & slices like
+/// `"1,3"`, `"2:5"`, `":3"`, `"2-4"`, `"-1"`) into deduplicated 0-based indices within `0..total`.
+fn parse_playlist_items_indices(spec: &str, total: usize) -> Vec<usize> {
+    if total == 0 {
+        return Vec::new();
+    }
+    let resolve_index = |raw: i64| -> Option<usize> {
+        if raw > 0 {
+            let idx = (raw - 1) as usize;
+            (idx < total).then_some(idx)
+        } else if raw < 0 {
+            let from_end = (-raw) as usize;
+            (from_end <= total).then(|| total - from_end)
+        } else {
+            None
+        }
+    };
+
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for part in spec.split(',') {
+        let p = part.trim();
+        if p.is_empty() {
+            continue;
+        }
+        if p.contains(':') {
+            let segs: Vec<&str> = p.split(':').collect();
+            let start_1 = segs
+                .first()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(1);
+            let end_1 = segs
+                .get(1)
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(total as i64);
+            let step = segs
+                .get(2)
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(1);
+            if step == 0 {
+                continue;
+            }
+            let norm_start = if start_1 < 0 {
+                (total as i64 + start_1 + 1).clamp(1, total as i64)
+            } else {
+                start_1.clamp(1, total as i64)
+            };
+            let norm_end = if end_1 < 0 {
+                (total as i64 + end_1 + 1).clamp(1, total as i64)
+            } else {
+                end_1.clamp(1, total as i64)
+            };
+            let mut cur = norm_start;
+            while (step > 0 && cur <= norm_end) || (step < 0 && cur >= norm_end) {
+                if let Some(idx) = resolve_index(cur)
+                    && seen.insert(idx)
+                {
+                    out.push(idx);
+                }
+                cur += step;
+            }
+        } else if let Some((a_str, b_str)) = p.split_once('-')
+            && !a_str.trim().is_empty()
+            && !b_str.trim().is_empty()
+            && let (Ok(a), Ok(b)) = (a_str.trim().parse::<usize>(), b_str.trim().parse::<usize>())
+            && a >= 1
+            && b >= a
+        {
+            for one_based in a..=b.min(total) {
+                let idx = one_based - 1;
+                if seen.insert(idx) {
+                    out.push(idx);
+                }
+            }
+        } else if let Ok(n) = p.parse::<i64>()
+            && let Some(idx) = resolve_index(n)
+            && seen.insert(idx)
+        {
+            out.push(idx);
+        }
+    }
+    out
 }
 
 /// Pure-Rust FIPS-180-4 SHA-1 lowercase hex digest (zero OpenSSL / external crate dependencies).
@@ -536,8 +974,12 @@ pub struct ResolvedAudioStream {
     pub duration_secs: Option<u64>,
     pub protocol: String,
     pub uploader: String,
+    pub channel: String,
     pub channel_id: String,
+    pub is_live: bool,
+    pub live_status: String,
     pub thumbnail: String,
+    pub thumbnails_json: Vec<Value>,
     pub user_agent: String,
     pub is_hls: bool,
     pub formats_json: Vec<Value>,
@@ -1145,6 +1587,32 @@ pub async fn resolve_innertube_stream_with_cache(
     .await
 }
 
+#[derive(Default)]
+struct CascadeExtraOptions<'a> {
+    format_sort: Option<&'a FormatSortSpec>,
+    geo_bypass_country: Option<&'a str>,
+    extra_headers: &'a [(String, String)],
+    socket_timeout: Option<Duration>,
+    cancel_flag: Option<&'a AtomicBool>,
+}
+
+fn is_cancelled(cancel_flag: Option<&AtomicBool>) -> bool {
+    cancel_flag.is_some_and(|f| f.load(Ordering::Relaxed))
+}
+
+async fn wait_for_cancel(cancel_flag: Option<&AtomicBool>) {
+    let Some(flag) = cancel_flag else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    loop {
+        if flag.load(Ordering::Relaxed) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn resolve_innertube_stream_with_extractor_args(
     client: &reqwest::Client,
@@ -1169,6 +1637,7 @@ async fn resolve_innertube_stream_with_extractor_args(
         verify_stream_url,
         DEFAULT_CASCADE_BUDGET,
         cache_dir,
+        CascadeExtraOptions::default(),
     )
     .await
 }
@@ -1185,6 +1654,7 @@ async fn resolve_innertube_stream_inner(
     verify_stream_url: bool,
     total_budget: Duration,
     cache_dir: Option<&Path>,
+    extra: CascadeExtraOptions<'_>,
 ) -> Result<ResolvedAudioStream, String> {
     let primary = primary_origin.trim_end_matches('/');
     let trimmed_cookie = cookie.map(str::trim).filter(|s| !s.is_empty());
@@ -1203,6 +1673,7 @@ async fn resolve_innertube_stream_inner(
         total_budget,
         cache_dir,
         track_health,
+        extra,
     )
     .await
 }
@@ -1250,9 +1721,20 @@ async fn resolve_innertube_stream_with_steps(
     total_budget: Duration,
     cache_dir: Option<&Path>,
     track_health: bool,
+    extra: CascadeExtraOptions<'_>,
 ) -> Result<ResolvedAudioStream, String> {
     let has_cookie = trimmed_cookie.is_some();
     let selector = FormatSelector::parse(format_expr.unwrap_or(""));
+    let cancel_flag = extra.cancel_flag;
+    let player_cap = extra
+        .socket_timeout
+        .map_or(PLAYER_HTTP_TIMEOUT, |t| t.min(PLAYER_HTTP_TIMEOUT));
+    let direct_preflight_cap = extra
+        .socket_timeout
+        .map_or(PREFLIGHT_HTTP_TIMEOUT, |t| t.min(PREFLIGHT_HTTP_TIMEOUT));
+    let hls_preflight_cap = extra
+        .socket_timeout
+        .map_or(HLS_PREFLIGHT_TIMEOUT, |t| t.min(HLS_PREFLIGHT_TIMEOUT));
 
     let deadline = Instant::now() + total_budget;
     let mut detected_geo: Option<String> = ext_args
@@ -1266,6 +1748,9 @@ async fn resolve_innertube_stream_with_steps(
     let mut errors = Vec::new();
 
     for step in steps {
+        if is_cancelled(cancel_flag) {
+            return Err("cancelled".to_owned());
+        }
         let spec = step.spec;
         let Some(rem) = deadline
             .checked_duration_since(Instant::now())
@@ -1289,6 +1774,12 @@ async fn resolve_innertube_stream_with_steps(
         let player_pot = ext_args
             .find_po_token(spec.key, PoTokenContext::Player)
             .map(str::to_owned);
+        let step_extra_headers: Vec<(String, String)> = extra
+            .extra_headers
+            .iter()
+            .filter(|(k, _)| step.send_auth || !k.eq_ignore_ascii_case("x-goog-pageid"))
+            .cloned()
+            .collect();
         let extract_req = YtJsExtractRequest {
             video_id: video_id.to_owned(),
             ytjs_client: spec.ytjs_client.to_owned(),
@@ -1298,29 +1789,42 @@ async fn resolve_innertube_stream_with_steps(
                 .flatten()
                 .map(str::to_owned),
             lang: ext_args.lang.clone(),
+            location: extra.geo_bypass_country.map(str::to_owned),
             visitor_data: ext_args.visitor_data.clone(),
             po_token: player_pot,
             user_agent_override: spec.user_agent_override.map(str::to_owned),
+            extra_headers: step_extra_headers,
             skip_hls: ext_args.skip_hls,
+            skip_dash: ext_args.skip_dash,
             loopback_origin: step.loopback_origin.clone(),
             cache_dir: cache_dir.map(Path::to_path_buf),
-            timeout: rem.min(PLAYER_HTTP_TIMEOUT),
+            timeout: rem.min(player_cap),
         };
 
-        let resp = match extract_via_youtubejs(client, extract_req).await {
-            Ok(r) => r,
-            Err(e) => {
-                log::warn!(
-                    target: "nsh_music_plugin",
-                    "virtual yt-dlp video={video_id} client={client_tag} YouTube.js error: {e}"
-                );
-                errors.push(format!("{client_tag}: {e}"));
-                if track_health {
-                    record_client_health_failure(has_cookie, spec.key);
+        let resp = tokio::select! {
+            biased;
+            _ = wait_for_cancel(cancel_flag) => {
+                return Err("cancelled".to_owned());
+            }
+            res = extract_via_youtubejs(client, extract_req) => match res {
+                Ok(r) => r,
+                Err(e) => {
+                    log::warn!(
+                        target: "nsh_music_plugin",
+                        "virtual yt-dlp video={video_id} client={client_tag} YouTube.js error: {e}"
+                    );
+                    errors.push(format!("{client_tag}: {e}"));
+                    if track_health {
+                        record_client_health_failure(has_cookie, spec.key);
+                    }
+                    continue;
                 }
-                continue;
             }
         };
+
+        if is_cancelled(cancel_flag) {
+            return Err("cancelled".to_owned());
+        }
 
         if detected_geo.is_none()
             && let Some(cc) = decode_visitor_data_geo(&resp.visitor_data)
@@ -1360,6 +1864,29 @@ async fn resolve_innertube_stream_with_steps(
 
         let (video_meta, mut all_candidates) = candidates_from_youtubejs(video_id, &resp);
 
+        // DASH MPD `<BaseURL>` fallback when `adaptive_formats` & `formats` yield 0 audio formats.
+        if all_candidates.is_empty()
+            && !ext_args.skip_dash
+            && let Some(ref dash_url) = resp.dash_manifest_url
+            && let Some(dash_rem) = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|d| !d.is_zero())
+        {
+            let dash_timeout = dash_rem.min(direct_preflight_cap);
+            let dash_fetch = tokio::select! {
+                biased;
+                _ = wait_for_cancel(cancel_flag) => return Err("cancelled".to_owned()),
+                res = fetch_text_prefix(client, dash_url, &resp.user_agent, dash_timeout, 512 * 1024) => res,
+            };
+            if let Ok(mpd_xml) = dash_fetch {
+                let dash_cands =
+                    parse_dash_mpd_audio_candidates(&mpd_xml, &video_meta, &resp.user_agent);
+                if !dash_cands.is_empty() {
+                    all_candidates.extend(dash_cands);
+                }
+            }
+        }
+
         if let Some(ref hls_url) = resp.hls_manifest_url
             && !ext_args.skip_hls
         {
@@ -1369,11 +1896,13 @@ async fn resolve_innertube_stream_with_steps(
                     .checked_duration_since(Instant::now())
                     .filter(|d| !d.is_zero())
             {
-                let hls_timeout = hls_rem.min(PREFLIGHT_HTTP_TIMEOUT);
-                if let Ok(text) =
-                    fetch_text_prefix(client, hls_url, &resp.user_agent, hls_timeout, 256 * 1024)
-                        .await
-                {
+                let hls_timeout = hls_rem.min(direct_preflight_cap);
+                let hls_res = tokio::select! {
+                    biased;
+                    _ = wait_for_cancel(cancel_flag) => return Err("cancelled".to_owned()),
+                    res = fetch_text_prefix(client, hls_url, &resp.user_agent, hls_timeout, 256 * 1024) => res,
+                };
+                if let Ok(text) = hls_res {
                     expanded =
                         expand_hls_master_variants(hls_url, &text, &video_meta, &resp.user_agent);
                 }
@@ -1432,10 +1961,14 @@ async fn resolve_innertube_stream_with_steps(
 
         let metas: Vec<CandidateFormatMeta> =
             all_candidates.iter().map(|c| c.meta.clone()).collect();
-        let mut selected_indices = selector.select_indices(&metas, prefer_mobile_aac);
+        let mut selected_indices =
+            selector.select_indices_with_sort(&metas, prefer_mobile_aac, extra.format_sort);
         if selected_indices.is_empty() && !step.is_explicit && !all_candidates.is_empty() {
-            let relaxed =
-                FormatSelector::parse("bestaudio/best").select_indices(&metas, prefer_mobile_aac);
+            let relaxed = FormatSelector::parse("bestaudio/best").select_indices_with_sort(
+                &metas,
+                prefer_mobile_aac,
+                extra.format_sort,
+            );
             if !relaxed.is_empty() {
                 log::info!(
                     target: "nsh_music_plugin",
@@ -1484,19 +2017,22 @@ async fn resolve_innertube_stream_with_steps(
                     .unwrap_or_default()
                     .min(Duration::from_secs(15));
                 if !fetch_rem.is_zero() {
-                    match yt_ejs::fetch_or_cached_tv_player_with_options(
-                        client,
-                        cache_dir,
-                        fetch_rem,
-                        ext_args.player_js_variant.as_deref(),
-                        ext_args
-                            .player_js_version
-                            .as_deref()
-                            .or(resp.player_id.as_deref()),
-                        Some(video_id),
-                    )
-                    .await
-                    {
+                    let fetch_res = tokio::select! {
+                        biased;
+                        _ = wait_for_cancel(cancel_flag) => return Err("cancelled".to_owned()),
+                        res = yt_ejs::fetch_or_cached_tv_player_with_options(
+                            client,
+                            cache_dir,
+                            fetch_rem,
+                            ext_args.player_js_variant.as_deref(),
+                            ext_args
+                                .player_js_version
+                                .as_deref()
+                                .or(resp.player_id.as_deref()),
+                            Some(video_id),
+                        ) => res,
+                    };
+                    match fetch_res {
                         Ok(bundle) => tv_bundle = Some(bundle),
                         Err(e) => {
                             log::warn!(
@@ -1514,17 +2050,21 @@ async fn resolve_innertube_stream_with_steps(
                 let sigs_clone = sig_challenges.clone();
                 let ns_clone = n_challenges.clone();
                 let cache_owned = cache_dir.map(Path::to_path_buf);
-                let solve_res = tokio::task::spawn_blocking(move || {
+                let solve_fut = tokio::task::spawn_blocking(move || {
                     yt_ejs::solve_challenges(
                         &bundle_clone,
                         &sigs_clone,
                         &ns_clone,
                         cache_owned.as_deref(),
                     )
-                })
-                .await
-                .map_err(|e| format!("EJS join error: {e}"))
-                .and_then(|r| r);
+                });
+                let solve_res = tokio::select! {
+                    biased;
+                    _ = wait_for_cancel(cancel_flag) => return Err("cancelled".to_owned()),
+                    joined = solve_fut => joined
+                        .map_err(|e| format!("EJS join error: {e}"))
+                        .and_then(|r| r),
+                };
 
                 match solve_res {
                     Ok(res) => {
@@ -1586,6 +2126,9 @@ async fn resolve_innertube_stream_with_steps(
         let mut transport_or_timeout_failures = 0usize;
 
         for (idx, candidate) in probe_candidates.into_iter().enumerate() {
+            if is_cancelled(cancel_flag) {
+                return Err("cancelled".to_owned());
+            }
             if !candidate.is_hls && skip_remaining_direct {
                 continue;
             }
@@ -1617,25 +2160,31 @@ async fn resolve_innertube_stream_with_steps(
                 break;
             };
             let cap_timeout = if candidate.is_hls {
-                HLS_PREFLIGHT_TIMEOUT
+                hls_preflight_cap
             } else {
-                PREFLIGHT_HTTP_TIMEOUT
+                direct_preflight_cap
             };
             let preflight_timeout = preflight_rem.min(cap_timeout);
 
-            match tokio::time::timeout(
-                preflight_timeout,
-                verify_candidate_stream_url_with_ejs(
-                    client,
-                    &candidate,
+            let preflight_res = tokio::select! {
+                biased;
+                _ = wait_for_cancel(cancel_flag) => {
+                    return Err("cancelled".to_owned());
+                }
+                res = tokio::time::timeout(
                     preflight_timeout,
-                    tv_bundle.as_ref(),
-                    &solved_n_outputs,
-                    cache_dir,
-                ),
-            )
-            .await
-            {
+                    verify_candidate_stream_url_with_ejs(
+                        client,
+                        &candidate,
+                        preflight_timeout,
+                        tv_bundle.as_ref(),
+                        &solved_n_outputs,
+                        cache_dir,
+                    ),
+                ) => res,
+            };
+
+            match preflight_res {
                 Ok(Ok(())) => {
                     log::info!(
                         target: "nsh_music_plugin",
@@ -1951,8 +2500,12 @@ struct VideoMeta {
     title: String,
     duration_secs: Option<u64>,
     uploader: String,
+    channel: String,
     channel_id: String,
+    is_live: bool,
+    live_status: String,
     thumbnail: String,
+    thumbnails_json: Vec<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -2367,8 +2920,12 @@ fn build_hls_stream(
         duration_secs: meta.duration_secs,
         protocol: "m3u8_native".to_owned(),
         uploader: meta.uploader.clone(),
+        channel: meta.channel.clone(),
         channel_id: meta.channel_id.clone(),
+        is_live: meta.is_live,
+        live_status: meta.live_status.clone(),
         thumbnail: meta.thumbnail.clone(),
+        thumbnails_json: meta.thumbnails_json.clone(),
         user_agent: user_agent.to_owned(),
         is_hls: true,
         formats_json: Vec::new(),
@@ -2637,17 +3194,301 @@ fn infer_direct_ext_and_codecs(mime_lower: &str, is_muxed: bool) -> (String, Str
     (ext.to_owned(), acodec, vcodec)
 }
 
+fn xml_unescape(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp + 1..];
+        if let Some(semi) = after.find(';') {
+            let entity = &after[..semi];
+            match entity {
+                "amp" => out.push('&'),
+                "lt" => out.push('<'),
+                "gt" => out.push('>'),
+                "quot" => out.push('"'),
+                "apos" => out.push('\''),
+                _ if entity.starts_with('#') => {
+                    let code = if let Some(hex) = entity
+                        .strip_prefix("#x")
+                        .or_else(|| entity.strip_prefix("#X"))
+                    {
+                        u32::from_str_radix(hex, 16).ok()
+                    } else {
+                        entity[1..].parse::<u32>().ok()
+                    };
+                    if let Some(ch) = code.and_then(char::from_u32) {
+                        out.push(ch);
+                    } else {
+                        out.push('&');
+                        out.push_str(entity);
+                        out.push(';');
+                    }
+                }
+                _ => {
+                    out.push('&');
+                    out.push_str(entity);
+                    out.push(';');
+                }
+            }
+            rest = &after[semi + 1..];
+        } else {
+            out.push_str(&rest[amp..]);
+            rest = "";
+            break;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() || n.len() > h.len() {
+        return None;
+    }
+    h.windows(n.len()).position(|w| w.eq_ignore_ascii_case(n))
+}
+
+fn extract_xml_attr(tag_header: &str, attr_name: &str) -> Option<String> {
+    let mut search = tag_header;
+    while let Some(pos) = find_ascii_ci(search, attr_name) {
+        let before_ok = pos == 0
+            || search.as_bytes()[pos - 1].is_ascii_whitespace()
+            || search.as_bytes()[pos - 1] == b'<';
+        let after = &search[pos + attr_name.len()..];
+        if before_ok {
+            let after_ws = after.trim_start();
+            if let Some(after_eq) = after_ws.strip_prefix('=') {
+                let val_start = after_eq.trim_start();
+                if let Some(q) = val_start
+                    .bytes()
+                    .next()
+                    .filter(|&b| b == b'"' || b == b'\'')
+                {
+                    let inner = &val_start[1..];
+                    if let Some(end) = inner.find(q as char) {
+                        return Some(xml_unescape(&inner[..end]));
+                    }
+                }
+            }
+        }
+        search = after;
+    }
+    None
+}
+
+/// Parses a YouTube DASH MPD XML document and extracts audio `<AdaptationSet>` -> `<Representation>`
+/// -> `<BaseURL>` candidates (`itag`, `mimeType`/`codecs`, `bandwidth`, `audioSamplingRate`).
+fn parse_dash_mpd_audio_candidates(
+    mpd_xml: &str,
+    meta: &VideoMeta,
+    user_agent: &str,
+) -> Vec<AudioCandidate> {
+    let mut out = Vec::new();
+    let mut seen_urls = HashSet::new();
+    let mut rest = mpd_xml;
+
+    while let Some(as_start) = find_ascii_ci(rest, "<AdaptationSet") {
+        let after_as = &rest[as_start..];
+        let Some(as_open_end) = after_as.find('>') else {
+            break;
+        };
+        let as_header = &after_as[..as_open_end];
+        let body_after_open = &after_as[as_open_end + 1..];
+        let Some(as_close) = find_ascii_ci(body_after_open, "</AdaptationSet>") else {
+            break;
+        };
+        let as_body = &body_after_open[..as_close];
+        rest = &body_after_open[as_close + "</AdaptationSet>".len()..];
+
+        let as_mime = extract_xml_attr(as_header, "mimeType").unwrap_or_default();
+        let as_content_type = extract_xml_attr(as_header, "contentType").unwrap_or_default();
+        let as_codecs = extract_xml_attr(as_header, "codecs").unwrap_or_default();
+        let as_asr =
+            extract_xml_attr(as_header, "audioSamplingRate").and_then(|s| s.parse::<u64>().ok());
+
+        let mut rep_rest = as_body;
+        while let Some(rep_start) = find_ascii_ci(rep_rest, "<Representation") {
+            let after_rep = &rep_rest[rep_start..];
+            let Some(rep_open_end) = after_rep.find('>') else {
+                break;
+            };
+            let rep_header = &after_rep[..rep_open_end];
+            let rep_after_open = &after_rep[rep_open_end + 1..];
+            let Some(rep_close) = find_ascii_ci(rep_after_open, "</Representation>") else {
+                break;
+            };
+            let rep_body = &rep_after_open[..rep_close];
+            rep_rest = &rep_after_open[rep_close + "</Representation>".len()..];
+
+            let mime_base = extract_xml_attr(rep_header, "mimeType")
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| as_mime.clone());
+            let is_audio = mime_base.to_ascii_lowercase().starts_with("audio/")
+                || as_content_type.eq_ignore_ascii_case("audio");
+            if !is_audio {
+                continue;
+            }
+
+            let Some(bu_start) = find_ascii_ci(rep_body, "<BaseURL") else {
+                continue;
+            };
+            let after_bu = &rep_body[bu_start..];
+            let Some(bu_open_end) = after_bu.find('>') else {
+                continue;
+            };
+            let bu_inner = &after_bu[bu_open_end + 1..];
+            let Some(bu_close) = find_ascii_ci(bu_inner, "</BaseURL>") else {
+                continue;
+            };
+            let base_url = xml_unescape(bu_inner[..bu_close].trim());
+            if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
+                continue;
+            }
+            if !seen_urls.insert(base_url.clone()) {
+                continue;
+            }
+
+            let codecs = extract_xml_attr(rep_header, "codecs")
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| as_codecs.clone());
+            let mime_type =
+                if !codecs.is_empty() && !mime_base.to_ascii_lowercase().contains("codecs=") {
+                    if mime_base.is_empty() {
+                        format!("audio/mp4; codecs=\"{codecs}\"")
+                    } else {
+                        format!("{mime_base}; codecs=\"{codecs}\"")
+                    }
+                } else if mime_base.is_empty() {
+                    "audio/mp4".to_owned()
+                } else {
+                    mime_base
+                };
+
+            let mime_lower = mime_type.to_ascii_lowercase();
+            let (ext, acodec, vcodec) = infer_direct_ext_and_codecs(&mime_lower, false);
+            if acodec == "none" {
+                continue;
+            }
+
+            let rep_id = extract_xml_attr(rep_header, "id").filter(|s| !s.is_empty());
+            let itag_str = rep_id
+                .or_else(|| extract_itag_from_url(&base_url).map(|n| n.to_string()))
+                .unwrap_or_else(|| "dash-audio".to_owned());
+            let bandwidth = extract_xml_attr(rep_header, "bandwidth")
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            let kbps = (bandwidth > 0).then(|| (bandwidth as f64) / 1000.0);
+            let asr = extract_xml_attr(rep_header, "audioSamplingRate")
+                .and_then(|s| s.parse::<u64>().ok())
+                .or(as_asr);
+            let needs_ejs = extract_query_n_param(&base_url).is_some()
+                || extract_path_n_param(&base_url).is_some();
+
+            let stream = ResolvedAudioStream {
+                video_id: meta.video_id.clone(),
+                title: meta.title.clone(),
+                url: base_url,
+                mime_type,
+                ext: ext.clone(),
+                acodec: acodec.clone(),
+                vcodec: vcodec.clone(),
+                format_id: itag_str.clone(),
+                bitrate: bandwidth,
+                abr: kbps,
+                tbr: kbps,
+                asr,
+                audio_channels: Some(2),
+                filesize: None,
+                duration_secs: meta.duration_secs,
+                protocol: "https".to_owned(),
+                uploader: meta.uploader.clone(),
+                channel: meta.channel.clone(),
+                channel_id: meta.channel_id.clone(),
+                is_live: meta.is_live,
+                live_status: meta.live_status.clone(),
+                thumbnail: meta.thumbnail.clone(),
+                thumbnails_json: meta.thumbnails_json.clone(),
+                user_agent: user_agent.to_owned(),
+                is_hls: false,
+                formats_json: Vec::new(),
+            };
+
+            out.push(AudioCandidate {
+                stream,
+                meta: CandidateFormatMeta {
+                    format_id: itag_str,
+                    ext,
+                    protocol: "https".to_owned(),
+                    acodec,
+                    vcodec,
+                    abr: kbps,
+                    tbr: kbps,
+                    asr,
+                    audio_channels: Some(2),
+                    filesize: None,
+                    is_drc: false,
+                    is_default_audio_track: true,
+                    is_original_audio_track: true,
+                    is_hls: false,
+                    is_muxed: false,
+                },
+                cipher_s: None,
+                cipher_sp: "signature".to_owned(),
+                deciphered_by_ytjs: !needs_ejs,
+            });
+        }
+    }
+
+    out
+}
+
 fn candidates_from_youtubejs(
     video_id: &str,
     resp: &YtJsExtractResponse,
 ) -> (VideoMeta, Vec<AudioCandidate>) {
+    let thumbnails_json: Vec<Value> = resp
+        .thumbnails
+        .iter()
+        .map(|t| {
+            let mut obj = serde_json::Map::new();
+            obj.insert("url".to_owned(), json!(t.url));
+            if let Some(w) = t.width {
+                obj.insert("width".to_owned(), json!(w));
+            }
+            if let Some(h) = t.height {
+                obj.insert("height".to_owned(), json!(h));
+            }
+            Value::Object(obj)
+        })
+        .collect();
+    let channel = if resp.channel.is_empty() {
+        resp.uploader.clone()
+    } else {
+        resp.channel.clone()
+    };
+    let live_status = if resp.live_status.is_empty() {
+        if resp.is_live {
+            "is_live".to_owned()
+        } else {
+            "not_live".to_owned()
+        }
+    } else {
+        resp.live_status.clone()
+    };
     let video_meta = VideoMeta {
         video_id: video_id.to_owned(),
         title: resp.title.clone(),
         duration_secs: resp.duration_secs,
         uploader: resp.uploader.clone(),
+        channel,
         channel_id: resp.channel_id.clone(),
+        is_live: resp.is_live,
+        live_status,
         thumbnail: resp.thumbnail.clone(),
+        thumbnails_json,
     };
 
     let mut candidates = Vec::new();
@@ -2724,8 +3565,12 @@ fn candidates_from_youtubejs(
             duration_secs: video_meta.duration_secs,
             protocol: "https".to_owned(),
             uploader: video_meta.uploader.clone(),
+            channel: video_meta.channel.clone(),
             channel_id: video_meta.channel_id.clone(),
+            is_live: video_meta.is_live,
+            live_status: video_meta.live_status.clone(),
             thumbnail: video_meta.thumbnail.clone(),
+            thumbnails_json: video_meta.thumbnails_json.clone(),
             user_agent: resp.user_agent.clone(),
             is_hls: false,
             formats_json: Vec::new(),
@@ -2763,6 +3608,138 @@ type YtdlpExhaustedTracker = Arc<Mutex<Option<(String, Instant)>>>;
 
 /// Pure-Rust in-process `yt-dlp` runtime engine.
 pub struct VirtualYtdlpShim;
+
+fn build_effective_http_client(
+    default_client: &reqwest::Client,
+    parsed: &YtdlpParsedArgs,
+) -> Result<reqwest::Client, String> {
+    if parsed.proxy.is_none()
+        && !parsed.no_check_certificates
+        && parsed.socket_timeout_secs.is_none()
+    {
+        return Ok(default_client.clone());
+    }
+    let mut builder = reqwest::Client::builder()
+        .pool_idle_timeout(Some(Duration::from_secs(30)))
+        .tcp_keepalive(Some(Duration::from_secs(30)))
+        .tcp_nodelay(true);
+    if let Some(secs) = parsed.socket_timeout_secs {
+        builder = builder.connect_timeout(Duration::from_secs(secs.max(1)));
+    }
+    if parsed.no_check_certificates {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    if let Some(ref proxy_raw) = parsed.proxy {
+        let p = proxy_raw.trim();
+        if p.is_empty() || p == "\"\"" || p == "''" {
+            builder = builder.no_proxy();
+        } else {
+            let proxy =
+                reqwest::Proxy::all(p).map_err(|e| format!("invalid --proxy `{p}`: {e}"))?;
+            builder = builder.proxy(proxy);
+        }
+    }
+    builder
+        .build()
+        .map_err(|e| format!("failed to build custom HTTP client: {e}"))
+}
+
+fn collect_forwardable_extra_headers(headers: &HashMap<String, String>) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for name in ["X-Goog-PageId", "Accept-Language"] {
+        if let Some(val) = find_header(headers, name)
+            && !val.trim().is_empty()
+        {
+            out.push((name.to_owned(), val.trim().to_owned()));
+        }
+    }
+    out
+}
+
+fn flat_collection_entry_json(entry: &YtJsCollectionEntry) -> Value {
+    let webpage_url = if entry.url.is_empty() {
+        format!("https://www.youtube.com/watch?v={}", entry.id)
+    } else {
+        entry.url.clone()
+    };
+    let thumbnails = if entry.thumbnail.is_empty() {
+        Vec::new()
+    } else {
+        vec![json!({ "url": entry.thumbnail })]
+    };
+    json!({
+        "_type": "url",
+        "ie_key": "Youtube",
+        "extractor": "youtube",
+        "extractor_key": "Youtube",
+        "id": entry.id,
+        "title": entry.title,
+        "track": entry.title,
+        "artist": entry.uploader,
+        "uploader": entry.uploader,
+        "channel": entry.uploader,
+        "channel_id": entry.channel_id,
+        "duration": entry.duration_secs,
+        "thumbnail": entry.thumbnail,
+        "thumbnails": thumbnails,
+        "url": webpage_url,
+        "webpage_url": webpage_url,
+    })
+}
+
+fn build_playlist_single_json(
+    coll: &YtJsCollectionResponse,
+    entries: &[YtJsCollectionEntry],
+    original_url: &str,
+    is_search: bool,
+) -> Value {
+    let entries_json: Vec<Value> = entries.iter().map(flat_collection_entry_json).collect();
+    json!({
+        "_type": "playlist",
+        "id": coll.id,
+        "title": coll.title,
+        "uploader": coll.uploader,
+        "webpage_url": coll.webpage_url,
+        "original_url": original_url,
+        "extractor": if is_search { "youtube:search" } else { "youtube:tab" },
+        "extractor_key": if is_search { "YoutubeSearch" } else { "YoutubeTab" },
+        "playlist_count": entries_json.len(),
+        "entries": entries_json,
+    })
+}
+
+fn select_collection_entries(
+    entries: &[YtJsCollectionEntry],
+    parsed: &YtdlpParsedArgs,
+    search_cap: Option<usize>,
+) -> Vec<YtJsCollectionEntry> {
+    if let Some(ref spec) = parsed.playlist_items {
+        let indices = parse_playlist_items_indices(spec, entries.len());
+        return indices
+            .into_iter()
+            .filter_map(|idx| entries.get(idx).cloned())
+            .collect();
+    }
+    let cap = search_cap.unwrap_or(entries.len());
+    entries.iter().take(cap).cloned().collect()
+}
+
+fn estimate_collection_fetch_limit(parsed: &YtdlpParsedArgs, default_limit: usize) -> usize {
+    let Some(ref spec) = parsed.playlist_items else {
+        return default_limit.clamp(1, 200);
+    };
+    let mut max_pos = default_limit;
+    for part in spec.split(',') {
+        for tok in part.split([':', '-']) {
+            if let Ok(n) = tok.trim().parse::<usize>()
+                && n > max_pos
+            {
+                max_pos = n;
+            }
+        }
+    }
+    max_pos.clamp(1, 200)
+}
 
 impl VirtualYtdlpShim {
     /// Spawns a virtual `yt-dlp` process backed by `http_client` against `base_origin`
@@ -2836,16 +3813,25 @@ impl VirtualYtdlpShim {
                     return;
                 }
 
-                let Some(target) = parsed.target.as_deref() else {
+                let Some(target) = parsed.target.clone() else {
                     pipe_bg.push_stderr("ERROR: [youtube] You must provide at least one URL");
                     pipe_bg.finish(1);
                     return;
                 };
 
-                let Some(video_id) = extract_youtube_video_id(target) else {
+                let Some(classified) = classify_ytdlp_target(&target, &parsed) else {
                     pipe_bg.push_stderr(&format!("ERROR: [generic] Unsupported URL: {target}"));
                     pipe_bg.finish(1);
                     return;
+                };
+
+                let effective_client = match build_effective_http_client(&http_client, &parsed) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        pipe_bg.push_stderr(&format!("ERROR: [youtube] {e}"));
+                        pipe_bg.finish(1);
+                        return;
+                    }
                 };
 
                 let cookie = find_header(&parsed.headers, "Cookie")
@@ -2856,6 +3842,14 @@ impl VirtualYtdlpShim {
                             .as_deref()
                             .and_then(read_netscape_cookies_file)
                     });
+                let extra_headers = collect_forwardable_extra_headers(&parsed.headers);
+                let socket_timeout = parsed.socket_timeout_secs.map(Duration::from_secs);
+                let format_sort = FormatSortSpec::parse(&parsed.format_sort);
+                let active_sort = (!format_sort.is_empty()).then_some(&format_sort);
+                let ext_args = YoutubeExtractorArgs::parse(&parsed.extractor_args);
+                let verify = !is_loopback_origin(&base_origin);
+                let loopback_origin =
+                    is_loopback_origin(&base_origin).then(|| base_origin.trim_end_matches('/').to_owned());
 
                 let rt = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -2864,50 +3858,184 @@ impl VirtualYtdlpShim {
                     Ok(rt) => rt,
                     Err(e) => {
                         pipe_bg.push_stderr(&format!(
-                            "ERROR: [youtube] {video_id}: runtime init failed: {e}"
+                            "ERROR: [youtube] runtime init failed: {e}"
                         ));
                         pipe_bg.finish(1);
                         return;
                     }
                 };
 
-                let verify = !is_loopback_origin(&base_origin);
-                let ext_args = YoutubeExtractorArgs::parse(&parsed.extractor_args);
-                let resolved = rt.block_on(resolve_innertube_stream_with_extractor_args(
-                    &http_client,
-                    &base_origin,
-                    &video_id,
-                    cookie.as_deref(),
-                    parsed.format_expr.as_deref(),
-                    &ext_args,
-                    prefer_mobile_aac,
-                    verify,
-                    cache_dir.as_deref(),
-                ));
+                match classified {
+                    YtdlpTarget::Video(video_id) => {
+                        let resolved = rt.block_on(resolve_innertube_stream_inner(
+                            &effective_client,
+                            &base_origin,
+                            &video_id,
+                            cookie.as_deref(),
+                            parsed.format_expr.as_deref(),
+                            &ext_args,
+                            prefer_mobile_aac,
+                            verify,
+                            DEFAULT_CASCADE_BUDGET,
+                            cache_dir.as_deref(),
+                            CascadeExtraOptions {
+                                format_sort: active_sort,
+                                geo_bypass_country: parsed.geo_bypass_country.as_deref(),
+                                extra_headers: &extra_headers,
+                                socket_timeout,
+                                cancel_flag: Some(pipe_bg.cancel_flag()),
+                            },
+                        ));
 
-                if pipe_bg.is_killed() {
-                    return;
-                }
-
-                match resolved {
-                    Ok(stream) => {
-                        if let Some(ref tracker) = exhausted_tracker
-                            && let Ok(mut guard) = tracker.lock()
-                        {
-                            *guard = None;
+                        if pipe_bg.is_killed() {
+                            return;
                         }
-                        let line = format_ytdlp_output(&stream, &parsed);
-                        pipe_bg.push_stdout_line(&line);
-                        pipe_bg.finish(0);
+
+                        match resolved {
+                            Ok(stream) => {
+                                if let Some(ref tracker) = exhausted_tracker
+                                    && let Ok(mut guard) = tracker.lock()
+                                {
+                                    *guard = None;
+                                }
+                                for line in format_ytdlp_output_lines(&stream, &parsed) {
+                                    pipe_bg.push_stdout_line(&line);
+                                }
+                                pipe_bg.finish(0);
+                            }
+                            Err(reason) => {
+                                if let Some(ref tracker) = exhausted_tracker
+                                    && let Ok(mut guard) = tracker.lock()
+                                {
+                                    *guard = Some((video_id.clone(), Instant::now()));
+                                }
+                                pipe_bg.push_stderr(&format!("ERROR: [youtube] {video_id}: {reason}"));
+                                pipe_bg.finish(1);
+                            }
+                        }
                     }
-                    Err(reason) => {
-                        if let Some(ref tracker) = exhausted_tracker
-                            && let Ok(mut guard) = tracker.lock()
-                        {
-                            *guard = Some((video_id.clone(), Instant::now()));
+                    YtdlpTarget::Search { query, count } => {
+                        let fetch_limit = estimate_collection_fetch_limit(&parsed, count);
+                        let coll_req = YtJsCollectionRequest {
+                            kind: YtJsCollectionKind::Search {
+                                query: query.clone(),
+                                limit: fetch_limit,
+                            },
+                            cookie: cookie.clone(),
+                            lang: ext_args.lang.clone(),
+                            location: parsed.geo_bypass_country.clone(),
+                            extra_headers: extra_headers.clone(),
+                            loopback_origin: loopback_origin.clone(),
+                            cache_dir: cache_dir.clone(),
+                            timeout: socket_timeout
+                                .map_or(Duration::from_secs(15), |t| t.min(Duration::from_secs(15))),
+                        };
+                        let coll_res = rt.block_on(async {
+                            tokio::select! {
+                                biased;
+                                _ = wait_for_cancel(Some(pipe_bg.cancel_flag())) => Err("cancelled".to_owned()),
+                                res = extract_collection_via_youtubejs(&effective_client, coll_req) => res,
+                            }
+                        });
+                        if pipe_bg.is_killed() {
+                            return;
                         }
-                        pipe_bg.push_stderr(&format!("ERROR: [youtube] {video_id}: {reason}"));
-                        pipe_bg.finish(1);
+                        let coll = match coll_res {
+                            Ok(c) if c.ok => c,
+                            Ok(c) => {
+                                let msg = c.error.unwrap_or_else(|| "search failed".to_owned());
+                                pipe_bg.push_stderr(&format!("ERROR: [youtube:search] {query}: {msg}"));
+                                pipe_bg.finish(1);
+                                return;
+                            }
+                            Err(e) => {
+                                pipe_bg.push_stderr(&format!("ERROR: [youtube:search] {query}: {e}"));
+                                pipe_bg.finish(1);
+                                return;
+                            }
+                        };
+                        let selected = select_collection_entries(&coll.entries, &parsed, Some(count));
+                        emit_collection_output(
+                            &rt,
+                            &pipe_bg,
+                            &effective_client,
+                            &base_origin,
+                            &target,
+                            &parsed,
+                            &ext_args,
+                            cookie.as_deref(),
+                            active_sort,
+                            &extra_headers,
+                            socket_timeout,
+                            prefer_mobile_aac,
+                            verify,
+                            cache_dir.as_deref(),
+                            &coll,
+                            &selected,
+                            true,
+                        );
+                    }
+                    YtdlpTarget::Playlist { list_id, is_music } => {
+                        let fetch_limit = estimate_collection_fetch_limit(&parsed, 50);
+                        let coll_req = YtJsCollectionRequest {
+                            kind: YtJsCollectionKind::Playlist {
+                                list_id: list_id.clone(),
+                                is_music,
+                                limit: fetch_limit,
+                            },
+                            cookie: cookie.clone(),
+                            lang: ext_args.lang.clone(),
+                            location: parsed.geo_bypass_country.clone(),
+                            extra_headers: extra_headers.clone(),
+                            loopback_origin: loopback_origin.clone(),
+                            cache_dir: cache_dir.clone(),
+                            timeout: socket_timeout
+                                .map_or(Duration::from_secs(15), |t| t.min(Duration::from_secs(15))),
+                        };
+                        let coll_res = rt.block_on(async {
+                            tokio::select! {
+                                biased;
+                                _ = wait_for_cancel(Some(pipe_bg.cancel_flag())) => Err("cancelled".to_owned()),
+                                res = extract_collection_via_youtubejs(&effective_client, coll_req) => res,
+                            }
+                        });
+                        if pipe_bg.is_killed() {
+                            return;
+                        }
+                        let coll = match coll_res {
+                            Ok(c) if c.ok => c,
+                            Ok(c) => {
+                                let msg = c.error.unwrap_or_else(|| "playlist extraction failed".to_owned());
+                                pipe_bg.push_stderr(&format!("ERROR: [youtube:tab] {list_id}: {msg}"));
+                                pipe_bg.finish(1);
+                                return;
+                            }
+                            Err(e) => {
+                                pipe_bg.push_stderr(&format!("ERROR: [youtube:tab] {list_id}: {e}"));
+                                pipe_bg.finish(1);
+                                return;
+                            }
+                        };
+                        let selected = select_collection_entries(&coll.entries, &parsed, None);
+                        emit_collection_output(
+                            &rt,
+                            &pipe_bg,
+                            &effective_client,
+                            &base_origin,
+                            &target,
+                            &parsed,
+                            &ext_args,
+                            cookie.as_deref(),
+                            active_sort,
+                            &extra_headers,
+                            socket_timeout,
+                            prefer_mobile_aac,
+                            verify,
+                            cache_dir.as_deref(),
+                            &coll,
+                            &selected,
+                            false,
+                        );
                     }
                 }
             });
@@ -2916,9 +4044,107 @@ impl VirtualYtdlpShim {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn emit_collection_output(
+    rt: &tokio::runtime::Runtime,
+    pipe_bg: &VirtualPipeHandle,
+    http_client: &reqwest::Client,
+    base_origin: &str,
+    original_url: &str,
+    parsed: &YtdlpParsedArgs,
+    ext_args: &YoutubeExtractorArgs,
+    cookie: Option<&str>,
+    active_sort: Option<&FormatSortSpec>,
+    extra_headers: &[(String, String)],
+    socket_timeout: Option<Duration>,
+    prefer_mobile_aac: bool,
+    verify: bool,
+    cache_dir: Option<&Path>,
+    coll: &YtJsCollectionResponse,
+    selected: &[YtJsCollectionEntry],
+    is_search: bool,
+) {
+    if parsed.output_mode == YtdlpOutputMode::DumpSingleJson {
+        let payload = build_playlist_single_json(coll, selected, original_url, is_search);
+        pipe_bg.push_stdout_line(&payload.to_string());
+        pipe_bg.finish(0);
+        return;
+    }
+
+    if parsed.flat_playlist || parsed.output_mode == YtdlpOutputMode::DumpJson {
+        for entry in selected {
+            if pipe_bg.is_killed() {
+                return;
+            }
+            let entry_val = flat_collection_entry_json(entry);
+            if parsed.output_mode != YtdlpOutputMode::DumpJson && !parsed.print_templates.is_empty()
+            {
+                for tpl in &parsed.print_templates {
+                    pipe_bg.push_stdout_line(&render_print_template(tpl, &entry_val));
+                }
+            } else {
+                pipe_bg.push_stdout_line(&entry_val.to_string());
+            }
+        }
+        pipe_bg.finish(0);
+        return;
+    }
+
+    let mut resolved_any = false;
+    let mut last_err = String::new();
+    for entry in selected {
+        if pipe_bg.is_killed() {
+            return;
+        }
+        let resolved = rt.block_on(resolve_innertube_stream_inner(
+            http_client,
+            base_origin,
+            &entry.id,
+            cookie,
+            parsed.format_expr.as_deref(),
+            ext_args,
+            prefer_mobile_aac,
+            verify,
+            DEFAULT_CASCADE_BUDGET,
+            cache_dir,
+            CascadeExtraOptions {
+                format_sort: active_sort,
+                geo_bypass_country: parsed.geo_bypass_country.as_deref(),
+                extra_headers,
+                socket_timeout,
+                cancel_flag: Some(pipe_bg.cancel_flag()),
+            },
+        ));
+        if pipe_bg.is_killed() {
+            return;
+        }
+        match resolved {
+            Ok(stream) => {
+                resolved_any = true;
+                for line in format_ytdlp_output_lines(&stream, parsed) {
+                    pipe_bg.push_stdout_line(&line);
+                }
+            }
+            Err(e) => {
+                last_err = format!("{}: {e}", entry.id);
+                pipe_bg.push_stderr(&format!("ERROR: [youtube] {}: {e}", entry.id));
+            }
+        }
+    }
+    if resolved_any || selected.is_empty() {
+        pipe_bg.finish(0);
+    } else {
+        if last_err.is_empty() {
+            pipe_bg.push_stderr("ERROR: [youtube] failed to resolve any playlist/search items");
+        }
+        pipe_bg.finish(1);
+    }
+}
+
 fn build_dump_json_value(
     stream: &ResolvedAudioStream,
     http_headers: serde_json::Map<String, Value>,
+    original_url: Option<&str>,
 ) -> Value {
     let abr_val = stream
         .abr
@@ -2928,9 +4154,54 @@ fn build_dump_json_value(
         .tbr
         .map(|v| json!(v))
         .unwrap_or_else(|| json!((stream.bitrate as f64) / 1000.0));
+    let webpage_url = format!("https://www.youtube.com/watch?v={}", stream.video_id);
+    let orig_url = original_url
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(webpage_url.as_str());
+    let channel = if stream.channel.is_empty() {
+        stream.uploader.as_str()
+    } else {
+        stream.channel.as_str()
+    };
+    let artist = if stream.uploader.is_empty() {
+        channel
+    } else {
+        stream.uploader.as_str()
+    };
+    let live_status = if stream.live_status.is_empty() {
+        if stream.is_live {
+            "is_live"
+        } else {
+            "not_live"
+        }
+    } else {
+        stream.live_status.as_str()
+    };
+    let thumbnails: Vec<Value> = if !stream.thumbnails_json.is_empty() {
+        stream.thumbnails_json.clone()
+    } else if !stream.thumbnail.is_empty() {
+        vec![json!({ "url": stream.thumbnail })]
+    } else {
+        Vec::new()
+    };
     json!({
         "id": stream.video_id,
         "title": stream.title,
+        "track": stream.title,
+        "artist": artist,
+        "channel": channel,
+        "channel_id": stream.channel_id,
+        "uploader": stream.uploader,
+        "duration": stream.duration_secs,
+        "is_live": stream.is_live,
+        "live_status": live_status,
+        "webpage_url": webpage_url,
+        "original_url": orig_url,
+        "extractor": "youtube",
+        "extractor_key": "Youtube",
+        "thumbnail": stream.thumbnail,
+        "thumbnails": thumbnails,
         "url": stream.url,
         "ext": stream.ext,
         "acodec": stream.acodec,
@@ -2941,15 +4212,11 @@ fn build_dump_json_value(
         "asr": stream.asr,
         "audio_channels": stream.audio_channels,
         "filesize": stream.filesize,
-        "duration": stream.duration_secs,
         "protocol": if stream.protocol.is_empty() {
             if stream.is_hls { "m3u8_native" } else { "https" }
         } else {
             stream.protocol.as_str()
         },
-        "uploader": stream.uploader,
-        "channel_id": stream.channel_id,
-        "thumbnail": stream.thumbnail,
         "http_headers": http_headers,
         "formats": stream.formats_json,
     })
@@ -3035,7 +4302,10 @@ fn render_print_template(tpl: &str, info: &Value) -> String {
     out
 }
 
-fn format_ytdlp_output(stream: &ResolvedAudioStream, parsed: &YtdlpParsedArgs) -> String {
+fn format_ytdlp_output_lines(
+    stream: &ResolvedAudioStream,
+    parsed: &YtdlpParsedArgs,
+) -> Vec<String> {
     let mut http_headers = serde_json::Map::new();
     // Always advertise the winning InnerTube client's User-Agent so googlevideo.com
     // accepts the stream URL even when the plugin passed a desktop browser UA on stdin.
@@ -3051,22 +4321,37 @@ fn format_ytdlp_output(stream: &ResolvedAudioStream, parsed: &YtdlpParsedArgs) -
         }
     }
 
-    let info = build_dump_json_value(stream, http_headers);
+    let info = build_dump_json_value(stream, http_headers, parsed.target.as_deref());
 
-    if parsed.output_mode == YtdlpOutputMode::DumpJson {
-        return info.to_string();
+    if matches!(
+        parsed.output_mode,
+        YtdlpOutputMode::DumpJson | YtdlpOutputMode::DumpSingleJson
+    ) {
+        return vec![info.to_string()];
+    }
+    if !parsed.print_templates.is_empty() {
+        return parsed
+            .print_templates
+            .iter()
+            .map(|tpl| render_print_template(tpl, &info))
+            .collect();
     }
     if let Some(ref tpl) = parsed.print_template {
-        return render_print_template(tpl, &info);
+        return vec![render_print_template(tpl, &info)];
     }
 
     match parsed.output_mode {
         YtdlpOutputMode::PrintUrlAndHeadersJson => {
-            render_print_template("%(.{url,http_headers})j", &info)
+            vec![render_print_template("%(.{url,http_headers})j", &info)]
         }
-        YtdlpOutputMode::PrintUrl => stream.url.clone(),
-        YtdlpOutputMode::DumpJson => info.to_string(),
+        YtdlpOutputMode::PrintUrl => vec![stream.url.clone()],
+        YtdlpOutputMode::DumpJson | YtdlpOutputMode::DumpSingleJson => vec![info.to_string()],
     }
+}
+
+#[cfg(test)]
+fn format_ytdlp_output(stream: &ResolvedAudioStream, parsed: &YtdlpParsedArgs) -> String {
+    format_ytdlp_output_lines(stream, parsed).join("\n")
 }
 
 /// [`VirtualProcessShim`] intercepting `yt-dlp` invocations.
@@ -3137,7 +4422,6 @@ mod tests {
     use crate::yt_youtubejs::SAFARI_WEB_UA;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn matches_ytdlp_commands_and_extracts_video_ids() {
@@ -3727,6 +5011,7 @@ mod tests {
                 false,
                 Duration::from_secs(10),
                 None,
+                CascadeExtraOptions::default(),
             ))
             .expect("should fall back from auth web_music to anon android_vr");
         assert_eq!(resolved.url, "https://cdn.example.test/vr_anon140.m4a");
@@ -3754,6 +5039,7 @@ mod tests {
                 false,
                 Duration::from_millis(320),
                 None,
+                CascadeExtraOptions::default(),
             ))
             .expect_err("slow cascade should fail within budget");
         let elapsed = started.elapsed();
@@ -4092,8 +5378,12 @@ https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/94/n/hlsN001/ind
             duration_secs: None,
             protocol: "m3u8_native".to_owned(),
             uploader: String::new(),
+            channel: String::new(),
             channel_id: String::new(),
+            is_live: false,
+            live_status: "not_live".to_owned(),
             thumbnail: String::new(),
+            thumbnails_json: Vec::new(),
             user_agent: SAFARI_WEB_UA.to_owned(),
             is_hls: true,
             formats_json: Vec::new(),
@@ -4233,8 +5523,16 @@ https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/94/n/hlsN001/ind
             title: "Test Track".to_owned(),
             duration_secs: Some(215),
             uploader: "Test Artist".to_owned(),
+            channel: "Test Artist Channel".to_owned(),
             channel_id: "UCtest123".to_owned(),
+            is_live: false,
+            live_status: "not_live".to_owned(),
             thumbnail: "https://i.ytimg.com/vi/vidHls00001/maxresdefault.jpg".to_owned(),
+            thumbnails_json: vec![json!({
+                "url": "https://i.ytimg.com/vi/vidHls00001/maxresdefault.jpg",
+                "width": 1280,
+                "height": 720
+            })],
         };
         let master = "\
 #EXTM3U
@@ -4562,6 +5860,7 @@ https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/94/n/n94/index.m
                 Duration::from_secs(10),
                 None,
                 false,
+                CascadeExtraOptions::default(),
             ))
             .expect("fallback client should relax m3u8 selector to bestaudio/best");
         assert_eq!(ok.format_id, "140");
@@ -4590,6 +5889,7 @@ https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/94/n/n94/index.m
                 Duration::from_secs(10),
                 None,
                 false,
+                CascadeExtraOptions::default(),
             ))
             .expect_err("explicit client must not relax strict selector");
         assert!(
@@ -4753,6 +6053,7 @@ https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/94/n/n94/index.m
                 Duration::from_secs(10),
                 None,
                 false,
+                CascadeExtraOptions::default(),
             ))
             .expect("should fall back to android_vr");
         assert!(ok_a.url.contains("/stream/c2_ok.m4a"));
@@ -4778,6 +6079,7 @@ https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/94/n/n94/index.m
                 Duration::from_secs(10),
                 None,
                 false,
+                CascadeExtraOptions::default(),
             ))
             .expect("should still try HLS candidate after direct 403");
         assert!(ok_b.is_hls);
@@ -4960,6 +6262,7 @@ https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/94/n/n94/index.m
                 Duration::from_secs(10),
                 None,
                 false,
+                CascadeExtraOptions::default(),
             ))
             .expect("should fall back to android_vr after capped probes");
         assert!(ok.url.contains("/stream/c2_ok.m4a"));
@@ -5091,6 +6394,770 @@ https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/94/n/n94/index.m
         .map(|s| s.spec.key)
         .collect();
         assert_eq!(expired_keys[0], "web_music");
+    }
+
+    #[test]
+    fn parses_leading_dash_video_ids_end_of_options_url_forms_and_two_arg_flags() {
+        // 1. Bare 11-char YouTube ID starting with `-` (`-dQw4w9WgXc`) without `--`.
+        let p_dash = parse_ytdlp_args(&["-g".to_owned(), "-dQw4w9WgXc".to_owned()]);
+        assert_eq!(p_dash.target.as_deref(), Some("-dQw4w9WgXc"));
+        assert_eq!(
+            extract_youtube_video_id("-dQw4w9WgXc").as_deref(),
+            Some("-dQw4w9WgXc")
+        );
+
+        // 2. `--` end-of-options passes leading-dash and double-dash IDs cleanly as positional target.
+        let p_eoo = parse_ytdlp_args(&[
+            "--no-warnings".to_owned(),
+            "--".to_owned(),
+            "-dQw4w9WgXc".to_owned(),
+        ]);
+        assert_eq!(p_eoo.target.as_deref(), Some("-dQw4w9WgXc"));
+        let p_eoo2 = parse_ytdlp_args(&["--".to_owned(), "--dQw4w9WgX".to_owned()]);
+        assert_eq!(p_eoo2.target.as_deref(), Some("--dQw4w9WgX"));
+
+        // 3. Complete YouTube URL forms: youtube-nocookie, /e/<id>, /attribution_link?...u=...
+        assert_eq!(
+            extract_youtube_video_id("https://www.youtube-nocookie.com/embed/abc123XYZ09")
+                .as_deref(),
+            Some("abc123XYZ09")
+        );
+        assert_eq!(
+            extract_youtube_video_id("https://www.youtube.com/e/abc123XYZ09?rel=0").as_deref(),
+            Some("abc123XYZ09")
+        );
+        assert_eq!(
+            extract_youtube_video_id(
+                "https://www.youtube.com/attribution_link?a=xyz&u=%2Fwatch%3Fv%3D-dQw4w9WgXc%26feature%3Dshare"
+            )
+            .as_deref(),
+            Some("-dQw4w9WgXc")
+        );
+
+        // 4. Known 2-arg flags must consume their value so `parsed.target` is NEVER overwritten.
+        let cli_2arg: Vec<String> = [
+            "--cookies-from-browser",
+            "chrome",
+            "-N",
+            "4",
+            "--retries",
+            "3",
+            "--fragment-retries",
+            "5",
+            "--extractor-retries",
+            "2",
+            "--buffer-size",
+            "16K",
+            "--http-chunk-size",
+            "10M",
+            "--throttled-rate",
+            "100K",
+            "-r",
+            "2M",
+            "--sleep-interval",
+            "1",
+            "--max-sleep-interval",
+            "5",
+            "--max-downloads",
+            "10",
+            "--impersonate",
+            "chrome",
+            "--download-sections",
+            "*0:00-0:30",
+            "-P",
+            "/tmp/out",
+            "--temp-dir",
+            "/tmp",
+            "--cache-dir",
+            "/tmp/cache",
+            "--proxy",
+            "http://127.0.0.1:7890",
+            "--no-check-certificates",
+            "--socket-timeout",
+            "7",
+            "--geo-bypass-country",
+            "jp",
+            "--flat-playlist",
+            "--yes-playlist",
+            "-I",
+            "1,3:5",
+            "https://www.youtube.com/watch?v=-dQw4w9WgXc",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let p_2arg = parse_ytdlp_args(&cli_2arg);
+        assert_eq!(
+            p_2arg.target.as_deref(),
+            Some("https://www.youtube.com/watch?v=-dQw4w9WgXc")
+        );
+        assert_eq!(p_2arg.proxy.as_deref(), Some("http://127.0.0.1:7890"));
+        assert!(p_2arg.no_check_certificates);
+        assert_eq!(p_2arg.socket_timeout_secs, Some(7));
+        assert_eq!(p_2arg.geo_bypass_country.as_deref(), Some("JP"));
+        assert!(p_2arg.flat_playlist);
+        assert!(p_2arg.yes_playlist);
+        assert_eq!(p_2arg.playlist_items.as_deref(), Some("1,3:5"));
+
+        // Target placed BEFORE 2-arg flags must also survive intact!
+        let cli_before: Vec<String> = [
+            "dQw4w9WgXcQ",
+            "--cookies-from-browser",
+            "firefox",
+            "-N",
+            "8",
+            "--retries",
+            "5",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let p_before = parse_ytdlp_args(&cli_before);
+        assert_eq!(p_before.target.as_deref(), Some("dQw4w9WgXcQ"));
+
+        // Verify playlist items index slicing (`1,3:5`, `-1`).
+        assert_eq!(parse_playlist_items_indices("1,3:5", 6), vec![0, 2, 3, 4]);
+        assert_eq!(parse_playlist_items_indices("-1", 4), vec![3]);
+        assert_eq!(parse_playlist_items_indices("2-3", 4), vec![1, 2]);
+    }
+
+    #[test]
+    fn multiple_print_templates_format_sort_rich_dump_single_json_and_custom_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind rich json mock");
+        let port = listener.local_addr().unwrap().port();
+        let origin = format!("http://127.0.0.1:{port}");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_srv = Arc::clone(&stop);
+        let saw_geo_and_headers = Arc::new(AtomicBool::new(false));
+        let saw_geo_srv = Arc::clone(&saw_geo_and_headers);
+        let _ = listener.set_nonblocking(true);
+
+        let srv = std::thread::spawn(move || {
+            while !stop_srv.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let req = read_http_request(&mut stream);
+                        let req_lower = req.to_ascii_lowercase();
+                        if req.contains("\"gl\":\"JP\"")
+                            && req_lower.contains("x-goog-pageid: 112233445566")
+                            && req_lower.contains("accept-language: ja-jp,ja;q=0.9")
+                        {
+                            saw_geo_srv.store(true, Ordering::SeqCst);
+                        }
+                        let body = json!({
+                            "playabilityStatus": { "status": "OK" },
+                            "videoDetails": {
+                                "videoId": "-dQw4w9WgXc",
+                                "title": "Rich Meta Track",
+                                "lengthSeconds": "213",
+                                "author": "Artist Official",
+                                "channelId": "UCrich12345",
+                                "isLive": false,
+                                "thumbnail": {
+                                    "thumbnails": [
+                                        { "url": "https://i.ytimg.com/vi/-dQw4w9WgXc/hqdefault.jpg", "width": 480, "height": 360 },
+                                        { "url": "https://i.ytimg.com/vi/-dQw4w9WgXc/maxresdefault.jpg", "width": 1280, "height": 720 }
+                                    ]
+                                }
+                            },
+                            "streamingData": {
+                                "adaptiveFormats": [
+                                    {
+                                        "itag": 140,
+                                        "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"",
+                                        "bitrate": 128000,
+                                        "audioSampleRate": "44100",
+                                        "audioChannels": 2,
+                                        "contentLength": "3400000",
+                                        "url": "https://cdn.example.test/rich140.m4a"
+                                    },
+                                    {
+                                        "itag": 251,
+                                        "mimeType": "audio/webm; codecs=\"opus\"",
+                                        "bitrate": 160000,
+                                        "audioSampleRate": "48000",
+                                        "audioChannels": 2,
+                                        "contentLength": "4200000",
+                                        "url": "https://cdn.example.test/rich251.webm"
+                                    }
+                                ]
+                            }
+                        })
+                        .to_string();
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let client = reqwest::Client::new();
+
+        // 1. Multiple `-O` / `--print` flags with stage prefixes + `-S acodec:opus` + bare `-dQw4w9WgXc`.
+        let args_multi_o: Vec<String> = [
+            "-S",
+            "acodec:opus,abr",
+            "-O",
+            "video:%(id)s",
+            "--print",
+            "after_move:title",
+            "-O",
+            "%(format_id)s:%(ext)s",
+            "-dQw4w9WgXc",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let pipe_o = VirtualYtdlpShim::spawn_with_origin(
+            &args_multi_o,
+            client.clone(),
+            origin.clone(),
+            true,
+        );
+        let l1 = pipe_o.read_line_blocking().expect("line 1");
+        let l2 = pipe_o.read_line_blocking().expect("line 2");
+        let l3 = pipe_o.read_line_blocking().expect("line 3");
+        assert_eq!(pipe_o.read_line_blocking(), None);
+        assert_eq!(pipe_o.wait(), 0);
+        assert_eq!(l1, "-dQw4w9WgXc");
+        assert_eq!(l2, "Rich Meta Track");
+        assert_eq!(l3, "251:webm");
+
+        // 2. `-J` (`--dump-single-json`) with `--geo-bypass-country JP` + `X-Goog-PageId` + `Accept-Language`.
+        let args_j: Vec<String> = [
+            "-J",
+            "--geo-bypass-country",
+            "JP",
+            "--extractor-args",
+            "youtube:player_client=web_music",
+            "--add-header",
+            "Cookie:SAPISID=brand_account_secret",
+            "--add-header",
+            "X-Goog-PageId:112233445566",
+            "--add-header",
+            "Accept-Language:ja-JP,ja;q=0.9",
+            "--",
+            "-dQw4w9WgXc",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let pipe_j = VirtualYtdlpShim::spawn_with_origin(&args_j, client, origin, true);
+        let json_line = pipe_j.read_line_blocking().expect("single json line");
+        assert_eq!(pipe_j.wait(), 0);
+        assert!(
+            saw_geo_and_headers.load(Ordering::SeqCst),
+            "expected gl=JP, X-Goog-PageId, and Accept-Language on InnerTube request"
+        );
+        let val: Value = serde_json::from_str(&json_line).expect("valid -J JSON");
+        for field in [
+            "id",
+            "title",
+            "track",
+            "artist",
+            "channel",
+            "channel_id",
+            "uploader",
+            "duration",
+            "is_live",
+            "live_status",
+            "webpage_url",
+            "original_url",
+            "extractor",
+            "extractor_key",
+            "thumbnail",
+            "thumbnails",
+            "url",
+            "ext",
+            "acodec",
+            "vcodec",
+            "format_id",
+            "abr",
+            "tbr",
+            "asr",
+            "audio_channels",
+            "filesize",
+            "protocol",
+            "http_headers",
+            "formats",
+        ] {
+            assert!(val.get(field).is_some(), "-J missing `{field}`: {val}");
+        }
+        assert_eq!(val["id"], "-dQw4w9WgXc");
+        assert_eq!(val["extractor"], "youtube");
+        assert_eq!(val["extractor_key"], "Youtube");
+        assert_eq!(val["live_status"], "not_live");
+        assert_eq!(val["is_live"], false);
+        assert_eq!(
+            val["webpage_url"],
+            "https://www.youtube.com/watch?v=-dQw4w9WgXc"
+        );
+        assert_eq!(val["thumbnails"].as_array().unwrap().len(), 2);
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = srv.join();
+    }
+
+    #[test]
+    fn dash_mpd_baseurl_fallback_extracts_audio_when_formats_empty() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind dash mock");
+        let port = listener.local_addr().unwrap().port();
+        let origin = format!("http://127.0.0.1:{port}");
+        let origin_srv = origin.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_srv = Arc::clone(&stop);
+        let _ = listener.set_nonblocking(true);
+
+        let srv = std::thread::spawn(move || {
+            while !stop_srv.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let req = read_http_request(&mut stream);
+                        let first = req.lines().next().unwrap_or_default();
+                        let (ct, body) = if first.starts_with("GET /manifest.mpd") {
+                            let xml = format!(
+                                r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD>
+  <Period>
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <Representation id="137" codecs="avc1.640028" bandwidth="2500000">
+        <BaseURL>{origin_srv}/video.mp4</BaseURL>
+      </Representation>
+    </AdaptationSet>
+    <AdaptationSet mimeType="audio/mp4" contentType="audio" audioSamplingRate="44100">
+      <Representation id="140" codecs="mp4a.40.2" bandwidth="129500" audioSamplingRate="44100">
+        <BaseURL>{origin_srv}/dash_audio.m4a?itag=140&amp;mime=audio%2Fmp4</BaseURL>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>"#
+                            );
+                            ("application/dash+xml", xml)
+                        } else {
+                            let j = json!({
+                                "playabilityStatus": { "status": "OK" },
+                                "videoDetails": { "title": "DASH Fallback Track", "lengthSeconds": "190" },
+                                "streamingData": {
+                                    "adaptiveFormats": [],
+                                    "formats": [],
+                                    "dashManifestUrl": format!("{origin_srv}/manifest.mpd")
+                                }
+                            })
+                            .to_string();
+                            ("application/json", j)
+                        };
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = reqwest::Client::new();
+        let resolved = rt
+            .block_on(resolve_innertube_stream_with_options(
+                &client,
+                &origin,
+                "DASHONLY001",
+                None,
+                None,
+                true,
+                false,
+            ))
+            .expect("DASH MPD fallback should extract audio BaseURL");
+        assert_eq!(resolved.format_id, "140");
+        assert_eq!(resolved.ext, "m4a");
+        assert_eq!(resolved.acodec, "mp4a.40.2");
+        assert_eq!(resolved.asr, Some(44100));
+        assert_eq!(
+            resolved.url,
+            format!("{origin}/dash_audio.m4a?itag=140&mime=audio%2Fmp4")
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = srv.join();
+    }
+
+    #[test]
+    fn rapid_kill_cancels_inflight_virtual_ytdlp_cascade_promptly() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stall mock");
+        let port = listener.local_addr().unwrap().port();
+        let origin = format!("http://127.0.0.1:{port}");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_srv = Arc::clone(&stop);
+        let _ = listener.set_nonblocking(true);
+
+        let srv = std::thread::spawn(move || {
+            while !stop_srv.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let req = read_http_request(&mut stream);
+                        if req.contains("STALLTRACK1") {
+                            // Hold socket open in small slices so test shutdown is quick too.
+                            for _ in 0..50 {
+                                if stop_srv.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                                std::thread::sleep(Duration::from_millis(100));
+                            }
+                        }
+                        let body = json!({
+                            "playabilityStatus": { "status": "OK" },
+                            "videoDetails": { "title": "Fast Track", "lengthSeconds": "100" },
+                            "streamingData": {
+                                "adaptiveFormats": [
+                                    {
+                                        "itag": 140,
+                                        "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"",
+                                        "bitrate": 128000,
+                                        "url": "https://cdn.example.test/after_kill.m4a"
+                                    }
+                                ]
+                            }
+                        })
+                        .to_string();
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let client = reqwest::Client::new();
+        let started = Instant::now();
+        let pipe = VirtualYtdlpShim::spawn_with_origin(
+            &["-g".to_owned(), "STALLTRACK1".to_owned()],
+            client.clone(),
+            origin.clone(),
+            true,
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        pipe.kill();
+        let code = pipe.wait();
+        let elapsed = started.elapsed();
+        assert_eq!(code, -1);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "pipe.kill() must abort in-flight VirtualYtdlpShim promptly, took {elapsed:?}"
+        );
+
+        // Immediately following track resolution must still work cleanly.
+        let pipe2 = VirtualYtdlpShim::spawn_with_origin(
+            &["-g".to_owned(), "FASTTRACK01".to_owned()],
+            client,
+            origin,
+            true,
+        );
+        let url = pipe2.read_line_blocking().expect("fast track url");
+        assert_eq!(pipe2.wait(), 0);
+        assert_eq!(url, "https://cdn.example.test/after_kill.m4a");
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = srv.join();
+    }
+
+    #[test]
+    fn youtubejs_search_and_playlist_extraction_supports_ndjson_and_dump_single_json() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind collection mock");
+        let port = listener.local_addr().unwrap().port();
+        let origin = format!("http://127.0.0.1:{port}");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_srv = Arc::clone(&stop);
+        let _ = listener.set_nonblocking(true);
+
+        let srv = std::thread::spawn(move || {
+            while !stop_srv.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let req = read_http_request(&mut stream);
+                        let body = if req.contains("/youtubei/v1/search") {
+                            json!({
+                                "contents": {
+                                    "twoColumnSearchResultsRenderer": {
+                                        "primaryContents": {
+                                            "sectionListRenderer": {
+                                                "contents": [{
+                                                    "itemSectionRenderer": {
+                                                        "contents": [
+                                                            {
+                                                                "videoRenderer": {
+                                                                    "videoId": "SRCHVID0001",
+                                                                    "title": { "runs": [{ "text": "Search Song One" }] },
+                                                                    "ownerText": { "runs": [{ "text": "Artist One", "navigationEndpoint": { "browseEndpoint": { "browseId": "UCone" } } }] },
+                                                                    "lengthText": { "simpleText": "3:20" },
+                                                                    "thumbnail": { "thumbnails": [{ "url": "https://i.ytimg.com/vi/SRCHVID0001/hqdefault.jpg" }] }
+                                                                }
+                                                            },
+                                                            {
+                                                                "videoRenderer": {
+                                                                    "videoId": "SRCHVID0002",
+                                                                    "title": { "runs": [{ "text": "Search Song Two" }] },
+                                                                    "ownerText": { "runs": [{ "text": "Artist Two", "navigationEndpoint": { "browseEndpoint": { "browseId": "UCtwo" } } }] },
+                                                                    "lengthText": { "simpleText": "4:05" },
+                                                                    "thumbnail": { "thumbnails": [{ "url": "https://i.ytimg.com/vi/SRCHVID0002/hqdefault.jpg" }] }
+                                                                }
+                                                            },
+                                                            {
+                                                                "videoRenderer": {
+                                                                    "videoId": "SRCHVID0003",
+                                                                    "title": { "runs": [{ "text": "Search Song Three" }] },
+                                                                    "ownerText": { "runs": [{ "text": "Artist Three", "navigationEndpoint": { "browseEndpoint": { "browseId": "UCthr" } } }] },
+                                                                    "lengthText": { "simpleText": "2:50" },
+                                                                    "thumbnail": { "thumbnails": [{ "url": "https://i.ytimg.com/vi/SRCHVID0003/hqdefault.jpg" }] }
+                                                                }
+                                                            }
+                                                        ]
+                                                    }
+                                                }]
+                                            }
+                                        }
+                                    }
+                                }
+                            })
+                            .to_string()
+                        } else if req.contains("/youtubei/v1/browse") {
+                            json!({
+                                "metadata": {
+                                    "playlistMetadataRenderer": {
+                                        "title": "Mock Playlist"
+                                    }
+                                },
+                                "contents": {
+                                    "twoColumnBrowseResultsRenderer": {
+                                        "tabs": [{
+                                            "tabRenderer": {
+                                                "selected": true,
+                                                "content": {
+                                                    "sectionListRenderer": {
+                                                        "contents": [{
+                                                            "itemSectionRenderer": {
+                                                                "contents": [{
+                                                                    "playlistVideoListRenderer": {
+                                                                        "playlistId": "PLmocklist123",
+                                                                        "contents": [
+                                                                            {
+                                                                                "playlistVideoRenderer": {
+                                                                                    "videoId": "PLVID000001",
+                                                                                    "title": {
+                                                                                        "runs": [{ "text": "Playlist Track 1" }],
+                                                                                        "accessibility": { "accessibilityData": { "label": "Playlist Track 1 by Band A" } }
+                                                                                    },
+                                                                                    "shortBylineText": { "runs": [{ "text": "Band A", "navigationEndpoint": { "browseEndpoint": { "browseId": "UCbandA" } } }] },
+                                                                                    "lengthSeconds": "180",
+                                                                                    "thumbnail": { "thumbnails": [{ "url": "https://i.ytimg.com/vi/PLVID000001/hqdefault.jpg" }] }
+                                                                                }
+                                                                            },
+                                                                            {
+                                                                                "playlistVideoRenderer": {
+                                                                                    "videoId": "PLVID000002",
+                                                                                    "title": {
+                                                                                        "runs": [{ "text": "Playlist Track 2" }],
+                                                                                        "accessibility": { "accessibilityData": { "label": "Playlist Track 2 by Band B" } }
+                                                                                    },
+                                                                                    "shortBylineText": { "runs": [{ "text": "Band B", "navigationEndpoint": { "browseEndpoint": { "browseId": "UCbandB" } } }] },
+                                                                                    "lengthSeconds": "240",
+                                                                                    "thumbnail": { "thumbnails": [{ "url": "https://i.ytimg.com/vi/PLVID000002/hqdefault.jpg" }] }
+                                                                                }
+                                                                            },
+                                                                            {
+                                                                                "playlistVideoRenderer": {
+                                                                                    "videoId": "PLVID000003",
+                                                                                    "title": {
+                                                                                        "runs": [{ "text": "Playlist Track 3" }],
+                                                                                        "accessibility": { "accessibilityData": { "label": "Playlist Track 3 by Band C" } }
+                                                                                    },
+                                                                                    "shortBylineText": { "runs": [{ "text": "Band C", "navigationEndpoint": { "browseEndpoint": { "browseId": "UCbandC" } } }] },
+                                                                                    "lengthSeconds": "210",
+                                                                                    "thumbnail": { "thumbnails": [{ "url": "https://i.ytimg.com/vi/PLVID000003/hqdefault.jpg" }] }
+                                                                                }
+                                                                            }
+                                                                        ]
+                                                                    }
+                                                                }]
+                                                            }
+                                                        }]
+                                                    }
+                                                }
+                                            }
+                                        }]
+                                    }
+                                }
+                            })
+                            .to_string()
+                        } else {
+                            "{}".to_owned()
+                        };
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let client = reqwest::Client::new();
+
+        // 1. `ytsearch2:` with `--flat-playlist` emits 2 NDJSON lines.
+        let p_search_flat = VirtualYtdlpShim::spawn_with_origin(
+            &[
+                "--flat-playlist".to_owned(),
+                "ytsearch2:mock song".to_owned(),
+            ],
+            client.clone(),
+            origin.clone(),
+            true,
+        );
+        let s1: Value =
+            serde_json::from_str(&p_search_flat.read_line_blocking().expect("search line 1"))
+                .unwrap();
+        let s2: Value =
+            serde_json::from_str(&p_search_flat.read_line_blocking().expect("search line 2"))
+                .unwrap();
+        assert_eq!(p_search_flat.read_line_blocking(), None);
+        assert_eq!(p_search_flat.wait(), 0);
+        assert_eq!(s1["id"], "SRCHVID0001");
+        assert_eq!(s1["title"], "Search Song One");
+        assert_eq!(s1["duration"], 200);
+        assert_eq!(s2["id"], "SRCHVID0002");
+
+        // 2. `ytsearch3:` with `-J` and `-I 2:3` emits single playlist JSON containing items 2 & 3.
+        let p_search_j = VirtualYtdlpShim::spawn_with_origin(
+            &[
+                "-J".to_owned(),
+                "-I".to_owned(),
+                "2:3".to_owned(),
+                "ytsearch3:mock song".to_owned(),
+            ],
+            client.clone(),
+            origin.clone(),
+            true,
+        );
+        let sj: Value =
+            serde_json::from_str(&p_search_j.read_line_blocking().expect("-J search line"))
+                .unwrap();
+        assert_eq!(p_search_j.wait(), 0);
+        assert_eq!(sj["_type"], "playlist");
+        assert_eq!(sj["extractor"], "youtube:search");
+        let sj_entries = sj["entries"].as_array().unwrap();
+        assert_eq!(sj_entries.len(), 2);
+        assert_eq!(sj_entries[0]["id"], "SRCHVID0002");
+        assert_eq!(sj_entries[1]["id"], "SRCHVID0003");
+
+        // 3. `playlist?list=PLmocklist123` with `-J` emits single playlist JSON with all 3 tracks.
+        let p_pl_j = VirtualYtdlpShim::spawn_with_origin(
+            &[
+                "-J".to_owned(),
+                "https://www.youtube.com/playlist?list=PLmocklist123".to_owned(),
+            ],
+            client.clone(),
+            origin.clone(),
+            true,
+        );
+        let pl_val: Value =
+            serde_json::from_str(&p_pl_j.read_line_blocking().expect("-J playlist line")).unwrap();
+        assert_eq!(p_pl_j.wait(), 0);
+        assert_eq!(pl_val["_type"], "playlist");
+        assert_eq!(pl_val["id"], "PLmocklist123");
+        assert_eq!(pl_val["title"], "Mock Playlist");
+        assert_eq!(pl_val["entries"].as_array().unwrap().len(), 3);
+
+        // 4. `playlist?list=PLmocklist123` with `-j -I 1,3` emits 2 NDJSON lines (items #1 & #3).
+        let p_pl_nd = VirtualYtdlpShim::spawn_with_origin(
+            &[
+                "-j".to_owned(),
+                "-I".to_owned(),
+                "1,3".to_owned(),
+                "https://www.youtube.com/playlist?list=PLmocklist123".to_owned(),
+            ],
+            client,
+            origin,
+            true,
+        );
+        let pl1: Value =
+            serde_json::from_str(&p_pl_nd.read_line_blocking().expect("pl line 1")).unwrap();
+        let pl3: Value =
+            serde_json::from_str(&p_pl_nd.read_line_blocking().expect("pl line 2")).unwrap();
+        assert_eq!(p_pl_nd.read_line_blocking(), None);
+        assert_eq!(p_pl_nd.wait(), 0);
+        assert_eq!(pl1["id"], "PLVID000001");
+        assert_eq!(pl3["id"], "PLVID000003");
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = srv.join();
+    }
+
+    #[test]
+    #[ignore = "live network test verifying YouTube.js ytsearch2: extraction"]
+    fn live_youtubejs_search_and_playlist_extraction() {
+        let client = reqwest::Client::new();
+        let pipe = VirtualYtdlpShim::spawn_with_origin(
+            &[
+                "-J".to_owned(),
+                "ytsearch2:Never Gonna Give You Up Rick Astley".to_owned(),
+            ],
+            client,
+            DEFAULT_INNERTUBE_ORIGIN.to_owned(),
+            true,
+        );
+        let line = pipe
+            .read_line_blocking()
+            .expect("live ytsearch2 -J output line");
+        let code = pipe.wait();
+        let err = pipe.error_output();
+        assert_eq!(code, 0, "live ytsearch2 failed: {err}");
+        let val: Value = serde_json::from_str(&line).expect("valid -J JSON");
+        assert_eq!(val["_type"], "playlist");
+        let entries = val["entries"].as_array().expect("entries array");
+        assert_eq!(entries.len(), 2, "expected 2 search entries: {val}");
+        for entry in entries {
+            assert!(
+                entry["id"].as_str().is_some_and(|s| s.len() == 11),
+                "expected 11-char video id: {entry}"
+            );
+            assert!(
+                entry["title"].as_str().is_some_and(|s| !s.is_empty()),
+                "expected non-empty title: {entry}"
+            );
+        }
+        println!(
+            "LIVE ytsearch2 OK: [0]={} ({:?}), [1]={} ({:?})",
+            entries[0]["id"], entries[0]["title"], entries[1]["id"], entries[1]["title"]
+        );
     }
 
     #[test]

@@ -238,6 +238,203 @@ struct FormatAlternative {
     filters: Vec<BracketFilter>,
 }
 
+/// Parsed `-S` / `--format-sort` ordering specification.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct FormatSortSpec {
+    keys: Vec<FormatSortKey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FormatSortKey {
+    reverse: bool,
+    kind: FormatSortKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FormatSortKind {
+    Abr,
+    Tbr,
+    Asr,
+    Filesize,
+    AudioChannels,
+    HasAudio,
+    Ext(Vec<String>),
+    Acodec(Vec<String>),
+    Proto(Vec<String>),
+}
+
+impl FormatSortSpec {
+    /// Parses one or more `-S` / `--format-sort` comma-separated sort specifications
+    /// (e.g. `abr`, `+abr`, `tbr`, `asr`, `filesize`, `ext:m4a`, `acodec:opus`, `proto:https`).
+    pub fn parse(raw_specs: &[String]) -> Self {
+        let mut keys = Vec::new();
+        for raw in raw_specs {
+            for item in raw.split(',') {
+                let mut token = item.trim();
+                if token.is_empty() {
+                    continue;
+                }
+                let reverse = if let Some(rest) = token.strip_prefix('+') {
+                    token = rest.trim();
+                    true
+                } else {
+                    false
+                };
+                if token.is_empty() {
+                    continue;
+                }
+                let (field_raw, prefs): (&str, Vec<String>) = match token.split_once(':') {
+                    Some((f, rest)) => (
+                        f.trim(),
+                        rest.split(':')
+                            .map(|s| s.trim().to_ascii_lowercase())
+                            .filter(|s| !s.is_empty())
+                            .collect(),
+                    ),
+                    None => (token, Vec::new()),
+                };
+                let kind = match field_raw.to_ascii_lowercase().as_str() {
+                    "abr" => FormatSortKind::Abr,
+                    "tbr" | "br" => FormatSortKind::Tbr,
+                    "asr" => FormatSortKind::Asr,
+                    "filesize" | "size" | "fs" | "filesize_approx" => FormatSortKind::Filesize,
+                    "channels" | "audio_channels" => FormatSortKind::AudioChannels,
+                    "hasaud" => FormatSortKind::HasAudio,
+                    "ext" | "aext" => FormatSortKind::Ext(prefs),
+                    "acodec" => FormatSortKind::Acodec(prefs),
+                    "proto" | "protocol" => FormatSortKind::Proto(prefs),
+                    _ => continue,
+                };
+                keys.push(FormatSortKey { reverse, kind });
+            }
+        }
+        Self { keys }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    fn compare(&self, a: &CandidateFormatMeta, b: &CandidateFormatMeta) -> std::cmp::Ordering {
+        for key in &self.keys {
+            let ord = compare_by_sort_key(&key.kind, a, b);
+            let adjusted = if key.reverse { ord.reverse() } else { ord };
+            if adjusted != std::cmp::Ordering::Equal {
+                return adjusted;
+            }
+        }
+        std::cmp::Ordering::Equal
+    }
+}
+
+fn compare_by_sort_key(
+    kind: &FormatSortKind,
+    a: &CandidateFormatMeta,
+    b: &CandidateFormatMeta,
+) -> std::cmp::Ordering {
+    // By default (non-reversed), better/higher/preferred candidate sorts FIRST (Less).
+    match kind {
+        FormatSortKind::Abr => {
+            let ka = (a.abr.unwrap_or(0.0) * 100.0) as u64;
+            let kb = (b.abr.unwrap_or(0.0) * 100.0) as u64;
+            kb.cmp(&ka)
+        }
+        FormatSortKind::Tbr => {
+            let ka = (a.effective_bitrate_kbps() * 100.0) as u64;
+            let kb = (b.effective_bitrate_kbps() * 100.0) as u64;
+            kb.cmp(&ka)
+        }
+        FormatSortKind::Asr => b.asr.unwrap_or(0).cmp(&a.asr.unwrap_or(0)),
+        FormatSortKind::Filesize => b.filesize.unwrap_or(0).cmp(&a.filesize.unwrap_or(0)),
+        FormatSortKind::AudioChannels => b
+            .audio_channels
+            .unwrap_or(0)
+            .cmp(&a.audio_channels.unwrap_or(0)),
+        FormatSortKind::HasAudio => b.has_audio().cmp(&a.has_audio()),
+        FormatSortKind::Ext(prefs) => {
+            let ra = ext_sort_rank(&a.ext, prefs);
+            let rb = ext_sort_rank(&b.ext, prefs);
+            rb.cmp(&ra)
+        }
+        FormatSortKind::Acodec(prefs) => {
+            let ra = acodec_sort_rank(&a.acodec, prefs);
+            let rb = acodec_sort_rank(&b.acodec, prefs);
+            rb.cmp(&ra)
+        }
+        FormatSortKind::Proto(prefs) => {
+            let ra = proto_sort_rank(&a.protocol, prefs);
+            let rb = proto_sort_rank(&b.protocol, prefs);
+            rb.cmp(&ra)
+        }
+    }
+}
+
+fn ext_sort_rank(ext: &str, prefs: &[String]) -> usize {
+    let lower = ext.to_ascii_lowercase();
+    if !prefs.is_empty() {
+        for (idx, pref) in prefs.iter().enumerate() {
+            if lower == *pref {
+                return prefs.len() - idx + 1;
+            }
+        }
+        return 0;
+    }
+    match lower.as_str() {
+        "m4a" => 5,
+        "mp4" => 4,
+        "webm" => 3,
+        "mp3" => 2,
+        "m3u8" => 1,
+        _ => 0,
+    }
+}
+
+fn acodec_sort_rank(acodec: &str, prefs: &[String]) -> usize {
+    let lower = acodec.to_ascii_lowercase();
+    if !prefs.is_empty() {
+        for (idx, pref) in prefs.iter().enumerate() {
+            if lower == *pref || lower.starts_with(pref) || lower.contains(pref) {
+                return prefs.len() - idx + 1;
+            }
+        }
+        return 0;
+    }
+    if lower.contains("opus") {
+        5
+    } else if lower.contains("mp4a.40.2") {
+        4
+    } else if lower.contains("mp4a") || lower.contains("aac") {
+        3
+    } else if lower.contains("vorbis") {
+        2
+    } else if lower != "none" && !lower.is_empty() {
+        1
+    } else {
+        0
+    }
+}
+
+fn proto_sort_rank(proto: &str, prefs: &[String]) -> usize {
+    let lower = proto.to_ascii_lowercase();
+    if !prefs.is_empty() {
+        for (idx, pref) in prefs.iter().enumerate() {
+            if lower == *pref || lower.starts_with(pref) || lower.contains(pref) {
+                return prefs.len() - idx + 1;
+            }
+        }
+        return 0;
+    }
+    if lower == "https" || lower == "http" {
+        3
+    } else if lower.starts_with("m3u8") {
+        2
+    } else if !lower.is_empty() {
+        1
+    } else {
+        0
+    }
+}
+
 /// Parsed `-f` / `--format` fallback selector chain (`alt1/alt2/...`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FormatSelector {
@@ -275,13 +472,25 @@ impl FormatSelector {
     }
 
     /// Selects and orders candidate indices matching the `/` fallback chain in strict priority order.
+    #[allow(dead_code)]
     pub fn select_indices(
         &self,
         candidates: &[CandidateFormatMeta],
         prefer_mobile_aac: bool,
     ) -> Vec<usize> {
+        self.select_indices_with_sort(candidates, prefer_mobile_aac, None)
+    }
+
+    /// Selects and orders candidate indices honoring optional `-S` / `--format-sort` keys first.
+    pub fn select_indices_with_sort(
+        &self,
+        candidates: &[CandidateFormatMeta],
+        prefer_mobile_aac: bool,
+        format_sort: Option<&FormatSortSpec>,
+    ) -> Vec<usize> {
         let mut ordered = Vec::new();
         let mut seen = HashSet::new();
+        let active_sort = format_sort.filter(|s| !s.is_empty());
 
         for alt in &self.alternatives {
             let mut matched: Vec<usize> = candidates
@@ -291,7 +500,8 @@ impl FormatSelector {
                 .map(|(i, _)| i)
                 .collect();
 
-            let mandates_specific = matches!(alt.base, BaseTarget::ExactId(_))
+            let mandates_specific = active_sort.is_some()
+                || matches!(alt.base, BaseTarget::ExactId(_))
                 || alt
                     .filters
                     .iter()
@@ -301,6 +511,12 @@ impl FormatSelector {
             matched.sort_by(|&a_idx, &b_idx| {
                 let a = &candidates[a_idx];
                 let b = &candidates[b_idx];
+                if let Some(sort_spec) = active_sort {
+                    let custom = sort_spec.compare(a, b);
+                    if custom != std::cmp::Ordering::Equal {
+                        return custom;
+                    }
+                }
                 compare_candidates(
                     a,
                     b,
@@ -716,5 +932,63 @@ mod tests {
         let both = vec![drc_only, normal];
         let ranked = sel.select_indices(&both, true);
         assert_eq!(ranked, vec![1, 0]);
+    }
+
+    #[test]
+    fn format_sort_orders_candidates_by_abr_asr_filesize_ext_acodec_and_proto() {
+        let mut f140 = mk_fmt("140", "m4a", "https", "mp4a.40.2", "none", Some(128.0));
+        f140.asr = Some(44100);
+        f140.filesize = Some(3_000_000);
+
+        let mut f251 = mk_fmt("251", "webm", "https", "opus", "none", Some(160.0));
+        f251.asr = Some(48000);
+        f251.filesize = Some(4_000_000);
+
+        let mut f139 = mk_fmt("139", "m4a", "https", "mp4a.40.5", "none", Some(48.0));
+        f139.asr = Some(22050);
+        f139.filesize = Some(1_100_000);
+
+        let mut f234 = mk_fmt(
+            "234",
+            "m3u8",
+            "m3u8_native",
+            "mp4a.40.2",
+            "none",
+            Some(128.0),
+        );
+        f234.asr = Some(44100);
+        f234.filesize = None;
+
+        let candidates = vec![f140, f251, f139, f234];
+        let sel = FormatSelector::parse("bestaudio");
+
+        // 1. `-S acodec:opus,abr` puts opus `251` ahead even when `prefer_mobile_aac = true`.
+        let s_opus = FormatSortSpec::parse(&["acodec:opus,abr".to_owned()]);
+        let idx_opus = sel.select_indices_with_sort(&candidates, true, Some(&s_opus));
+        assert_eq!(candidates[idx_opus[0]].format_id, "251");
+
+        // 2. `-S +abr` puts lowest bitrate `139` first.
+        let s_low_abr = FormatSortSpec::parse(&["+abr".to_owned()]);
+        let idx_low = sel.select_indices_with_sort(&candidates, true, Some(&s_low_abr));
+        assert_eq!(candidates[idx_low[0]].format_id, "139");
+
+        // 3. `-S proto:m3u8` prefers HLS `234` first.
+        let s_hls = FormatSortSpec::parse(&["proto:m3u8".to_owned()]);
+        let idx_hls = sel.select_indices_with_sort(&candidates, true, Some(&s_hls));
+        assert_eq!(candidates[idx_hls[0]].format_id, "234");
+
+        // 4. `-S ext:webm:m4a,+filesize` puts `251` first, then `139` (smaller m4a), then `140`.
+        let s_ext_fs = FormatSortSpec::parse(&["ext:webm:m4a,+filesize".to_owned()]);
+        let idx_ext_fs = sel.select_indices_with_sort(&candidates, true, Some(&s_ext_fs));
+        let ordered: Vec<&str> = idx_ext_fs
+            .iter()
+            .map(|&i| candidates[i].format_id.as_str())
+            .collect();
+        assert_eq!(ordered, vec!["251", "139", "140", "234"]);
+
+        // 5. `-S asr` puts 48000 Hz (`251`) first.
+        let s_asr = FormatSortSpec::parse(&["asr".to_owned()]);
+        let idx_asr = sel.select_indices_with_sort(&candidates, true, Some(&s_asr));
+        assert_eq!(candidates[idx_asr[0]].format_id, "251");
     }
 }
