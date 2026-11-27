@@ -4033,7 +4033,7 @@ pub fn web_sign_in_modal(
         .w_full()
         .h(move || {
             if is_phone {
-                px(if keyboard_height().0 > 0.0 {
+                px(if keyboard_height().0 > safe_area().bottom.0 + 20.0 {
                     120.0
                 } else {
                     290.0
@@ -4114,7 +4114,7 @@ pub fn web_sign_in_modal(
         .w_full()
         .gap(px(if is_phone { 10.0 } else { 14.0 }))
         .child(when(
-            move || !is_phone || keyboard_height().0 <= 0.0,
+            move || !is_phone || keyboard_height().0 <= safe_area().bottom.0 + 20.0,
             build_hint_bar,
         ))
         .child(web_box)

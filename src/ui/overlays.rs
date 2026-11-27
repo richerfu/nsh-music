@@ -1,14 +1,15 @@
-//! Adaptive modals (centered `dialog` on Desktop, floating sheet on Pad,
-//! bottom `sheet` on Phone), global toast overlay, and styled menus / context
-//! menus.
+//! Adaptive modals (centered `dialog` on Desktop, in-surface modal sheet on
+//! mobile Pad & Phone so Android/iOS soft keyboards stay attached to the main
+//! surface and report live `keyboard_height()`), global toast overlay, and
+//! styled menus / context menus.
 
 use std::rc::Rc;
 use std::time::Duration;
 
 use nsh_base::{
-    Anchor, ContextMenuElement, MenuElement, SheetEvent, ToastManager, ToastMotion, ToastOptions,
+    Anchor, ContextMenuElement, MenuElement, ToastManager, ToastMotion, ToastOptions,
     ToastStackState, ToastTransitionStatus, alert_dialog, context_menu, dialog, menu, menu_item,
-    menu_separator, sheet, toast, toast_stack,
+    menu_separator, toast, toast_stack,
 };
 use nsh_core::{element::StyleRefinement, prelude::*, time::now};
 
@@ -21,8 +22,8 @@ use super::{
 
 /// Adaptive modal presentation:
 /// - **Desktop**: Centered elevated `dialog` with scrim backdrop (`max_w = 500pt`).
-/// - **Pad**: Floating rounded dialog sheet (`max_w = 540pt`).
-/// - **Phone**: Bottom `sheet` with backdrop/back/close dismissal and safe-area bottom inset.
+/// - **Pad**: In-surface centered modal on mobile OSes (live IME avoidance), or `dialog` on desktop.
+/// - **Phone**: In-surface bottom sheet on `NshView` lifting cleanly above `keyboard_height()`.
 pub fn adaptive_modal<F, E>(
     open: impl IntoReactive<bool>,
     title: impl IntoReactive<SharedString>,
@@ -39,157 +40,280 @@ where
     let content_fn: Rc<dyn Fn() -> AnyElement> = Rc::new(move || build_content().into_element());
 
     let form = computed(theme::detect_device_form);
+    let open_rx_pe = open_rx.clone();
 
-    view().child(dynamic(move || {
-        let current_form = form.get();
-        let open_rx = open_rx.clone();
-        let title_rx = title_rx.clone();
-        let close = on_close.clone();
-        let make_content = content_fn.clone();
-
-        match current_form {
-            DeviceForm::Phone => {
-                let close_evt = close.clone();
-                let close_btn = close.clone();
-                let title_a11y = title_rx.clone();
-                sheet()
-                    .open(move || Some(open_rx.get()))
-                    .side(Placement::Bottom)
-                    .close_on_swipe(false)
-                    .close_on_escape(true)
-                    .close_on_backdrop_press(true)
-                    .grabber(false)
-                    .accessibility_label(move || Some(title_a11y.get()))
-                    .on_open_change(move |e: &SheetEvent| {
-                        if let SheetEvent::OpenChange(false, _) = e {
-                            close_evt();
-                        }
-                    })
-                    .backdrop_style(|s| s.bg(theme::scrim))
-                    .popup_style(|s| {
-                        s.rounded_t(px(radius::SHEET))
-                            .bg(theme::card_elevated)
-                            .border_t_1()
-                            .border_color(theme::border)
-                            .elevation(Elevation::Modal)
-                    })
-                    .child({
-                        let sheet_metrics = || {
-                            let win_h = window().height.0;
-                            let insets = safe_area();
-                            let kb_lift = (keyboard_height().0 - insets.bottom.0).max(0.0);
-                            if kb_lift > 0.0 {
-                                let sheet_max_h = (win_h - insets.top.0 - kb_lift - 8.0).max(220.0);
-                                let scroll_max_h = (sheet_max_h - 84.0).max(120.0);
-                                (sheet_max_h, 12.0_f32, scroll_max_h)
-                            } else {
-                                let sheet_max_h = (win_h * 0.88).max(320.0);
-                                let scroll_max_h =
-                                    (sheet_max_h - 110.0 - insets.bottom.0).max(220.0);
-                                (sheet_max_h, insets.bottom.0 + 20.0, scroll_max_h)
-                            }
-                        };
-                        view()
-                            .w_full()
-                            .max_h(move || px(sheet_metrics().0))
-                            .px_4()
-                            .pt_3p5()
-                            .pb(move || px(sheet_metrics().1))
-                            .gap_3()
-                            .child(modal_header(title_rx, close_btn))
-                            .child(
-                                scroll()
-                                    .w_full()
-                                    .keyboard_taps(KeyboardTaps::Handled)
-                                    .keyboard_dismiss_mode(KeyboardDismissMode::OnDrag)
-                                    .max_h(move || px(sheet_metrics().2))
-                                    .child(make_content()),
-                            )
-                    })
-                    .into_element()
+    view()
+        .absolute()
+        .inset_0()
+        .pointer_events(move || {
+            if open_rx_pe.get() {
+                PointerEvents::BoxNone
+            } else {
+                PointerEvents::None
             }
-            DeviceForm::Desktop | DeviceForm::Pad { .. } => {
-                let max_w = if current_form.is_desktop() {
-                    500.0
-                } else {
-                    540.0
-                };
-                when(
+        })
+        .child(dynamic(move || {
+            let current_form = form.get();
+            let open_rx = open_rx.clone();
+            let title_rx = title_rx.clone();
+            let close = on_close.clone();
+            let make_content = content_fn.clone();
+
+            match current_form {
+                DeviceForm::Phone => when(
                     move || open_rx.get(),
                     move || {
-                        let close_cancel = close.clone();
                         let close_bg = close.clone();
                         let close_btn = close.clone();
                         let title_hdr = title_rx.clone();
                         let title_a11y = title_rx.clone();
                         let body = make_content();
-                        let card_scale = animated_value(if reduce_motion() { 1.0 } else { 0.96 });
-                        let card_y = animated_value(if reduce_motion() { 0.0 } else { 8.0 });
+
+                        let card_y = animated_value(if reduce_motion() { 0.0 } else { 48.0 });
+                        let fade = animated_value(if reduce_motion() { 1.0 } else { 0.0 });
                         if !reduce_motion() {
-                            motion::animate_spring(&card_scale, 1.0, motion::spring_snappy());
                             motion::animate_spring(&card_y, 0.0, motion::spring_snappy());
+                            motion::animate_timing(&fade, 1.0, motion::timing_fast());
                         }
-                        dialog()
-                            .animation(if reduce_motion() {
-                                ModalAnimation::None
+
+                        let sheet_metrics = || {
+                            let win_h = window().height.0;
+                            let insets = safe_area();
+                            let kb = keyboard_height().0;
+                            if kb > insets.bottom.0 + 20.0 {
+                                let sheet_max_h = (win_h - insets.top.0 - kb - 8.0).max(180.0);
+                                let scroll_max_h = (sheet_max_h - 72.0).max(100.0);
+                                (sheet_max_h, 12.0_f32, scroll_max_h)
                             } else {
-                                ModalAnimation::Fade
-                            })
+                                let sheet_max_h =
+                                    (win_h - insets.top.0 - 12.0).min(win_h * 0.88).max(260.0);
+                                let scroll_max_h =
+                                    (sheet_max_h - 96.0 - insets.bottom.0).max(180.0);
+                                (sheet_max_h, insets.bottom.0 + 20.0, scroll_max_h)
+                            }
+                        };
+
+                        view()
+                            .absolute()
+                            .inset_0()
                             .label(move || title_a11y.get())
-                            .on_cancel(move || close_cancel())
+                            .bind_opacity(&fade)
                             .child(
                                 view()
-                                    .flex_1()
-                                    .w_full()
-                                    .h_full()
-                                    .items_center()
-                                    .justify_center()
-                                    .p_6()
-                                    .child(
-                                        view()
-                                            .absolute()
-                                            .inset_0()
-                                            .bg(theme::scrim)
-                                            .focusable(false)
-                                            .on_press(move || close_bg()),
-                                    )
-                                    .child(
-                                        Elevated::elevation(
-                                            view()
-                                                .w_full()
-                                                .max_w(px(max_w))
-                                                .max_h(move || {
-                                                    px((window().height.0 * 0.84).max(320.0))
-                                                })
-                                                .p_5()
-                                                .gap_4()
-                                                .rounded(px(radius::XL))
-                                                .bg(theme::card_elevated)
-                                                .border_1()
-                                                .border_color(theme::border)
-                                                .bind_scale(&card_scale)
-                                                .bind_translate_y(&card_y),
-                                            Elevation::Modal,
-                                        )
-                                        .child(modal_header(title_hdr, close_btn))
-                                        .child(
-                                            view().w_full().overflow_hidden().child(
-                                                scroll()
-                                                    .w_full()
-                                                    .max_h(move || {
-                                                        px((window().height.0 * 0.68).max(220.0))
-                                                    })
-                                                    .child(body),
-                                            ),
-                                        ),
-                                    ),
+                                    .absolute()
+                                    .inset_0()
+                                    .bg(theme::scrim)
+                                    .focusable(false)
+                                    .on_press(move || {
+                                        dismiss_keyboard();
+                                        close_bg();
+                                    }),
+                            )
+                            .child(
+                                Elevated::elevation(
+                                    view()
+                                        .absolute()
+                                        .left_0()
+                                        .right_0()
+                                        .bottom(move || {
+                                            let kb = keyboard_height().0;
+                                            if kb > safe_area().bottom.0 + 20.0 {
+                                                px(kb)
+                                            } else {
+                                                px(0.0)
+                                            }
+                                        })
+                                        .max_h(move || px(sheet_metrics().0))
+                                        .pl(move || px(safe_area().left.0 + 16.0))
+                                        .pr(move || px(safe_area().right.0 + 16.0))
+                                        .pt_3p5()
+                                        .pb(move || px(sheet_metrics().1))
+                                        .gap_3()
+                                        .rounded_t(px(radius::SHEET))
+                                        .bg(theme::card_elevated)
+                                        .border_t_1()
+                                        .border_color(theme::border)
+                                        .bind_translate_y(&card_y),
+                                    Elevation::Modal,
+                                )
+                                .child(modal_header(title_hdr, close_btn))
+                                .child(
+                                    scroll()
+                                        .w_full()
+                                        .keyboard_taps(KeyboardTaps::Handled)
+                                        .keyboard_dismiss_mode(KeyboardDismissMode::OnDrag)
+                                        .max_h(move || px(sheet_metrics().2))
+                                        .child(body),
+                                ),
                             )
                     },
                 )
-                .into_element()
+                .into_element(),
+                DeviceForm::Pad { .. } if !os().is_desktop() => when(
+                    move || open_rx.get(),
+                    move || {
+                        let close_bg = close.clone();
+                        let close_btn = close.clone();
+                        let title_hdr = title_rx.clone();
+                        let title_a11y = title_rx.clone();
+                        let body = make_content();
+
+                        let card_scale = animated_value(if reduce_motion() { 1.0 } else { 0.96 });
+                        let card_y = animated_value(if reduce_motion() { 0.0 } else { 8.0 });
+                        let fade = animated_value(if reduce_motion() { 1.0 } else { 0.0 });
+                        if !reduce_motion() {
+                            motion::animate_spring(&card_scale, 1.0, motion::spring_snappy());
+                            motion::animate_spring(&card_y, 0.0, motion::spring_snappy());
+                            motion::animate_timing(&fade, 1.0, motion::timing_fast());
+                        }
+
+                        let pad_card_max_h = || {
+                            let bottom = keyboard_height().0.max(safe_area().bottom.0);
+                            (window().height.0 - safe_area().top.0 - bottom - 32.0).max(200.0)
+                        };
+
+                        view()
+                            .absolute()
+                            .inset_0()
+                            .label(move || title_a11y.get())
+                            .items_center()
+                            .justify_center()
+                            .pt(move || px(safe_area().top.0 + 16.0))
+                            .pb(move || px(keyboard_height().0.max(safe_area().bottom.0) + 16.0))
+                            .px_6()
+                            .bind_opacity(&fade)
+                            .child(
+                                view()
+                                    .absolute()
+                                    .inset_0()
+                                    .bg(theme::scrim)
+                                    .focusable(false)
+                                    .on_press(move || {
+                                        dismiss_keyboard();
+                                        close_bg();
+                                    }),
+                            )
+                            .child(
+                                Elevated::elevation(
+                                    view()
+                                        .w_full()
+                                        .max_w(px(540.0))
+                                        .max_h(move || px(pad_card_max_h()))
+                                        .p_5()
+                                        .gap_4()
+                                        .rounded(px(radius::XL))
+                                        .bg(theme::card_elevated)
+                                        .border_1()
+                                        .border_color(theme::border)
+                                        .bind_scale(&card_scale)
+                                        .bind_translate_y(&card_y),
+                                    Elevation::Modal,
+                                )
+                                .child(modal_header(title_hdr, close_btn))
+                                .child(
+                                    view().w_full().overflow_hidden().child(
+                                        scroll()
+                                            .w_full()
+                                            .keyboard_taps(KeyboardTaps::Handled)
+                                            .keyboard_dismiss_mode(KeyboardDismissMode::OnDrag)
+                                            .max_h(move || px((pad_card_max_h() - 84.0).max(120.0)))
+                                            .child(body),
+                                    ),
+                                ),
+                            )
+                    },
+                )
+                .into_element(),
+                DeviceForm::Desktop | DeviceForm::Pad { .. } => {
+                    let max_w = if current_form.is_desktop() {
+                        500.0
+                    } else {
+                        540.0
+                    };
+                    when(
+                        move || open_rx.get(),
+                        move || {
+                            let close_cancel = close.clone();
+                            let close_bg = close.clone();
+                            let close_btn = close.clone();
+                            let title_hdr = title_rx.clone();
+                            let title_a11y = title_rx.clone();
+                            let body = make_content();
+                            let card_scale =
+                                animated_value(if reduce_motion() { 1.0 } else { 0.96 });
+                            let card_y = animated_value(if reduce_motion() { 0.0 } else { 8.0 });
+                            if !reduce_motion() {
+                                motion::animate_spring(&card_scale, 1.0, motion::spring_snappy());
+                                motion::animate_spring(&card_y, 0.0, motion::spring_snappy());
+                            }
+                            dialog()
+                                .animation(if reduce_motion() {
+                                    ModalAnimation::None
+                                } else {
+                                    ModalAnimation::Fade
+                                })
+                                .label(move || title_a11y.get())
+                                .on_cancel(move || {
+                                    dismiss_keyboard();
+                                    close_cancel();
+                                })
+                                .child(
+                                    view()
+                                        .flex_1()
+                                        .w_full()
+                                        .h_full()
+                                        .items_center()
+                                        .justify_center()
+                                        .p_6()
+                                        .child(
+                                            view()
+                                                .absolute()
+                                                .inset_0()
+                                                .bg(theme::scrim)
+                                                .focusable(false)
+                                                .on_press(move || {
+                                                    dismiss_keyboard();
+                                                    close_bg();
+                                                }),
+                                        )
+                                        .child(
+                                            Elevated::elevation(
+                                                view()
+                                                    .w_full()
+                                                    .max_w(px(max_w))
+                                                    .max_h(move || {
+                                                        px((window().height.0 * 0.84).max(320.0))
+                                                    })
+                                                    .p_5()
+                                                    .gap_4()
+                                                    .rounded(px(radius::XL))
+                                                    .bg(theme::card_elevated)
+                                                    .border_1()
+                                                    .border_color(theme::border)
+                                                    .bind_scale(&card_scale)
+                                                    .bind_translate_y(&card_y),
+                                                Elevation::Modal,
+                                            )
+                                            .child(modal_header(title_hdr, close_btn))
+                                            .child(
+                                                view().w_full().overflow_hidden().child(
+                                                    scroll()
+                                                        .w_full()
+                                                        .max_h(move || {
+                                                            px((window().height.0 * 0.68)
+                                                                .max(220.0))
+                                                        })
+                                                        .child(body),
+                                                ),
+                                            ),
+                                        ),
+                                )
+                        },
+                    )
+                    .into_element()
+                }
             }
-        }
-    }))
+        }))
 }
 
 /// Shows a native confirmation alert dialog for destructive actions (Delete Playlist, Remove Plugin).
@@ -248,7 +372,10 @@ fn modal_header(title: Reactive<SharedString>, on_close: Rc<dyn Fn()>) -> View {
             Icon::Close,
             theme::muted_fg,
             "Close",
-            move || on_close(),
+            move || {
+                dismiss_keyboard();
+                on_close();
+            },
         ))
 }
 
@@ -431,14 +558,22 @@ pub fn toast_overlay(controller: ToastController) -> impl IntoElement {
     overlay()
         .inset_0()
         .pointer_events(PointerEvents::BoxNone)
-        .p_4()
+        .pt(move || px(safe_area().top.0 + 12.0))
+        .pl(move || px(safe_area().left.0 + 16.0))
+        .pr(move || px(safe_area().right.0 + 16.0))
         .pb(move || {
-            let extra = if theme::detect_device_form().is_phone() {
-                84.0
+            let bottom = safe_area().bottom.0;
+            let kb = keyboard_height().0;
+            if kb > bottom + 20.0 {
+                px(kb + 16.0)
             } else {
-                96.0
-            };
-            px(safe_area().bottom.0 + extra)
+                let extra = if theme::detect_device_form().is_phone() {
+                    84.0
+                } else {
+                    96.0
+                };
+                px(bottom + extra)
+            }
         })
         .items_end()
         .justify_end()
@@ -630,8 +765,17 @@ fn menu_popup_style(s: StyleRefinement, desktop_min_w: f32) -> StyleRefinement {
             .border_t_1()
             .border_color(theme::border)
             .pt_2()
-            .px_2()
-            .pb(move || px(safe_area().bottom.0 + 12.0))
+            .pl(move || px(safe_area().left.0 + 8.0))
+            .pr(move || px(safe_area().right.0 + 8.0))
+            .pb(move || {
+                let kb = keyboard_height().0;
+                let bottom = safe_area().bottom.0;
+                if kb > bottom + 20.0 {
+                    px(12.0)
+                } else {
+                    px(bottom + 14.0)
+                }
+            })
             .elevation(Elevation::Popover)
     }
 }

@@ -303,8 +303,8 @@ fn pad_stage(store: AppStore, form: DeviceForm, landscape: bool) -> View {
         .flex_1()
         .w_full()
         .h_full()
-        .pt_safe_area_plus(px(10.0))
-        .pb_safe_area_plus(px(14.0))
+        .pt(move || px(safe_area().top.0 + 10.0))
+        .pb(move || px(keyboard_height().0.max(safe_area().bottom.0) + 14.0))
         .pl(move || px(safe_area().left.0 + side_pad))
         .pr(move || px(safe_area().right.0 + side_pad))
         .gap_3()
@@ -455,7 +455,11 @@ fn phone_sheet_stage(store: AppStore, form: DeviceForm) -> View {
         }
     });
     let is_art = computed(move || section.get() == PhoneSection::Art);
+    let kb_open = computed(move || keyboard_height().0 > safe_area().bottom.0 + 24.0);
     let show_bottom_scrubber = computed(move || {
+        if kb_open.get() {
+            return false;
+        }
         let sec = section.get();
         sec != PhoneSection::Stage
             && !(sec == PhoneSection::More && more_subpanel.get() == PhoneMoreSubpanel::Wall)
@@ -481,8 +485,14 @@ fn phone_sheet_stage(store: AppStore, form: DeviceForm) -> View {
         .flex_1()
         .w_full()
         .h_full()
-        .pt_safe_area_plus(px(6.0))
-        .pb_safe_area_plus(px(14.0))
+        .pt(move || px(safe_area().top.0 + 6.0))
+        .pb(move || {
+            if kb_open.get() {
+                px(keyboard_height().0 + 8.0)
+            } else {
+                px(safe_area().bottom.0 + 14.0)
+            }
+        })
         .pl(move || px(safe_area().left.0))
         .pr(move || px(safe_area().right.0))
         .gap_2()
@@ -519,7 +529,7 @@ fn phone_sheet_stage(store: AppStore, form: DeviceForm) -> View {
         )
         // Compact mini track bar on non-Cover Phone tabs so track identity & quick pause stay visible
         .child(when(
-            move || section.get() != PhoneSection::Art,
+            move || section.get() != PhoneSection::Art && !kb_open.get(),
             move || phone_mini_track_bar(store, section),
         ))
         // Primary adaptive stage viewport

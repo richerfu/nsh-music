@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
-use nsh_core::geometry::{Points, Size};
+use nsh_core::geometry::{Edges, Points, Size};
 use nsh_core::platform::{Idiom, Os};
 use nsh_engine::{EngineConfig, Environment, Root};
 use nsh_music_core::local::LocalMusicSource;
@@ -411,6 +411,26 @@ export async function account() {
 }
 
 fn start_viewport(width: f32, height: f32, os: Os, idiom: Idiom) -> Headless {
+    start_viewport_with_env(
+        width,
+        height,
+        os,
+        idiom,
+        Edges::default(),
+        Points(0.0),
+        false,
+    )
+}
+
+fn start_viewport_with_env(
+    width: f32,
+    height: f32,
+    os: Os,
+    idiom: Idiom,
+    safe_area: Edges<Points>,
+    keyboard_height: Points,
+    reduce_motion: bool,
+) -> Headless {
     let viewport = Size::new(Points(width), Points(height));
     let root = Root::of::<nsh_app_music::App>()
         .tokens(nsh_app_music::app_tokens())
@@ -420,6 +440,9 @@ fn start_viewport(width: f32, height: f32, os: Os, idiom: Idiom) -> Headless {
         window: viewport,
         os,
         idiom,
+        safe_area,
+        keyboard_height,
+        reduce_motion,
         ..Environment::default()
     };
 
@@ -431,6 +454,22 @@ fn start_viewport(width: f32, height: f32, os: Os, idiom: Idiom) -> Headless {
     app.wait_for("id:nsh-music-root")
         .expect("root container mounts");
     app
+}
+
+fn node_bounds(app: &Headless, test_id: &str) -> Result<(f32, f32, f32, f32), String> {
+    let nodes = app.screen().layout_nodes();
+    let Some(node) = nodes
+        .iter()
+        .find(|n| !n.hidden && n.test_id.as_deref() == Some(test_id))
+    else {
+        return Err(format!("missing visible LayoutNode `{test_id}`"));
+    };
+    Ok((
+        node.bounds.origin.x.0,
+        node.bounds.origin.y.0,
+        node.bounds.size.width.0,
+        node.bounds.size.height.0,
+    ))
 }
 
 fn check_min_bounds(app: &Headless, test_id: &str, min_w: f32, min_h: f32) -> Result<(), String> {
@@ -2722,5 +2761,242 @@ fn deep_link_install_plugin_closes_now_playing_and_stages_across_form_factors() 
                 .unwrap();
             std::thread::sleep(Duration::from_millis(300));
         }
+    }
+}
+
+#[test]
+fn mobile_ime_and_four_edge_safe_area_avoidance() {
+    let _guard = IsolatedStateGuard::acquire();
+
+    // (a) & (b) Portrait Phone (390x844, safe_area top=47, bottom=34):
+    // Verify 4-edge safe-area clearance, modal IME lift, and Phone shell IME avoidance.
+    {
+        let portrait_insets = Edges {
+            top: Points(47.0),
+            right: Points(0.0),
+            bottom: Points(34.0),
+            left: Points(0.0),
+        };
+        let mut app = start_viewport_with_env(
+            390.0,
+            844.0,
+            Os::Android,
+            Idiom::Phone,
+            portrait_insets,
+            Points(0.0),
+            true,
+        );
+        app.wait_for("id:shell-phone").unwrap();
+        app.wait_for("id:phone-header").unwrap();
+        app.wait_for("id:phone-tab-bar").unwrap();
+
+        // Top safe-area clearance: header interactive content starts below 47pt inset.
+        let (_, header_y, _, header_h) = node_bounds(&app, "phone-header").unwrap();
+        let (_, search_btn_y, _, _) = node_bounds(&app, "phone-search-btn").unwrap();
+        assert!(
+            header_y <= 0.5 && header_h >= 47.0 + 44.0 - 0.5,
+            "phone-header must span top safe area + controls, got y={header_y:.1} h={header_h:.1}"
+        );
+        assert!(
+            search_btn_y >= 47.0 - 0.5,
+            "phone-header content must clear safe_area.top (47pt), got y={search_btn_y:.1}"
+        );
+
+        // Bottom safe-area clearance: tab bar items sit strictly above 34pt bottom inset.
+        let (_, tab_bar_y, _, tab_bar_h) = node_bounds(&app, "phone-tab-bar").unwrap();
+        let (_, tab_home_y, _, tab_home_h) = node_bounds(&app, "tab-home").unwrap();
+        assert!(
+            tab_bar_y + tab_bar_h <= 844.0 + 0.5 && tab_bar_h >= 34.0 + 44.0 - 0.5,
+            "phone-tab-bar must include safe_area.bottom (34pt), got y={tab_bar_y:.1} h={tab_bar_h:.1}"
+        );
+        assert!(
+            tab_home_y + tab_home_h <= 844.0 - 34.0 + 0.5,
+            "tab-home must sit above safe_area.bottom (810pt), got bottom={:.1}",
+            tab_home_y + tab_home_h
+        );
+
+        // (a) Modal IME avoidance: InstallPlugin sheet lifts input & submit 100% above 336pt IME.
+        app.press("id:tab-settings").unwrap();
+        app.wait_for("id:phone-settings-plugins").unwrap();
+        app.press("id:phone-settings-plugins").unwrap();
+        app.wait_for("id:phone-plugins-install-btn").unwrap();
+        app.press("id:phone-plugins-install-btn").unwrap();
+        app.wait_for("id:install-plugin-input").unwrap();
+        app.wait_for("id:install-plugin-submit").unwrap();
+
+        let (_, submit_y_closed, _, submit_h_closed) =
+            node_bounds(&app, "install-plugin-submit").unwrap();
+        let submit_bottom_closed = submit_y_closed + submit_h_closed;
+
+        app.set_environment("showSoftKeyboard(336)", |env| {
+            env.keyboard_height = Points(336.0);
+        })
+        .unwrap();
+
+        let (_, input_y, _, input_h) = node_bounds(&app, "install-plugin-input").unwrap();
+        let (_, submit_y, _, submit_h) = node_bounds(&app, "install-plugin-submit").unwrap();
+        let ime_top = 844.0 - 336.0;
+        assert!(
+            input_y >= 47.0 - 0.5 && input_y + input_h <= ime_top + 0.5,
+            "install-plugin-input must sit between safe_area.top (47pt) and IME top ({ime_top:.1}pt), got [{input_y:.1}, {:.1}]",
+            input_y + input_h
+        );
+        assert!(
+            submit_y + submit_h <= ime_top + 0.5,
+            "install-plugin-submit must sit 100% above 336pt keyboard ({ime_top:.1}pt), got bottom={:.1}",
+            submit_y + submit_h
+        );
+        assert!(
+            submit_y + submit_h < submit_bottom_closed - 200.0,
+            "install-plugin-submit should lift significantly above IME (closed={submit_bottom_closed:.1}, open={:.1})",
+            submit_y + submit_h
+        );
+
+        // Dismiss InstallPlugin modal and hide keyboard.
+        app.press("role:button[取消]").unwrap();
+        app.wait_for_gone("id:install-plugin-input", GONE_TIMEOUT)
+            .unwrap();
+        app.set_environment("hideSoftKeyboard()", |env| {
+            env.keyboard_height = Points(0.0);
+        })
+        .unwrap();
+
+        // (b) Phone Shell IME avoidance:
+        // Return to Route::Home -> raising IME hides `phone-tab-bar` and shrinks viewport above IME;
+        // lowering IME restores `phone-tab-bar`.
+        app.press("id:phone-back-btn").unwrap();
+        app.wait_for("id:tab-home").unwrap();
+        app.press("id:tab-home").unwrap();
+        app.wait_for("id:phone-tab-bar").unwrap();
+
+        app.set_environment("showSoftKeyboardOnHome(336)", |env| {
+            env.keyboard_height = Points(336.0);
+        })
+        .unwrap();
+        app.wait_for_gone("id:phone-tab-bar", GONE_TIMEOUT).unwrap();
+        let (_, vp_y, _, vp_h) = node_bounds(&app, "phone-main-viewport").unwrap();
+        assert!(
+            vp_y + vp_h <= ime_top + 0.5,
+            "phone-main-viewport must end at/above IME top ({ime_top:.1}pt), got bottom={:.1}",
+            vp_y + vp_h
+        );
+
+        app.set_environment("hideSoftKeyboardOnHome()", |env| {
+            env.keyboard_height = Points(0.0);
+        })
+        .unwrap();
+        app.wait_for("id:phone-tab-bar").unwrap();
+
+        // Open Route::Search -> raising IME keeps `phone-tab-bar` hidden and `search-page-input` above 508pt.
+        app.press("id:phone-search-btn").unwrap();
+        app.wait_for("id:search-page-input").unwrap();
+        app.set_environment("showSoftKeyboardOnSearch(336)", |env| {
+            env.keyboard_height = Points(336.0);
+        })
+        .unwrap();
+        assert!(
+            !app.screen().matches("id:phone-tab-bar").unwrap(),
+            "phone-tab-bar must stay hidden while IME is up on Route::Search"
+        );
+        let (_, search_y, _, search_h) = node_bounds(&app, "search-page-input").unwrap();
+        let (_, search_vp_y, _, search_vp_h) = node_bounds(&app, "phone-main-viewport").unwrap();
+        assert!(
+            search_y + search_h <= ime_top + 0.5,
+            "search-page-input must sit above IME top ({ime_top:.1}pt), got bottom={:.1}",
+            search_y + search_h
+        );
+        assert!(
+            search_vp_y + search_vp_h <= ime_top + 0.5,
+            "Route::Search phone-main-viewport must end above IME top ({ime_top:.1}pt), got bottom={:.1}",
+            search_vp_y + search_vp_h
+        );
+
+        // Return to Route::Home and dismiss keyboard -> `phone-tab-bar` restores cleanly.
+        app.press("id:phone-back-btn").unwrap();
+        app.set_environment("hideSoftKeyboardAfterSearch()", |env| {
+            env.keyboard_height = Points(0.0);
+        })
+        .unwrap();
+        app.wait_for("id:phone-tab-bar").unwrap();
+    }
+
+    // (c) Landscape Mobile Phone (932x430 >= 900pt width on iOS & 853x393 on Android):
+    // Must stay in `shell-phone` (NEVER `desktop-shell` or `shell-pad-*`) and respect left/right/bottom safe areas.
+    for (os, width, height, left, right, bottom) in [
+        (Os::Ios, 932.0_f32, 430.0_f32, 59.0_f32, 59.0_f32, 21.0_f32),
+        (
+            Os::Android,
+            853.0_f32,
+            393.0_f32,
+            44.0_f32,
+            44.0_f32,
+            24.0_f32,
+        ),
+    ] {
+        let landscape_insets = Edges {
+            top: Points(0.0),
+            right: Points(right),
+            bottom: Points(bottom),
+            left: Points(left),
+        };
+        let mut app = start_viewport_with_env(
+            width,
+            height,
+            os,
+            Idiom::Phone,
+            landscape_insets,
+            Points(0.0),
+            true,
+        );
+        app.wait_for("id:shell-phone").unwrap();
+        assert!(
+            !app.screen().matches("id:desktop-shell").unwrap(),
+            "{os:?} landscape phone ({width}x{height}) must NOT mount desktop-shell"
+        );
+        assert!(
+            !app.screen().matches("id:shell-pad-landscape").unwrap(),
+            "{os:?} landscape phone ({width}x{height}) must NOT mount shell-pad-landscape"
+        );
+
+        // Header controls & bottom tab items must clear horizontal & bottom safe areas.
+        let (search_btn_x, _, search_btn_w, _) = node_bounds(&app, "phone-search-btn").unwrap();
+        assert!(
+            search_btn_x + search_btn_w <= width - right + 0.5,
+            "{os:?} landscape phone-search-btn must clear safe_area.right ({right}pt), got right={:.1}",
+            search_btn_x + search_btn_w
+        );
+        let (tab_home_x, tab_home_y, _, tab_home_h) = node_bounds(&app, "tab-home").unwrap();
+        let (tab_settings_x, _, tab_settings_w, _) = node_bounds(&app, "tab-settings").unwrap();
+        assert!(
+            tab_home_x >= left - 0.5,
+            "{os:?} landscape tab-home must clear safe_area.left ({left}pt), got x={tab_home_x:.1}"
+        );
+        assert!(
+            tab_settings_x + tab_settings_w <= width - right + 0.5,
+            "{os:?} landscape tab-settings must clear safe_area.right ({right}pt), got right={:.1}",
+            tab_settings_x + tab_settings_w
+        );
+        assert!(
+            tab_home_y + tab_home_h <= height - bottom + 0.5,
+            "{os:?} landscape tab-home must clear safe_area.bottom ({bottom}pt), got bottom={:.1}",
+            tab_home_y + tab_home_h
+        );
+
+        // Secondary route (`Search`) header back button and `page_scroll` input must clear left/right safe areas.
+        app.press("id:phone-search-btn").unwrap();
+        app.wait_for("id:phone-back-btn").unwrap();
+        app.wait_for("id:search-page-input").unwrap();
+
+        let (back_x, _, _, _) = node_bounds(&app, "phone-back-btn").unwrap();
+        let (search_x, _, search_w, _) = node_bounds(&app, "search-page-input").unwrap();
+        assert!(
+            back_x >= left - 0.5,
+            "{os:?} landscape phone-back-btn must clear safe_area.left ({left}pt), got x={back_x:.1}"
+        );
+        assert!(
+            search_x >= left - 0.5 && search_x + search_w <= width - right + 0.5,
+            "{os:?} landscape search-page-input must clear safe_area left/right ({left}/{right}pt), got [{search_x:.1}, {:.1}]",
+            search_x + search_w
+        );
     }
 }

@@ -89,6 +89,13 @@ pub fn detect_device_form() -> DeviceForm {
     let h = win.height.0;
     let current_idiom = idiom();
 
+    if !os().is_desktop() {
+        if current_idiom == Idiom::Phone || w.min(h) < 600.0 {
+            return DeviceForm::Phone;
+        }
+        return DeviceForm::Pad { landscape: w >= h };
+    }
+
     if w < 600.0 {
         return DeviceForm::Phone;
     }

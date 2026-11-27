@@ -33,6 +33,7 @@
     }
   },
   "android": {
+    "usesCleartextTraffic": true,
     "permissions": [
       "INTERNET",
       "FOREGROUND_SERVICE",

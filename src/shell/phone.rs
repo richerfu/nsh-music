@@ -29,9 +29,11 @@ const MINI_PLAYER_HEIGHT: f32 = 64.0;
 pub fn phone_shell(store: AppStore) -> View {
     on_back_press(move || {
         if !matches!(store.active_modal.get_untracked(), ActiveModal::None) {
+            dismiss_keyboard();
             store.close_modal();
             true
         } else if store.now_playing_open.get_untracked() {
+            dismiss_keyboard();
             store.close_now_playing();
             true
         } else if store.mobile_drawer_open.get_untracked() {
@@ -42,18 +44,27 @@ pub fn phone_shell(store: AppStore) -> View {
         }
     });
 
+    let kb_open = computed(move || keyboard_height().0 > safe_area().bottom.0 + 24.0);
+
     view()
         .test_id("shell-phone")
         .flex_1()
         .w_full()
         .h_full()
+        .pb(move || {
+            if kb_open.get() {
+                px(keyboard_height().0)
+            } else {
+                px(0.0)
+            }
+        })
         .bg(theme::bg)
         .text_color(theme::fg)
         .child(phone_top_header(store))
         .child(phone_main_viewport(store))
-        .child(phone_mini_player(store))
-        .child(phone_bottom_tabs(store))
-        .child(phone_bottom_safe_inset(store))
+        .child(phone_mini_player(store, kb_open))
+        .child(phone_bottom_tabs(store, kb_open))
+        .child(phone_bottom_safe_inset(store, kb_open))
 }
 
 fn phone_refresh_button(store: AppStore) -> impl IntoElement {
@@ -275,10 +286,10 @@ fn phone_main_viewport(store: AppStore) -> View {
         .child(pages::render_route(store, DeviceForm::Phone))
 }
 
-fn phone_mini_player(store: AppStore) -> impl IntoElement {
-    let has_track = computed(move || store.current_track.with(Option::is_some));
+fn phone_mini_player(store: AppStore, kb_open: Memo<bool>) -> impl IntoElement {
+    let show_mini = computed(move || !kb_open.get() && store.current_track.with(Option::is_some));
 
-    when(has_track, move || {
+    when(show_mini, move || {
         let track_seed = computed(move || {
             store.current_track.with(|t| match t {
                 Some(tr) if !tr.album.id.is_empty() => SharedString::from(tr.album.id.clone()),
@@ -649,9 +660,9 @@ fn phone_mini_player(store: AppStore) -> impl IntoElement {
     })
 }
 
-fn phone_bottom_tabs(store: AppStore) -> impl IntoElement {
+fn phone_bottom_tabs(store: AppStore, kb_open: Memo<bool>) -> impl IntoElement {
     when(
-        move || !store.route.with(AppStore::is_phone_secondary_route),
+        move || !kb_open.get() && !store.route.with(AppStore::is_phone_secondary_route),
         move || {
             view()
                 .test_id("phone-tab-bar")
@@ -731,9 +742,10 @@ fn phone_bottom_tabs(store: AppStore) -> impl IntoElement {
     )
 }
 
-fn phone_bottom_safe_inset(store: AppStore) -> impl IntoElement {
+fn phone_bottom_safe_inset(store: AppStore, kb_open: Memo<bool>) -> impl IntoElement {
     let needs_spacer = computed(move || {
-        store.route.with(AppStore::is_phone_secondary_route)
+        !kb_open.get()
+            && store.route.with(AppStore::is_phone_secondary_route)
             && store.current_track.with(Option::is_none)
     });
 

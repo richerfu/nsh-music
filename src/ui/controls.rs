@@ -655,12 +655,32 @@ pub fn styled_select(
         .margin(px(8.0))
         .backdrop_style(|s| s.bg(theme::scrim))
         .popup_style(|s| {
-            s.p_1p5()
-                .rounded(px(radius::LG))
-                .border_1()
-                .border_color(theme::border)
-                .bg(theme::popover)
-                .elevation(Elevation::Popover)
+            if os().is_desktop() {
+                s.p_1p5()
+                    .rounded(px(radius::LG))
+                    .border_1()
+                    .border_color(theme::border)
+                    .bg(theme::popover)
+                    .elevation(Elevation::Popover)
+            } else {
+                s.rounded_t(px(radius::SHEET))
+                    .bg(theme::card_elevated)
+                    .border_t_1()
+                    .border_color(theme::border)
+                    .pt_2()
+                    .pl(move || px(safe_area().left.0 + 8.0))
+                    .pr(move || px(safe_area().right.0 + 8.0))
+                    .pb(move || {
+                        let kb = keyboard_height().0;
+                        let bottom = safe_area().bottom.0;
+                        if kb > bottom + 20.0 {
+                            px(12.0)
+                        } else {
+                            px(bottom + 14.0)
+                        }
+                    })
+                    .elevation(Elevation::Popover)
+            }
         })
         .item_class("rounded-md focus:bg-accent selected:font-semibold disabled:opacity-45")
         .render_item(|item: &SelectEntry| {

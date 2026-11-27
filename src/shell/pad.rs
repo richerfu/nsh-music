@@ -31,12 +31,14 @@ const PAD_DOCK_HEIGHT: f32 = 72.0;
 pub fn pad_shell(store: AppStore, landscape: bool) -> View {
     on_back_press(move || {
         if !matches!(store.active_modal.get_untracked(), ActiveModal::None) {
+            dismiss_keyboard();
             store.close_modal();
             true
         } else if store.mobile_drawer_open.get_untracked() {
             store.set_mobile_drawer_open(false);
             true
         } else if store.now_playing_open.get_untracked() {
+            dismiss_keyboard();
             store.close_now_playing();
             true
         } else {
@@ -45,6 +47,7 @@ pub fn pad_shell(store: AppStore, landscape: bool) -> View {
     });
 
     let form = DeviceForm::Pad { landscape };
+    let kb_open = computed(move || keyboard_height().0 > safe_area().bottom.0 + 24.0);
 
     view()
         .test_id(if landscape {
@@ -58,14 +61,14 @@ pub fn pad_shell(store: AppStore, landscape: bool) -> View {
         .bg(theme::bg)
         .text_color(theme::fg)
         .child(if landscape {
-            pad_landscape_body(store, form)
+            pad_landscape_body(store, form, kb_open)
         } else {
-            pad_portrait_body(store, form)
+            pad_portrait_body(store, form, kb_open)
         })
         .child(pad_drawer_sheet(store))
 }
 
-fn pad_landscape_body(store: AppStore, form: DeviceForm) -> View {
+fn pad_landscape_body(store: AppStore, form: DeviceForm, kb_open: Memo<bool>) -> View {
     view()
         .flex_1()
         .w_full()
@@ -79,18 +82,24 @@ fn pad_landscape_body(store: AppStore, form: DeviceForm) -> View {
                 .h_full()
                 .child(pad_top_bar(store, false))
                 .child(pad_main_viewport(store, form))
-                .child(pad_floating_player_dock(store, true)),
+                .child(when(
+                    move || !kb_open.get(),
+                    move || pad_floating_player_dock(store, true),
+                )),
         )
 }
 
-fn pad_portrait_body(store: AppStore, form: DeviceForm) -> View {
+fn pad_portrait_body(store: AppStore, form: DeviceForm, kb_open: Memo<bool>) -> View {
     view()
         .flex_1()
         .w_full()
         .h_full()
         .child(pad_top_bar(store, true))
         .child(pad_main_viewport(store, form))
-        .child(pad_floating_player_dock(store, false))
+        .child(when(
+            move || !kb_open.get(),
+            move || pad_floating_player_dock(store, false),
+        ))
 }
 
 fn pad_left_rail(store: AppStore) -> View {

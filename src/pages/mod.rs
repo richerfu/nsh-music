@@ -821,12 +821,25 @@ pub(crate) fn page_scroll(form: DeviceForm, content: View) -> View {
                     })
                     .pt(px(pad_top))
                     .pb(move || {
-                        px(pad_bottom
-                            + if form.is_desktop() {
-                                0.0
-                            } else {
-                                safe_area().bottom.0
-                            })
+                        let kb = keyboard_height().0;
+                        let kb_open = kb > safe_area().bottom.0 + 24.0;
+                        match form {
+                            DeviceForm::Desktop => px(pad_bottom),
+                            DeviceForm::Phone => {
+                                if kb_open {
+                                    px(24.0)
+                                } else {
+                                    px(pad_bottom + safe_area().bottom.0)
+                                }
+                            }
+                            DeviceForm::Pad { .. } => {
+                                if kb_open {
+                                    px(28.0 + kb)
+                                } else {
+                                    px(pad_bottom + safe_area().bottom.0)
+                                }
+                            }
+                        }
                     })
                     .gap_6()
                     .child(content),
