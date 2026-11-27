@@ -151,8 +151,20 @@ impl VirtualProcessShim for FfmpegVirtualShim {
     }
 }
 
+fn is_rooted_or_abs_command(cmd: &str) -> bool {
+    let bytes = cmd.as_bytes();
+    let has_windows_drive = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\');
+    Path::new(cmd).is_absolute()
+        || cmd.starts_with('/')
+        || cmd.starts_with('\\')
+        || has_windows_drive
+}
+
 pub(crate) fn resolve_relative_command(plugin_dir: &Path, cmd: &str) -> String {
-    if (cmd.contains('/') || cmd.contains('\\')) && !Path::new(cmd).is_absolute() {
+    if (cmd.contains('/') || cmd.contains('\\')) && !is_rooted_or_abs_command(cmd) {
         plugin_dir.join(cmd).to_string_lossy().into_owned()
     } else {
         cmd.to_owned()
@@ -378,11 +390,15 @@ mod tests {
         assert_eq!(resolve_relative_command(pdir, "ffmpeg"), "ffmpeg");
         assert_eq!(
             resolve_relative_command(pdir, "bin/helper"),
-            "/plugins/sample/bin/helper"
+            pdir.join("bin/helper").to_string_lossy().as_ref()
         );
         assert_eq!(
             resolve_relative_command(pdir, "/usr/local/bin/tool"),
             "/usr/local/bin/tool"
+        );
+        assert_eq!(
+            resolve_relative_command(pdir, r"C:\tools\helper.exe"),
+            r"C:\tools\helper.exe"
         );
 
         let help_args: Vec<String> = ["-hide_banner", "-h", "protocol=http"]

@@ -659,8 +659,7 @@ fn patterns_allow_process(
     let cleaned_command = if bare {
         cmd_trimmed.to_owned()
     } else {
-        let raw_path = Path::new(cmd_trimmed);
-        let full = if raw_path.is_absolute() || starts_with_windows_drive(cmd_trimmed) {
+        let full = if is_rooted_or_abs(cmd_trimmed) {
             cmd_trimmed.to_owned()
         } else {
             join_normalized_path(plugin_dir, cmd_trimmed)
@@ -684,7 +683,7 @@ fn patterns_allow_process(
         let mut pattern_cmp = if bare {
             pat.to_owned()
         } else {
-            let full = if Path::new(pat).is_absolute() || starts_with_windows_drive(pat) {
+            let full = if is_rooted_or_abs(pat) {
                 pat.to_owned()
             } else {
                 join_normalized_path(plugin_dir, pat)
@@ -710,6 +709,13 @@ fn patterns_allow_process(
     }
 
     false
+}
+
+fn is_rooted_or_abs(p: &str) -> bool {
+    Path::new(p).is_absolute()
+        || p.starts_with('/')
+        || p.starts_with('\\')
+        || starts_with_windows_drive(p)
 }
 
 fn starts_with_windows_drive(p: &str) -> bool {
@@ -1118,7 +1124,7 @@ mod tests {
         assert!(m_scoped.allows_process(pdir, "/opt/homebrew/bin/yt-dlp"));
         assert!(!m_scoped.allows_process(pdir, "yt-dlp"));
 
-        // Windows case-insensitive + bare `.exe` matching.
+        // Windows case-insensitive + bare `.exe` + drive-letter path matching.
         assert!(patterns_allow_process(
             &["ffmpeg".to_owned()],
             pdir,
@@ -1129,6 +1135,25 @@ mod tests {
             &["ffmpeg.bat".to_owned()],
             pdir,
             "ffmpeg.exe",
+            true
+        ));
+        let win_pdir = Path::new(r"C:\plugins\p-scoped");
+        assert!(patterns_allow_process(
+            &["bin/helper-*".to_owned()],
+            win_pdir,
+            r"bin\helper-win.exe",
+            true
+        ));
+        assert!(patterns_allow_process(
+            &["bin/helper-*".to_owned()],
+            win_pdir,
+            r"C:\plugins\p-scoped\bin\helper-win.exe",
+            true
+        ));
+        assert!(!patterns_allow_process(
+            &["bin/helper-*".to_owned()],
+            win_pdir,
+            r"C:\evil\bin\helper-win.exe",
             true
         ));
     }
