@@ -77,7 +77,7 @@ Every plugin executes in its own isolated QuickJS worker thread with `globalThis
 
 | API | Methods / Fields | Notes |
 |---|---|---|
-| `host.fetch(url, opts?)` | Returns `{ ok, status, statusText, url, headers, body, text(), json(), bytes() }` | Backed by Rust `reqwest` (`rustls-tls`, zero OpenSSL); auto-applies `requestHeaders` (`Api` kind) |
+| `host.fetch(url, opts?)` | Returns `{ ok, status, statusText, url, redirected, bodyUsed, headers, body, text(), json(), bytes(), arrayBuffer(), clone() }` | Backed by Rust `reqwest` (`rustls-tls`, zero OpenSSL); auto-applies `requestHeaders` (`Api` kind); supports `redirect: "follow" \| "manual" \| "error"`, `AbortSignal`, `URLSearchParams` bodies, and Web Fetch `ReadableStream` `response.body` (`locked`, `getReader()` -> `read()`/`cancel()`/`releaseLock()`/`closed`, `body.cancel()`, `[Symbol.asyncIterator]()`) |
 | `host.storage` | `get(k)`, `set(k, v)`, `remove(k)`, `keys()`, `clear()` | Persisted atomically per plugin (`<data_dir>/<plugin_id>/storage.json`) |
 | `host.config` (`host.settings`) | `get(k, def?)`, `set(k, v)`, `all()` | Persisted per plugin; drives `{{config.xxx}}` header templates |
 | `host.crypto` | `md5`, `sha256`, `hmacSha256`, `aesEcbEncrypt`, `aesEcbDecrypt`, `aesCbcEncrypt`, `aesCbcDecrypt`, `base64Encode`, `base64Decode`, `base64UrlEncode`, `base64UrlDecode`, `hexEncode`, `hexDecode` | 100% pure Rust (AES-128/192/256 PKCS#7, FIPS-180-4 SHA-256, RFC 2104 HMAC) |
@@ -88,6 +88,15 @@ Every plugin executes in its own isolated QuickJS worker thread with `globalThis
 | `host.webSignIn(opts)` | `{ url, title?, incognito?, userAgent?, evalJs?, cookieNames?, allowManualCookie? }` | Invokes native embedded `web_view()` via `SignInPromptCallback` / `WebSignInHandler` |
 | `host.prompt({ qr, text })` | Emits QR code / instruction prompt to UI | Used by NetEase / Bilibili / QQ QR-code login flows |
 | `host.sleep(ms)` | Returns `Promise<void>` | Non-blocking Tokio timer |
+
+### Web Standard Globals / Web 标准全局 API
+
+In addition to `globalThis.host`, the plugin QuickJS VM provides standard Web APIs so modern bundled plugins run without Node.js shims:
+
+- **`fetch(input, init?)`**: Alias of `host.fetch` returning a Web Fetch response with `ReadableStream`-compatible `response.body` (`getReader()`, `cancel()`, `locked`, `[Symbol.asyncIterator]()`), `text()`, `json()`, `bytes()` (`Uint8Array`), `arrayBuffer()`, `clone()`, `bodyUsed`, `redirected`, `headers.getSetCookie()`, `AbortSignal` cancellation, and `redirect: "follow" | "manual" | "error"`.
+- **`TextEncoder` / `TextDecoder`**: Stateful UTF-8 `TextDecoder(label?, { fatal?, ignoreBOM? })` supporting `{ stream: true }` multi-byte UTF-8 buffering across chunk boundaries (`ArrayBuffer` and any `ArrayBufferView`).
+- **`crypto`**: `crypto.getRandomValues(typedArray)` (OS CSPRNG-backed integer `TypedArray` fill, 65,536-byte quota) and `crypto.randomUUID()` (RFC 4122 v4).
+- **`URL` / `URLSearchParams` / `AbortController` / `AbortSignal` / `structuredClone` / `atob` / `btoa` / `setTimeout` / `setInterval`**: Built-in cancellable timers and Web URL/Abort primitives.
 
 ---
 

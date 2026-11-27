@@ -277,6 +277,75 @@ pub struct NavItem {
     pub icon: String,
 }
 
+/// Deserializes an `i64` leniently from JSON integers, finite floats (rounded, e.g. from Go/JS
+/// `float64`/`Number`), numeric strings, or `null` (`0`).
+fn deserialize_i64_lenient<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct LenientI64Visitor;
+
+    impl<'de> serde::de::Visitor<'de> for LenientI64Visitor {
+        type Value = i64;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an integer, finite number, numeric string, or null")
+        }
+
+        fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E> {
+            Ok(v)
+        }
+
+        fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            i64::try_from(v).map_err(|_| E::custom(format!("integer out of i64 range: {v}")))
+        }
+
+        fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            if !v.is_finite() {
+                return Err(E::custom("non-finite float cannot be converted to i64"));
+            }
+            let rounded = v.round();
+            if rounded < (i64::MIN as f64) || rounded >= 9_223_372_036_854_775_808.0 {
+                return Err(E::custom(format!("float out of i64 range: {v}")));
+            }
+            Ok(rounded as i64)
+        }
+
+        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            let trimmed = v.trim();
+            if trimmed.is_empty() {
+                return Ok(0);
+            }
+            if let Ok(i) = trimmed.parse::<i64>() {
+                return Ok(i);
+            }
+            let f = trimmed
+                .parse::<f64>()
+                .map_err(|_| E::custom(format!("invalid numeric string: {v}")))?;
+            self.visit_f64(f)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(0)
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E> {
+            Ok(0)
+        }
+    }
+
+    deserializer.deserialize_any(LenientI64Visitor)
+}
+
 /// Stream response returned by a playback=stream source.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -285,7 +354,9 @@ pub struct StreamInfo {
     #[serde(rename = "type")]
     pub media_type: String,
     pub quality: String,
+    #[serde(deserialize_with = "deserialize_i64_lenient")]
     pub bit_rate: i64,
+    #[serde(deserialize_with = "deserialize_i64_lenient")]
     pub size: i64,
     pub peak: f64,
     pub gain: f64,
@@ -522,5 +593,60 @@ impl SourceError {
             Self::SignIn(r) | Self::Setup(r) | Self::Unavailable(r) | Self::Message(r) => r,
             Self::Unsupported => "unsupported",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_info_deserializes_floats_strings_and_null_leniently() {
+        let from_floats: StreamInfo = serde_json::from_str(
+            r#"{
+                "url": "http://127.0.0.1:43210/track",
+                "type": "flac",
+                "quality": "lossless",
+                "bitRate": 320128.6,
+                "size": 1048576.0
+            }"#,
+        )
+        .expect("float bitRate and size should deserialize");
+        assert_eq!(from_floats.bit_rate, 320_129);
+        assert_eq!(from_floats.size, 1_048_576);
+        assert_eq!(from_floats.media_type, "flac");
+
+        let from_strings: StreamInfo = serde_json::from_str(
+            r#"{
+                "url": "https://cdn.example.com/a.m4a",
+                "type": "m4a",
+                "bitRate": "128000",
+                "size": "2048000.4"
+            }"#,
+        )
+        .expect("numeric string bitRate and size should deserialize");
+        assert_eq!(from_strings.bit_rate, 128_000);
+        assert_eq!(from_strings.size, 2_048_000);
+
+        let from_null_and_missing: StreamInfo = serde_json::from_str(
+            r#"{
+                "url": "https://cdn.example.com/b.mp3",
+                "bitRate": null
+            }"#,
+        )
+        .expect("null and omitted fields should default to 0");
+        assert_eq!(from_null_and_missing.bit_rate, 0);
+        assert_eq!(from_null_and_missing.size, 0);
+
+        let from_ints: StreamInfo = serde_json::from_str(
+            r#"{
+                "url": "https://cdn.example.com/c.mp3",
+                "bitRate": 320000,
+                "size": 4096
+            }"#,
+        )
+        .expect("integer bitRate and size should deserialize");
+        assert_eq!(from_ints.bit_rate, 320_000);
+        assert_eq!(from_ints.size, 4_096);
     }
 }

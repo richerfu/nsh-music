@@ -22,8 +22,8 @@ pub struct PluginOrigin {
     pub version: String,
 }
 
-/// Maximum uncompressed bytes extracted from a plugin ZIP archive (64 MiB).
-const MAX_ZIP_UNCOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum uncompressed bytes extracted from a plugin ZIP archive (256 MiB).
+const MAX_ZIP_UNCOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
 /// Maximum number of entries allowed in a plugin ZIP archive.
 const MAX_ZIP_ENTRIES: usize = 2048;
 

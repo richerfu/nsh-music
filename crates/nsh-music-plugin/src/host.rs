@@ -12,7 +12,9 @@ use nsh_music_audio::virtual_ffmpeg::VirtualProcessHandle;
 use nsh_music_core::model::SignInPrompt;
 use nsh_music_core::source::SignInPromptCallback;
 use rquickjs::function::{Opt, Rest};
-use rquickjs::{Array, Ctx, Error as JsError, Exception, Function, IntoJs, Object, Promise, Value};
+use rquickjs::{
+    Array, Ctx, Error as JsError, Exception, Function, IntoJs, Object, Promise, TypedArray, Value,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -791,13 +793,26 @@ pub struct SpawnOptions {
     pub env: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum FetchRedirectMode {
+    #[default]
+    Follow,
+    Manual,
+    Error,
+}
+
 #[derive(Debug, Default)]
 struct FetchOptions {
     method: String,
     headers: Vec<(String, String)>,
     body: Option<Vec<u8>>,
     timeout_ms: Option<u64>,
-    follow_redirects: bool,
+    redirect: FetchRedirectMode,
+}
+
+enum FetchError {
+    TypeError(String),
+    Message(String),
 }
 
 struct FetchResponseData {
@@ -805,6 +820,7 @@ struct FetchResponseData {
     status: u16,
     status_text: String,
     url: String,
+    redirected: bool,
     headers: HashMap<String, String>,
     set_cookies: Vec<String>,
     bytes: Vec<u8>,
@@ -1340,16 +1356,19 @@ impl HostContext {
         url: &str,
         opts: FetchOptions,
         mut abort_rx: tokio::sync::oneshot::Receiver<()>,
-    ) -> Result<FetchResponseData, String> {
-        let parsed_url = url::Url::parse(url).map_err(|e| format!("invalid URL `{url}`: {e}"))?;
+    ) -> Result<FetchResponseData, FetchError> {
+        let parsed_url = url::Url::parse(url)
+            .map_err(|e| FetchError::TypeError(format!("invalid URL `{url}`: {e}")))?;
         if !matches!(parsed_url.scheme(), "http" | "https") {
-            return Err(format!("unsupported URL scheme for `{url}`"));
+            return Err(FetchError::TypeError(format!(
+                "unsupported URL scheme for `{url}`"
+            )));
         }
         let host = parsed_url.host_str().unwrap_or("");
         if !self.is_network_host_allowed(host, true) {
-            return Err(format!(
+            return Err(FetchError::Message(format!(
                 "host `{host}` is not permitted by plugin network permission"
-            ));
+            )));
         }
 
         let method_str = if opts.method.is_empty() {
@@ -1357,13 +1376,13 @@ impl HostContext {
         } else {
             opts.method.as_str()
         };
-        let method = reqwest::Method::from_bytes(method_str.as_bytes())
-            .map_err(|e| format!("invalid HTTP method `{method_str}`: {e}"))?;
+        let method = reqwest::Method::from_bytes(method_str.as_bytes()).map_err(|e| {
+            FetchError::TypeError(format!("invalid HTTP method `{method_str}`: {e}"))
+        })?;
 
-        let client = if opts.follow_redirects {
-            &self.http_client
-        } else {
-            &self.no_redirect_client
+        let client = match opts.redirect {
+            FetchRedirectMode::Follow => &self.http_client,
+            FetchRedirectMode::Manual | FetchRedirectMode::Error => &self.no_redirect_client,
         };
 
         // Apply plugin manifest requestHeaders first, then let explicit opts.headers override.
@@ -1399,10 +1418,10 @@ impl HostContext {
         let req = build_req(&merged_headers, body_bytes.as_deref());
         let mut resp = tokio::select! {
             _ = &mut abort_rx => {
-                return Err("AbortError: The operation was aborted".to_owned());
+                return Err(FetchError::Message("AbortError: The operation was aborted".to_owned()));
             }
             sent = req.send() => {
-                sent.map_err(|e| format!("host.fetch failed for `{url}`: {e}"))?
+                sent.map_err(|e| FetchError::Message(format!("host.fetch failed for `{url}`: {e}")))?
             }
         };
 
@@ -1439,7 +1458,7 @@ impl HostContext {
             let retry_req = build_req(&anon_headers, body_bytes.as_deref());
             let retry_res = tokio::select! {
                 _ = &mut abort_rx => {
-                    return Err("AbortError: The operation was aborted".to_owned());
+                    return Err(FetchError::Message("AbortError: The operation was aborted".to_owned()));
                 }
                 sent = retry_req.send() => sent,
             };
@@ -1451,7 +1470,16 @@ impl HostContext {
         }
 
         let status = resp.status();
+        if opts.redirect == FetchRedirectMode::Error && status.is_redirection() {
+            return Err(FetchError::TypeError(format!(
+                "redirect blocked by redirect: \"error\" (HTTP {} for `{url}`)",
+                status.as_u16()
+            )));
+        }
+
         let final_url = resp.url().to_string();
+        let redirected =
+            opts.redirect == FetchRedirectMode::Follow && final_url != parsed_url.as_str();
         let mut headers = HashMap::new();
         for (k, v) in resp.headers() {
             if let Ok(val) = v.to_str() {
@@ -1474,10 +1502,10 @@ impl HostContext {
 
         let bytes = tokio::select! {
             _ = &mut abort_rx => {
-                return Err("AbortError: The operation was aborted".to_owned());
+                return Err(FetchError::Message("AbortError: The operation was aborted".to_owned()));
             }
             body = resp.bytes() => {
-                body.map_err(|e| format!("failed to read response body for `{url}`: {e}"))?
+                body.map_err(|e| FetchError::Message(format!("failed to read response body for `{url}`: {e}")))?
                     .to_vec()
             }
         };
@@ -1487,6 +1515,7 @@ impl HostContext {
             status: status.as_u16(),
             status_text: status.canonical_reason().unwrap_or("").to_owned(),
             url: final_url,
+            redirected,
             headers,
             set_cookies,
             bytes,
@@ -1761,7 +1790,10 @@ fn install_fetch<'js>(
             Promise::wrap_future(&ctx, async move {
                 let res = hc.perform_fetch(&url, parsed, abort_rx).await;
                 hc.clear_abort_token(req_id);
-                let data = res.map_err(|msg| Exception::throw_message(&ctx_inner, &msg))?;
+                let data = res.map_err(|err| match err {
+                    FetchError::TypeError(msg) => Exception::throw_type(&ctx_inner, &msg),
+                    FetchError::Message(msg) => Exception::throw_message(&ctx_inner, &msg),
+                })?;
                 build_fetch_response_js(&ctx_inner, data)
             })
         },
@@ -1785,7 +1817,7 @@ fn parse_fetch_opts<'js>(
 ) -> rquickjs::Result<FetchOptions> {
     let mut out = FetchOptions {
         method: "GET".to_owned(),
-        follow_redirects: true,
+        redirect: FetchRedirectMode::Follow,
         ..FetchOptions::default()
     };
     let Some(val) = opts else {
@@ -1805,10 +1837,22 @@ fn parse_fetch_opts<'js>(
     } else if let Ok(Some(ms)) = obj.get::<_, Option<u64>>("timeoutMs") {
         out.timeout_ms = Some(ms);
     }
-    if let Ok(Some(redir)) = obj.get::<_, Option<String>>("redirect")
-        && redir.eq_ignore_ascii_case("manual")
+    if let Ok(Some(redir_val)) = obj.get::<_, Option<Value<'js>>>("redirect")
+        && !redir_val.is_undefined()
     {
-        out.follow_redirects = false;
+        let redir = js_value_to_lossy_string(ctx, redir_val).unwrap_or_default();
+        out.redirect = if redir.eq_ignore_ascii_case("follow") {
+            FetchRedirectMode::Follow
+        } else if redir.eq_ignore_ascii_case("manual") {
+            FetchRedirectMode::Manual
+        } else if redir.eq_ignore_ascii_case("error") {
+            FetchRedirectMode::Error
+        } else {
+            return Err(Exception::throw_type(
+                ctx,
+                &format!("Invalid redirect mode: {redir}"),
+            ));
+        };
     }
     if let Ok(Some(headers_val)) = obj.get::<_, Option<Value<'js>>>("headers")
         && let Some(hobj) = headers_val.into_object()
@@ -1840,6 +1884,7 @@ fn build_fetch_response_js<'js>(
     resp.set("status", i32::from(data.status))?;
     resp.set("statusText", data.status_text)?;
     resp.set("url", data.url)?;
+    resp.set("redirected", data.redirected)?;
 
     let headers_obj = Object::new(ctx.clone())?;
     for (k, v) in &data.headers {
@@ -1898,56 +1943,10 @@ fn build_fetch_response_js<'js>(
     )?;
     resp.set("headers", headers_obj)?;
 
-    let body_text = String::from_utf8_lossy(&data.bytes).into_owned();
-    resp.set("body", body_text.clone())?;
-
-    let text_copy = body_text.clone();
-    resp.set(
-        "text",
-        Function::new(
-            ctx.clone(),
-            move |ctx: Ctx<'js>| -> rquickjs::Result<Promise<'js>> {
-                let s = text_copy.clone();
-                Promise::wrap_future(&ctx, async move { Ok::<String, JsError>(s) })
-            },
-        )?,
-    )?;
-
-    let json_copy = body_text;
-    resp.set(
-        "json",
-        Function::new(
-            ctx.clone(),
-            move |ctx: Ctx<'js>| -> rquickjs::Result<Promise<'js>> {
-                let s = json_copy.clone();
-                let c = ctx.clone();
-                Promise::wrap_future(&ctx, async move {
-                    c.json_parse(s.as_bytes()).map_err(|e| {
-                        Exception::throw_message(&c, &format!("invalid JSON body: {e}"))
-                    })
-                })
-            },
-        )?,
-    )?;
-
-    let bytes_copy = data.bytes;
-    resp.set(
-        "bytes",
-        Function::new(
-            ctx.clone(),
-            move |ctx: Ctx<'js>| -> rquickjs::Result<Promise<'js>> {
-                let b = bytes_copy.clone();
-                let c = ctx.clone();
-                Promise::wrap_future(&ctx, async move {
-                    let arr = Array::new(c)?;
-                    for (idx, byte) in b.into_iter().enumerate() {
-                        arr.set(idx, i32::from(byte))?;
-                    }
-                    Ok::<Array<'js>, JsError>(arr)
-                })
-            },
-        )?,
-    )?;
+    // Transfer raw bytes via native `TypedArray<u8>` (wrapped into a Web Fetch `ReadableStream`
+    // response object by `wrapFetchResponse` in `install_js_polyfills`).
+    let body_bytes = TypedArray::<u8>::new(ctx.clone(), data.bytes)?;
+    resp.set("bodyBytes", body_bytes)?;
 
     Ok(resp)
 }
@@ -3041,7 +3040,83 @@ async fn await_redirect_once(
     }
 }
 
+fn os_random_bytes(len: usize) -> Vec<u8> {
+    if len == 0 {
+        return Vec::new();
+    }
+    #[cfg(unix)]
+    {
+        if let Ok(mut f) = fs::File::open("/dev/urandom") {
+            let mut buf = vec![0u8; len];
+            if f.read_exact(&mut buf).is_ok() {
+                return buf;
+            }
+        }
+    }
+    // Cross-platform fallback (Windows or restricted sandbox): SHA-256 CTR seeded from
+    // fresh OS-seeded `RandomState` per block + monotonic counter + nanosecond timestamp.
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let mut out = Vec::with_capacity(len);
+    while out.len() < len {
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let mut h1 = RandomState::new().build_hasher();
+        h1.write_u64(seq);
+        h1.write_u128(now);
+        let mut h2 = RandomState::new().build_hasher();
+        h2.write_u64(h1.finish());
+        h2.write_u32(std::process::id());
+        let mut material = [0u8; 40];
+        material[..8].copy_from_slice(&h1.finish().to_le_bytes());
+        material[8..16].copy_from_slice(&h2.finish().to_le_bytes());
+        material[16..24].copy_from_slice(&seq.to_le_bytes());
+        material[24..40].copy_from_slice(&now.to_le_bytes());
+        let digest = crypto::sha256_bytes(&material);
+        let take = (len - out.len()).min(digest.len());
+        out.extend_from_slice(&digest[..take]);
+    }
+    out
+}
+
 fn install_js_polyfills<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<()> {
+    let globals = ctx.globals();
+    globals.set(
+        "__nshRandomBytes",
+        Function::new(
+            ctx.clone(),
+            |ctx: Ctx<'js>, len: usize| -> rquickjs::Result<TypedArray<'js, u8>> {
+                let capped = len.min(65_536);
+                TypedArray::<u8>::new(ctx, os_random_bytes(capped))
+            },
+        )?,
+    )?;
+    globals.set(
+        "__nshUtf8Decode",
+        Function::new(
+            ctx.clone(),
+            |ctx: Ctx<'js>, val: Value<'js>, fatal: bool| -> rquickjs::Result<String> {
+                let bytes = js_value_to_bytes(&ctx, val)?;
+                if fatal {
+                    std::str::from_utf8(&bytes).map(str::to_owned).map_err(|_| {
+                        Exception::throw_type(
+                            &ctx,
+                            "The encoded data was not valid for encoding utf-8",
+                        )
+                    })
+                } else {
+                    Ok(String::from_utf8_lossy(&bytes).into_owned())
+                }
+            },
+        )?,
+    )?;
+
     const POLYFILLS: &str = r#"
 (function() {
   if (typeof globalThis.atob !== "function") {
@@ -3285,7 +3360,185 @@ fn install_js_polyfills<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<()> {
     };
   }
 
-  // Wrap native `fetch` to wire `AbortSignal`, `URL` inputs, and `URLSearchParams` bodies.
+  // Hidden native helpers for CSPRNG & fast Rust UTF-8 decoding (cleaned from globalThis).
+  const _nativeRandomBytes = globalThis.__nshRandomBytes;
+  const _nativeUtf8Decode = globalThis.__nshUtf8Decode;
+  delete globalThis.__nshRandomBytes;
+  delete globalThis.__nshUtf8Decode;
+
+  function ensureContiguousU8(u8) {
+    if (u8.byteOffset === 0 && u8.byteLength === u8.buffer.byteLength) {
+      return u8;
+    }
+    return new Uint8Array(u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength));
+  }
+
+  function decodeUtf8Fast(u8, fatal) {
+    if (!u8 || u8.byteLength === 0) return "";
+    return _nativeUtf8Decode(ensureContiguousU8(u8), Boolean(fatal));
+  }
+
+  // Web Fetch Response wrapper backed by a `ReadableStream`-compatible `response.body`.
+  function wrapFetchResponse(raw) {
+    const rawBytes = raw && raw.bodyBytes instanceof Uint8Array
+      ? raw.bodyBytes
+      : new Uint8Array(0);
+    let bodyUsed = false;
+    let bodyConsumed = false;
+    let bodyCanceled = false;
+    let bodyLocked = false;
+    let activeReader = null;
+    let resolveClosed;
+    const closedPromise = new Promise((resolve) => { resolveClosed = resolve; });
+    let closedResolved = false;
+
+    function resolveStreamClosed() {
+      if (!closedResolved) {
+        closedResolved = true;
+        resolveClosed(undefined);
+      }
+    }
+
+    function consumeRawBytes() {
+      if (bodyLocked) {
+        throw new TypeError("Response body is locked");
+      }
+      if (bodyUsed || bodyConsumed || bodyCanceled) {
+        throw new TypeError("Response body is already used");
+      }
+      bodyUsed = true;
+      bodyConsumed = true;
+      resolveStreamClosed();
+      return rawBytes;
+    }
+
+    const bodyStream = {
+      get locked() {
+        return bodyLocked;
+      },
+      getReader() {
+        if (bodyLocked) {
+          throw new TypeError("ReadableStream is already locked to a reader");
+        }
+        bodyLocked = true;
+        let released = false;
+        const reader = {
+          get closed() {
+            return closedPromise;
+          },
+          read() {
+            if (released) {
+              return Promise.reject(new TypeError("Cannot read from a released reader"));
+            }
+            bodyUsed = true;
+            if (bodyCanceled || bodyConsumed || rawBytes.byteLength === 0) {
+              bodyConsumed = true;
+              resolveStreamClosed();
+              return Promise.resolve({ value: undefined, done: true });
+            }
+            bodyConsumed = true;
+            const chunk = new Uint8Array(rawBytes);
+            resolveStreamClosed();
+            return Promise.resolve({ value: chunk, done: false });
+          },
+          cancel(_reason) {
+            if (released) {
+              return Promise.reject(new TypeError("Cannot cancel a released reader"));
+            }
+            bodyUsed = true;
+            bodyCanceled = true;
+            bodyConsumed = true;
+            resolveStreamClosed();
+            return Promise.resolve(undefined);
+          },
+          releaseLock() {
+            if (!released) {
+              released = true;
+              if (activeReader === reader) {
+                bodyLocked = false;
+                activeReader = null;
+              }
+            }
+          },
+        };
+        activeReader = reader;
+        return reader;
+      },
+      async cancel(_reason) {
+        if (bodyLocked) {
+          throw new TypeError("Cannot cancel a locked ReadableStream");
+        }
+        bodyUsed = true;
+        bodyCanceled = true;
+        bodyConsumed = true;
+        resolveStreamClosed();
+      },
+      async *[Symbol.asyncIterator]() {
+        const reader = this.getReader();
+        try {
+          for (;;) {
+            const { value, done } = await reader.read();
+            if (done) return;
+            yield value;
+          }
+        } finally {
+          reader.releaseLock();
+        }
+      },
+    };
+
+    Object.defineProperty(bodyStream, "toString", {
+      enumerable: false,
+      configurable: true,
+      writable: true,
+      value() {
+        return decodeUtf8Fast(rawBytes, false);
+      },
+    });
+
+    const resp = {
+      ok: Boolean(raw.ok),
+      status: raw.status,
+      statusText: raw.statusText,
+      url: raw.url,
+      redirected: Boolean(raw.redirected),
+      headers: raw.headers,
+      body: bodyStream,
+      get bodyUsed() {
+        return bodyUsed;
+      },
+      async text() {
+        return decodeUtf8Fast(consumeRawBytes(), false);
+      },
+      async json() {
+        return JSON.parse(decodeUtf8Fast(consumeRawBytes(), false));
+      },
+      async bytes() {
+        return new Uint8Array(consumeRawBytes());
+      },
+      async arrayBuffer() {
+        const b = consumeRawBytes();
+        return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength);
+      },
+      clone() {
+        if (bodyUsed || bodyLocked) {
+          throw new TypeError("Response body is already used");
+        }
+        return wrapFetchResponse({
+          ok: raw.ok,
+          status: raw.status,
+          statusText: raw.statusText,
+          url: raw.url,
+          redirected: raw.redirected,
+          headers: raw.headers,
+          bodyBytes: new Uint8Array(rawBytes),
+        });
+      },
+    };
+    return resp;
+  }
+
+  // Wrap native `fetch` to wire `AbortSignal`, `URL` inputs, `URLSearchParams` bodies, and `ReadableStream` responses.
   const _nativeFetch = globalThis.__nshFetch;
   const _nativeAbortFetch = globalThis.__nshAbortFetch;
   delete globalThis.__nshFetch;
@@ -3314,8 +3567,15 @@ fn install_js_polyfills<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<()> {
         sig.removeEventListener("abort", onAbort);
       }
     };
-    return _nativeFetch(reqId, urlStr, forwarded).then(
-      (res) => { detach(); return res; },
+    let pending;
+    try {
+      pending = _nativeFetch(reqId, urlStr, forwarded);
+    } catch (err) {
+      detach();
+      return Promise.reject(err);
+    }
+    return pending.then(
+      (res) => { detach(); return wrapFetchResponse(res); },
       (err) => {
         detach();
         if (sig && sig.aborted && err) err.name = "AbortError";
@@ -3325,6 +3585,59 @@ fn install_js_polyfills<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<()> {
   }
   globalThis.fetch = wrappedFetch;
   host.fetch = wrappedFetch;
+
+  // Web Crypto API (`crypto.getRandomValues` & `crypto.randomUUID`) backed by OS CSPRNG.
+  function isIntegerTypedArray(v) {
+    return (
+      v instanceof Int8Array ||
+      v instanceof Uint8Array ||
+      v instanceof Uint8ClampedArray ||
+      v instanceof Int16Array ||
+      v instanceof Uint16Array ||
+      v instanceof Int32Array ||
+      v instanceof Uint32Array ||
+      (typeof BigInt64Array === "function" && v instanceof BigInt64Array) ||
+      (typeof BigUint64Array === "function" && v instanceof BigUint64Array)
+    );
+  }
+  function getRandomValues(typedArray) {
+    if (!isIntegerTypedArray(typedArray)) {
+      throw new TypeError("crypto.getRandomValues expects an integer TypedArray");
+    }
+    if (typedArray.byteLength > 65536) {
+      const err = new Error("The ArrayBufferView's byte length exceeds the quota of 65536 bytes");
+      err.name = "QuotaExceededError";
+      throw err;
+    }
+    if (typedArray.byteLength > 0) {
+      const rand = _nativeRandomBytes(typedArray.byteLength);
+      new Uint8Array(typedArray.buffer, typedArray.byteOffset, typedArray.byteLength).set(rand);
+    }
+    return typedArray;
+  }
+  function randomUUID() {
+    const bytes = new Uint8Array(16);
+    getRandomValues(bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0"));
+    return (
+      hex.slice(0, 4).join("") + "-" +
+      hex.slice(4, 6).join("") + "-" +
+      hex.slice(6, 8).join("") + "-" +
+      hex.slice(8, 10).join("") + "-" +
+      hex.slice(10, 16).join("")
+    );
+  }
+  if (typeof globalThis.crypto !== "object" || globalThis.crypto === null) {
+    globalThis.crypto = {};
+  }
+  if (typeof globalThis.crypto.getRandomValues !== "function") {
+    globalThis.crypto.getRandomValues = getRandomValues;
+  }
+  if (typeof globalThis.crypto.randomUUID !== "function") {
+    globalThis.crypto.randomUUID = randomUUID;
+  }
 
   // Dynamically expose `host.webSignIn` only while a native WebSignInHandler is registered.
   const _hasWebSignIn = globalThis.__nshHasWebSignIn;
@@ -3343,6 +3656,9 @@ fn install_js_polyfills<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<()> {
 
   if (typeof globalThis.TextEncoder !== "function") {
     class TextEncoder {
+      constructor() {
+        this.encoding = "utf-8";
+      }
       encode(str) {
         const s = String(str ?? "");
         const out = [];
@@ -3376,33 +3692,99 @@ fn install_js_polyfills<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<()> {
     globalThis.TextEncoder = TextEncoder;
   }
   if (typeof globalThis.TextDecoder !== "function") {
+    function utf8TrailingIncompleteStart(bytes) {
+      const len = bytes.length;
+      if (len === 0) return len;
+      let trailCont = 0;
+      while (trailCont < 3 && trailCont < len && (bytes[len - 1 - trailCont] & 0xc0) === 0x80) {
+        trailCont++;
+      }
+      const leadIdx = len - 1 - trailCont;
+      if (leadIdx < 0) return len;
+      const lead = bytes[leadIdx];
+      const avail = len - leadIdx;
+      let needed = 0;
+      if (lead >= 0xc2 && lead <= 0xdf) {
+        needed = 2;
+      } else if (lead === 0xe0) {
+        needed = 3;
+        if (avail >= 2 && (bytes[leadIdx + 1] < 0xa0 || bytes[leadIdx + 1] > 0xbf)) return len;
+      } else if ((lead >= 0xe1 && lead <= 0xec) || (lead >= 0xee && lead <= 0xef)) {
+        needed = 3;
+      } else if (lead === 0xed) {
+        needed = 3;
+        if (avail >= 2 && (bytes[leadIdx + 1] < 0x80 || bytes[leadIdx + 1] > 0x9f)) return len;
+      } else if (lead === 0xf0) {
+        needed = 4;
+        if (avail >= 2 && (bytes[leadIdx + 1] < 0x90 || bytes[leadIdx + 1] > 0xbf)) return len;
+      } else if (lead >= 0xf1 && lead <= 0xf3) {
+        needed = 4;
+      } else if (lead === 0xf4) {
+        needed = 4;
+        if (avail >= 2 && (bytes[leadIdx + 1] < 0x80 || bytes[leadIdx + 1] > 0x8f)) return len;
+      } else {
+        return len;
+      }
+      return avail < needed ? leadIdx : len;
+    }
+
     class TextDecoder {
-      decode(bytes) {
-        if (!bytes) return "";
-        const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-        let out = "";
-        for (let i = 0; i < arr.length; ) {
-          const b0 = arr[i++];
-          if (b0 < 0x80) {
-            out += String.fromCharCode(b0);
-          } else if ((b0 & 0xe0) === 0xc0 && i < arr.length) {
-            const cp = ((b0 & 0x1f) << 6) | (arr[i++] & 0x3f);
-            out += String.fromCharCode(cp);
-          } else if ((b0 & 0xf0) === 0xe0 && i + 1 < arr.length) {
-            const cp = ((b0 & 0x0f) << 12) | ((arr[i++] & 0x3f) << 6) | (arr[i++] & 0x3f);
-            out += String.fromCharCode(cp);
-          } else if ((b0 & 0xf8) === 0xf0 && i + 2 < arr.length) {
-            const cp =
-              ((b0 & 0x07) << 18) |
-              ((arr[i++] & 0x3f) << 12) |
-              ((arr[i++] & 0x3f) << 6) |
-              (arr[i++] & 0x3f);
-            out += String.fromCodePoint(cp);
-          } else {
-            out += "\ufffd";
+      constructor(label = "utf-8", options = {}) {
+        const norm = String(label ?? "utf-8").trim().toLowerCase();
+        this.encoding = (norm === "" || norm === "utf8" || norm === "utf-8" || norm === "unicode-1-1-utf-8")
+          ? "utf-8"
+          : norm;
+        this.fatal = Boolean(options && options.fatal);
+        this.ignoreBOM = Boolean(options && options.ignoreBOM);
+        this._pending = new Uint8Array(0);
+        this._bomSeen = false;
+      }
+      decode(input, options) {
+        const stream = Boolean(options && options.stream);
+        let chunk;
+        if (input === undefined || input === null) {
+          chunk = new Uint8Array(0);
+        } else if (input instanceof ArrayBuffer) {
+          chunk = new Uint8Array(input);
+        } else if (ArrayBuffer.isView(input)) {
+          chunk = new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+        } else if (Array.isArray(input)) {
+          chunk = new Uint8Array(input);
+        } else {
+          throw new TypeError("TextDecoder.decode expects an ArrayBuffer or ArrayBufferView");
+        }
+
+        let combined;
+        if (this._pending.length > 0) {
+          combined = new Uint8Array(this._pending.length + chunk.length);
+          combined.set(this._pending, 0);
+          combined.set(chunk, this._pending.length);
+          this._pending = new Uint8Array(0);
+        } else {
+          combined = chunk;
+        }
+
+        if (stream && combined.length > 0) {
+          const splitAt = utf8TrailingIncompleteStart(combined);
+          if (splitAt < combined.length) {
+            this._pending = combined.slice(splitAt);
+            combined = combined.subarray(0, splitAt);
           }
         }
-        return out;
+
+        if (!this._bomSeen && combined.length > 0) {
+          this._bomSeen = true;
+          if (!this.ignoreBOM && combined.length >= 3 && combined[0] === 0xef && combined[1] === 0xbb && combined[2] === 0xbf) {
+            combined = combined.subarray(3);
+          }
+        }
+
+        if (!stream) {
+          this._bomSeen = false;
+        }
+
+        if (combined.length === 0) return "";
+        return decodeUtf8Fast(combined, this.fatal);
       }
     }
     globalThis.TextDecoder = TextDecoder;
@@ -3712,11 +4094,14 @@ mod tests {
                         .to_vec(),
                 ),
                 timeout_ms: Some(5_000),
-                follow_redirects: true,
+                redirect: FetchRedirectMode::Follow,
             };
             let (_tx, rx) = tokio::sync::oneshot::channel();
             let resp = rt
                 .block_on(ctx.perform_fetch(&url, opts, rx))
+                .map_err(|e| match e {
+                    FetchError::TypeError(m) | FetchError::Message(m) => m,
+                })
                 .expect("retry succeeds");
             assert!(resp.ok, "endpoint={endpoint} should succeed after retry");
             assert_eq!(resp.status, 200);
@@ -3810,5 +4195,517 @@ mod tests {
         assert!(blocked_setting.is_empty());
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    fn run_js_with_host(label: &str, script: &str) -> serde_json::Value {
+        use rquickjs::{AsyncContext, AsyncRuntime, CatchResultExt};
+
+        let root =
+            std::env::temp_dir().join(format!("nsh-plugin-host-js-{label}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let plugin_dir = root.join("plugin");
+        let data_dir = root.join("data");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::create_dir_all(&data_dir).unwrap();
+
+        let manifest = Arc::new(
+            PluginManifest::parse_json(
+                r#"{
+                    "id": "host-polyfill-test",
+                    "name": "Host Polyfill Test",
+                    "permissions": { "network": ["127.0.0.1"] }
+                }"#,
+            )
+            .unwrap(),
+        );
+        let host_ctx = Arc::new(HostContext::new(
+            plugin_dir,
+            data_dir,
+            manifest,
+            Arc::new(PluginLocales::default()),
+            HostRuntimeOptions::default(),
+        ));
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let out = rt.block_on(async {
+            let js_rt = AsyncRuntime::new().expect("AsyncRuntime");
+            let js_ctx = AsyncContext::full(&js_rt).await.expect("AsyncContext");
+            let wrapped = format!("(async () => {{\n{script}\n}})()");
+            let val = js_ctx
+                .async_with(async |ctx| {
+                    install_host_globals(&ctx, Arc::clone(&host_ctx))
+                        .expect("install_host_globals");
+                    let promise: Promise<'_> = ctx
+                        .eval(wrapped.as_bytes())
+                        .catch(&ctx)
+                        .unwrap_or_else(|e| panic!("JS eval failed: {e:?}"));
+                    let resolved: Value<'_> = promise
+                        .into_future()
+                        .await
+                        .catch(&ctx)
+                        .unwrap_or_else(|e| panic!("JS promise rejected: {e:?}"));
+                    js_to_json(&ctx, resolved).expect("js_to_json")
+                })
+                .await;
+            let _ = tokio::time::timeout(Duration::from_millis(200), js_rt.idle()).await;
+            val
+        });
+
+        let _ = fs::remove_dir_all(&root);
+        out
+    }
+
+    #[test]
+    fn fetch_response_body_readable_stream_array_buffer_clone_and_legacy_tostring() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let port = listener.local_addr().unwrap().port();
+
+        let server_thread = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let req = read_full_http_request(&mut stream);
+                let resp = if req.contains("GET /empty ") {
+                    "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_owned()
+                } else {
+                    let body = r#"{"msg":"汽水音乐🎵"}"#;
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+
+        let script = format!(
+            r#"
+            const res = await fetch("http://127.0.0.1:{port}/data");
+            const expectedText = '{{"msg":"汽水音乐🎵"}}';
+            const expectedLen = new TextEncoder().encode(expectedText).byteLength;
+
+            const c1 = res.clone();
+            const c2 = c1.clone();
+            const c3 = c2.clone();
+            const c4 = c3.clone();
+
+            const lockedBefore = res.body.locked;
+            const usedBefore = res.bodyUsed;
+            const redirected = res.redirected;
+
+            const reader = res.body.getReader();
+            const lockedWhileHeld = res.body.locked;
+
+            let doubleLockErr = "";
+            try {{ res.body.getReader(); }} catch (e) {{ doubleLockErr = e.name; }}
+
+            let lockedCancelErr = "";
+            try {{ await res.body.cancel(); }} catch (e) {{ lockedCancelErr = e.name; }}
+
+            let lockedCloneErr = "";
+            try {{ res.clone(); }} catch (e) {{ lockedCloneErr = e.name; }}
+
+            const p1 = await reader.read();
+            const p2 = await reader.read();
+            await reader.closed;
+            const usedAfterRead = res.bodyUsed;
+
+            reader.releaseLock();
+            const lockedAfterRelease = res.body.locked;
+
+            let releasedReadErr = "";
+            try {{ await reader.read(); }} catch (e) {{ releasedReadErr = e.name; }}
+
+            await res.body.cancel();
+
+            // Legacy stringification via non-enumerable `body.toString()`.
+            const legacyStr = String(res.body);
+            const legacyParsed = JSON.parse(res.body).msg;
+            const toStringEnumerable = Object.keys(res.body).includes("toString");
+
+            // Cloned responses remain completely independent.
+            const c1UsedBefore = c1.bodyUsed;
+            const ab = await c1.arrayBuffer();
+            const c1UsedAfter = c1.bodyUsed;
+            let reuseErr = "";
+            try {{ await c1.text(); }} catch (e) {{ reuseErr = e.name; }}
+
+            const bytesOut = await c2.bytes();
+
+            const chunks = [];
+            for await (const chunk of c3.body) {{
+                chunks.push(new TextDecoder().decode(chunk));
+            }}
+            const c3LockedAfterIter = c3.body.locked;
+
+            await c4.body.cancel();
+            const c4UsedAfterCancel = c4.bodyUsed;
+            const c4AfterCancelRead = await c4.body.getReader().read();
+
+            // Empty 204 response body stream behavior.
+            const emptyRes = await fetch("http://127.0.0.1:{port}/empty");
+            const emptyReader = emptyRes.body.getReader();
+            const emptyFirst = await emptyReader.read();
+            await emptyReader.closed;
+            await emptyReader.cancel();
+            emptyReader.releaseLock();
+            await emptyRes.body.cancel();
+
+            return {{
+                lockedBefore,
+                usedBefore,
+                redirected,
+                lockedWhileHeld,
+                doubleLockErr,
+                lockedCancelErr,
+                lockedCloneErr,
+                p1Done: p1.done,
+                p1IsU8: p1.value instanceof Uint8Array,
+                p1LenOk: p1.value.byteLength === expectedLen,
+                p1Text: new TextDecoder().decode(p1.value),
+                p2Done: p2.done,
+                p2ValUndef: p2.value === undefined,
+                usedAfterRead,
+                lockedAfterRelease,
+                releasedReadErr,
+                legacyStrOk: legacyStr === expectedText,
+                legacyParsed,
+                toStringEnumerable,
+                c1UsedBefore,
+                c1UsedAfter,
+                abIsArrayBuffer: ab instanceof ArrayBuffer,
+                abLenOk: ab.byteLength === expectedLen,
+                reuseErr,
+                bytesIsU8: bytesOut instanceof Uint8Array,
+                bytesLenOk: bytesOut.byteLength === expectedLen,
+                iterJoined: chunks.join(""),
+                c3LockedAfterIter,
+                c4UsedAfterCancel,
+                c4AfterCancelDone: c4AfterCancelRead.done,
+                emptyFirstDone: emptyFirst.done,
+                emptyFirstUndef: emptyFirst.value === undefined,
+            }};
+            "#
+        );
+
+        let result = run_js_with_host("fetch-stream", &script);
+        server_thread.join().expect("server thread");
+
+        assert_eq!(result["lockedBefore"], false);
+        assert_eq!(result["usedBefore"], false);
+        assert_eq!(result["redirected"], false);
+        assert_eq!(result["lockedWhileHeld"], true);
+        assert_eq!(result["doubleLockErr"], "TypeError");
+        assert_eq!(result["lockedCancelErr"], "TypeError");
+        assert_eq!(result["lockedCloneErr"], "TypeError");
+        assert_eq!(result["p1Done"], false);
+        assert_eq!(result["p1IsU8"], true);
+        assert_eq!(result["p1LenOk"], true);
+        assert_eq!(result["p1Text"], r#"{"msg":"汽水音乐🎵"}"#);
+        assert_eq!(result["p2Done"], true);
+        assert_eq!(result["p2ValUndef"], true);
+        assert_eq!(result["usedAfterRead"], true);
+        assert_eq!(result["lockedAfterRelease"], false);
+        assert_eq!(result["releasedReadErr"], "TypeError");
+        assert_eq!(result["legacyStrOk"], true);
+        assert_eq!(result["legacyParsed"], "汽水音乐🎵");
+        assert_eq!(result["toStringEnumerable"], false);
+        assert_eq!(result["c1UsedBefore"], false);
+        assert_eq!(result["c1UsedAfter"], true);
+        assert_eq!(result["abIsArrayBuffer"], true);
+        assert_eq!(result["abLenOk"], true);
+        assert_eq!(result["reuseErr"], "TypeError");
+        assert_eq!(result["bytesIsU8"], true);
+        assert_eq!(result["bytesLenOk"], true);
+        assert_eq!(result["iterJoined"], r#"{"msg":"汽水音乐🎵"}"#);
+        assert_eq!(result["c3LockedAfterIter"], false);
+        assert_eq!(result["c4UsedAfterCancel"], true);
+        assert_eq!(result["c4AfterCancelDone"], true);
+        assert_eq!(result["emptyFirstDone"], true);
+        assert_eq!(result["emptyFirstUndef"], true);
+    }
+
+    #[test]
+    fn fetch_redirect_modes_follow_manual_error_and_invalid() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let port = listener.local_addr().unwrap().port();
+
+        // 4 HTTP requests:
+        // 1) /redir (follow) -> 302 /final
+        // 2) /final (followed) -> 200
+        // 3) /redir (manual) -> 302 /final
+        // 4) /redir (error) -> 302 /final
+        let server_thread = std::thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let req = read_full_http_request(&mut stream);
+                let resp = if req.contains("GET /final ") {
+                    let body = r#"{"arrived":true}"#;
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                } else {
+                    "HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_owned()
+                };
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+
+        let script = format!(
+            r#"
+            const followed = await fetch("http://127.0.0.1:{port}/redir", {{ redirect: "follow" }});
+            const followedBody = await followed.json();
+
+            const manual = await fetch("http://127.0.0.1:{port}/redir", {{ redirect: "manual" }});
+
+            let errorModeName = "";
+            let errorModeIsTypeError = false;
+            let errorModeMsg = "";
+            try {{
+                await fetch("http://127.0.0.1:{port}/redir", {{ redirect: "error" }});
+            }} catch (e) {{
+                errorModeName = e.name || "";
+                errorModeIsTypeError = e instanceof TypeError;
+                errorModeMsg = String(e.message || e);
+            }}
+
+            let invalidModeIsTypeError = false;
+            let invalidModeMsg = "";
+            try {{
+                await fetch("http://127.0.0.1:{port}/redir", {{ redirect: "bogus" }});
+            }} catch (e) {{
+                invalidModeIsTypeError = e instanceof TypeError;
+                invalidModeMsg = String(e.message || e);
+            }}
+
+            return {{
+                followedStatus: followed.status,
+                followedRedirected: followed.redirected,
+                followedUrlEndsFinal: followed.url.endsWith("/final"),
+                followedArrived: followedBody.arrived,
+                manualStatus: manual.status,
+                manualOk: manual.ok,
+                manualRedirected: manual.redirected,
+                manualLocation: manual.headers.get("location"),
+                errorModeName,
+                errorModeIsTypeError,
+                errorModeMsg,
+                invalidModeIsTypeError,
+                invalidModeMsg,
+            }};
+            "#
+        );
+
+        let result = run_js_with_host("fetch-redirect", &script);
+        server_thread.join().expect("server thread");
+
+        assert_eq!(result["followedStatus"], 200);
+        assert_eq!(result["followedRedirected"], true);
+        assert_eq!(result["followedUrlEndsFinal"], true);
+        assert_eq!(result["followedArrived"], true);
+        assert_eq!(result["manualStatus"], 302);
+        assert_eq!(result["manualOk"], false);
+        assert_eq!(result["manualRedirected"], false);
+        assert_eq!(result["manualLocation"], "/final");
+        assert_eq!(result["errorModeName"], "TypeError");
+        assert_eq!(result["errorModeIsTypeError"], true);
+        assert!(
+            result["errorModeMsg"]
+                .as_str()
+                .unwrap_or("")
+                .contains("redirect: \"error\""),
+            "unexpected error message: {:?}",
+            result["errorModeMsg"]
+        );
+        assert_eq!(result["invalidModeIsTypeError"], true);
+        assert!(
+            result["invalidModeMsg"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Invalid redirect mode"),
+            "unexpected invalid redirect message: {:?}",
+            result["invalidModeMsg"]
+        );
+    }
+
+    #[test]
+    fn streaming_text_decoder_handles_multibyte_cjk_emoji_subarrays_bom_and_fatal() {
+        let script = r#"
+            const sample = "汽水音乐🎵Hello";
+            const encoded = new TextEncoder().encode(sample);
+
+            // 1. Feed 1 byte at a time across 3-byte CJK and 4-byte emoji boundaries.
+            const d1 = new TextDecoder("utf-8");
+            let out1 = "";
+            for (let i = 0; i < encoded.length; i++) {
+                out1 += d1.decode(encoded.subarray(i, i + 1), { stream: true });
+            }
+            out1 += d1.decode();
+
+            // 2. Feed awkward 2-byte DataView / subarray slices (splitting every CJK & emoji).
+            const padded = new Uint8Array(encoded.length + 6);
+            padded.set(encoded, 3);
+            const d2 = new TextDecoder();
+            let out2 = "";
+            for (let off = 3; off < 3 + encoded.length; off += 2) {
+                const len = Math.min(2, 3 + encoded.length - off);
+                out2 += d2.decode(new DataView(padded.buffer, off, len), { stream: true });
+            }
+            out2 += d2.decode();
+
+            // 3. BOM split across streaming chunks (ignoreBOM false vs true).
+            const bomStrip = new TextDecoder("utf-8");
+            const bomOutStrip =
+                bomStrip.decode(new Uint8Array([0xef, 0xbb]), { stream: true }) +
+                bomStrip.decode(new Uint8Array([0xbf, 0x41]), { stream: true }) +
+                bomStrip.decode();
+
+            const bomKeep = new TextDecoder("utf-8", { ignoreBOM: true });
+            const bomOutKeep =
+                bomKeep.decode(new Uint8Array([0xef, 0xbb]), { stream: true }) +
+                bomKeep.decode(new Uint8Array([0xbf, 0x41]), { stream: true }) +
+                bomKeep.decode();
+
+            // 4. Truncated UTF-8 sequence at EOF flush: replacement char vs fatal TypeError.
+            const lossy = new TextDecoder("utf-8");
+            const lossyHead = lossy.decode(new Uint8Array([0x41, 0xe6, 0xb1]), { stream: true });
+            const lossyTail = lossy.decode();
+            const lossyReuse = lossy.decode(new Uint8Array([0x42]));
+
+            const fatalDec = new TextDecoder("utf-8", { fatal: true });
+            const fatalHead = fatalDec.decode(new Uint8Array([0x41, 0xf0, 0x9f]), { stream: true });
+            let fatalErrName = "";
+            let fatalIsTypeError = false;
+            try {
+                fatalDec.decode();
+            } catch (e) {
+                fatalErrName = e.name || "";
+                fatalIsTypeError = e instanceof TypeError;
+            }
+            const fatalReuse = fatalDec.decode(new Uint8Array([0x43]));
+
+            return {
+                encoding: d1.encoding,
+                out1,
+                out2,
+                hasReplacement1: out1.includes("\ufffd"),
+                hasReplacement2: out2.includes("\ufffd"),
+                bomOutStrip,
+                bomOutKeep,
+                lossyHead,
+                lossyTail,
+                lossyReuse,
+                fatalHead,
+                fatalErrName,
+                fatalIsTypeError,
+                fatalReuse,
+            };
+        "#;
+
+        let result = run_js_with_host("text-decoder-stream", script);
+        assert_eq!(result["encoding"], "utf-8");
+        assert_eq!(result["out1"], "汽水音乐🎵Hello");
+        assert_eq!(result["out2"], "汽水音乐🎵Hello");
+        assert_eq!(result["hasReplacement1"], false);
+        assert_eq!(result["hasReplacement2"], false);
+        assert_eq!(result["bomOutStrip"], "A");
+        assert_eq!(result["bomOutKeep"], "\u{feff}A");
+        assert_eq!(result["lossyHead"], "A");
+        assert_eq!(result["lossyTail"], "\u{fffd}");
+        assert_eq!(result["lossyReuse"], "B");
+        assert_eq!(result["fatalHead"], "A");
+        assert_eq!(result["fatalErrName"], "TypeError");
+        assert_eq!(result["fatalIsTypeError"], true);
+        assert_eq!(result["fatalReuse"], "C");
+    }
+
+    #[test]
+    fn web_crypto_get_random_values_and_random_uuid() {
+        let script = r#"
+            const a = new Uint8Array(32);
+            const retA = crypto.getRandomValues(a);
+            const b = new Uint8Array(32);
+            crypto.getRandomValues(b);
+
+            const u32 = new Uint32Array(8);
+            const retU32 = crypto.getRandomValues(u32);
+
+            // Subarray slice must not clobber surrounding guard bytes.
+            const backing = new Uint8Array(16);
+            backing.fill(0xaa);
+            const mid = new Uint16Array(backing.buffer, 4, 4);
+            crypto.getRandomValues(mid);
+            const guardPrefixIntact = backing.slice(0, 4).every((x) => x === 0xaa);
+            const guardSuffixIntact = backing.slice(12, 16).every((x) => x === 0xaa);
+
+            // Exact 65536-byte boundary succeeds.
+            const maxBuf = new Uint8Array(65536);
+            crypto.getRandomValues(maxBuf);
+
+            // > 65536 bytes throws QuotaExceededError.
+            let quotaErrName = "";
+            try {
+                crypto.getRandomValues(new Uint8Array(65537));
+            } catch (e) {
+                quotaErrName = e.name || "";
+            }
+
+            // Float64Array / non-view throws TypeError.
+            let floatErrIsTypeError = false;
+            try {
+                crypto.getRandomValues(new Float64Array(4));
+            } catch (e) {
+                floatErrIsTypeError = e instanceof TypeError;
+            }
+            let objErrIsTypeError = false;
+            try {
+                crypto.getRandomValues({});
+            } catch (e) {
+                objErrIsTypeError = e instanceof TypeError;
+            }
+
+            const uuid1 = crypto.randomUUID();
+            const uuid2 = crypto.randomUUID();
+            const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+            return {
+                sameRefA: retA === a,
+                sameRefU32: retU32 === u32,
+                aNonZero: a.some((x) => x !== 0),
+                u32NonZero: u32.some((x) => x !== 0),
+                aDiffB: a.some((x, i) => x !== b[i]),
+                guardPrefixIntact,
+                guardSuffixIntact,
+                maxBufNonZero: maxBuf.some((x) => x !== 0),
+                quotaErrName,
+                floatErrIsTypeError,
+                objErrIsTypeError,
+                uuid1Valid: uuidRe.test(uuid1),
+                uuid2Valid: uuidRe.test(uuid2),
+                uuidsDistinct: uuid1 !== uuid2,
+            };
+        "#;
+
+        let result = run_js_with_host("web-crypto", script);
+        assert_eq!(result["sameRefA"], true);
+        assert_eq!(result["sameRefU32"], true);
+        assert_eq!(result["aNonZero"], true);
+        assert_eq!(result["u32NonZero"], true);
+        assert_eq!(result["aDiffB"], true);
+        assert_eq!(result["guardPrefixIntact"], true);
+        assert_eq!(result["guardSuffixIntact"], true);
+        assert_eq!(result["maxBufNonZero"], true);
+        assert_eq!(result["quotaErrName"], "QuotaExceededError");
+        assert_eq!(result["floatErrIsTypeError"], true);
+        assert_eq!(result["objErrIsTypeError"], true);
+        assert_eq!(result["uuid1Valid"], true);
+        assert_eq!(result["uuid2Valid"], true);
+        assert_eq!(result["uuidsDistinct"], true);
     }
 }
