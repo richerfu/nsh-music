@@ -1,78 +1,83 @@
 <div align="center">
   <img src="./assets/app-icon-macos.png" alt="NSH Music" width="108" height="108" />
   <h1>NSH Music</h1>
-  <p>基于 Rust 与 Native Shell (<code>nsh</code>) 构建的全平台原生音乐播放器</p>
+  <p>A 100% native cross-platform music player built with Rust and Native Shell (<code>nsh</code>)</p>
   <p>
+    <strong>English</strong> · <a href="./README.zh-CN.md">简体中文</a>
+  </p>
+  <p>
+    <a href="https://github.com/richerfu/nsh-music/actions/workflows/ci.yml"><img src="https://github.com/richerfu/nsh-music/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+    <a href="https://github.com/richerfu/nsh-music/releases"><img src="https://img.shields.io/github/v/release/richerfu/nsh-music?color=e85d4a&label=Release" alt="Latest Release" /></a>
     <img src="https://img.shields.io/badge/Rust-2024-orange?logo=rust&logoColor=white" alt="Rust 2024" />
     <img src="https://img.shields.io/badge/Native%20Shell-0.7-1f6feb" alt="Native Shell 0.7" />
-    <img src="https://img.shields.io/badge/Platforms-macOS%20%7C%20Windows%20%7C%20Linux%20%7C%20iOS%20%7C%20Android%20%7C%20HarmonyOS-2ea043" alt="Platforms" />
+    <img src="https://img.shields.io/badge/Platforms-macOS%20%7C%20Windows%20%7C%20Linux%20%7C%20iOS%20%7C%20Android%20%7C%20HarmonyOS-2ea043" alt="6 Platforms" />
     <a href="https://github.com/egoist/mygo-music"><img src="https://img.shields.io/badge/Plugins-mygo--music%20Compatible-8957e5" alt="mygo-music Compatible" /></a>
     <a href="./LICENSE"><img src="https://img.shields.io/badge/License-AGPL--3.0-blue" alt="License: AGPL-3.0" /></a>
   </p>
   <p>
-    <a href="#特性亮点">特性亮点</a> ·
-    <a href="#全平台能力对齐矩阵">全平台矩阵</a> ·
-    <a href="#系统架构与工程目录">系统架构</a> ·
-    <a href="#插件导入与虚拟化兼容策略">插件安装与兼容策略</a> ·
-    <a href="#快速开始与开发指南">快速开始</a> ·
-    <a href="#开源协议与致谢">开源协议与致谢</a>
+    <a href="#features">Features</a> ·
+    <a href="#platform-matrix">Platform Matrix</a> ·
+    <a href="#architecture">Architecture</a> ·
+    <a href="#plugin-compatibility">Plugin Compatibility</a> ·
+    <a href="#downloads--build">Downloads &amp; Build</a> ·
+    <a href="#license--credits">License &amp; Credits</a>
   </p>
 </div>
 
 ---
 
-## 特性亮点
+## Features
 
-### 100% 原生渲染 & 三形态自适应
+### 100% Native Rendering & 3 Adaptive Shells
 
-- 零 Electron / Tauri / WebView UI，界面完全由 `nsh` 原生图形管线渲染，原生流畅响应。
-- 根据设备类型与视口尺寸自动切换三套交互外壳：
-  - **Desktop（桌面端）**：自定义无边框标题栏、可折叠侧边栏、彗星光晕进度条底栏与独立设置子窗口。
-  - **Pad（平板端）**：横竖屏自适应导航轨 / 抽屉、悬浮胶囊播控与触控友好命中区。
-  - **Phone（手机端）**：安全区顶栏音源切换器、四栏底部导航、悬浮迷你播控与手势沉浸播放页。
+- Zero Electron, Tauri, or WebView UI — every screen is rendered natively through `nsh`'s native graphics pipeline with platform-appropriate HIG adaptive icons across all six operating systems.
+- Automatically adapts layout and interaction ergonomics across three dedicated shells:
+  - **Desktop**: Frameless custom titlebar, collapsible sidebar, comet-glow scrubber bar, dedicated Settings window, macOS menu-bar live synced-lyric title, and cross-platform system-tray playback controls.
+  - **Pad**: Landscape/portrait adaptive navigation rail & drawer, floating pill playback dock, and touch-sized (`>= 44pt`) controls.
+  - **Phone**: 4-edge safe-area layout with live IME / keyboard avoidance, top-bar source switcher, 4-tab bottom navigation, floating mini-player, and gesture-driven Now Playing sheet.
 
-### 完整兼容 `mygo-music` 插件生态
+### Complete `mygo-music` Plugin Ecosystem
 
-- 内置 `quickjs-jit` + `oxc` TypeScript 即时剥离运行时，零构建直接运行上游 JS / TS 插件。
-- 完整支持 `plugin.json` 清单、38+ 标准与别名导出函数、`requestHeaders` 域名通配与模板注入、二维码扫码登录，以及六端原生 WebView 登录（含 `HttpOnly` Cookie 采集与手动粘贴回退）。
+- Built-in `quickjs-jit` + `oxc` on-the-fly TypeScript stripping runtime executes upstream JS / TS plugins directly with zero build step.
+- Full support for `plugin.json` manifests, 38+ canonical & alias exports, wildcard `requestHeaders` template injection, Web Fetch (`ReadableStream` streaming bodies & `redirect: "error"`), streaming `TextDecoder`, Web Crypto, QR code sign-in, and 6-OS native WebView sign-in with `HttpOnly` cookie capture and manual cookie-paste fallback.
 
-### 零外部依赖沙箱流媒体引擎
+### Zero-External-Dependency Sandboxed Media Engine
 
-- 内置 **`VirtualFfmpegShim`**，在进程内完成 HTTP / HLS / TS / ID3v2 实时解复用、跨跳转请求头保留与断点重试中继。
-- 内置基于上游 **[LuanRT/YouTube.js](https://github.com/LuanRT/YouTube.js)** 与 **[yt-dlp/ejs](https://github.com/yt-dlp/ejs)** 的 **`VirtualYtdlpShim`**，具备字节码中断保护、Worker 自动自愈、有界 LRU 缓存与快速切歌即时取消能力。
+- **`VirtualFfmpegShim`**: In-process HTTP / HLS / MPEG-TS / ID3v2 real-time demuxing and relay with cross-redirect header preservation and reconnect-resilient streaming.
+- **`VirtualYtdlpShim`**: Powered by embedded upstream **[LuanRT/YouTube.js](https://github.com/LuanRT/YouTube.js)** and **[yt-dlp/ejs](https://github.com/yt-dlp/ejs)**, featuring bytecode interrupt protection, automatic worker self-healing, bounded LRU caches, and instant cancellation on rapid track skips.
 
-### 高保真音频管线与舞台动效
+### High-Fidelity Audio & Caching Pipeline
 
-- **本地音乐与解码**：Symphonia 纯 Rust 解码（MP3 / FLAC / WAV / Ogg / Opus / M4A / AAC / ALAC）+ 可选静态 FFmpeg 解码，自动提取内嵌封面与元信息。
-- **缓存与音效**：渐进式 LRU 磁盘音频缓存（播放与下载共享）、ReplayGain 响度均衡、Crossfade 交叉淡入淡出及 16 频段实时 FFT 频谱。
-- **歌词舞台与视觉模式**：支持逐行 / 逐字同步 **LRC / YRC / QRC**（同目录 `.lrc` 外挂优先，回退内嵌标签）与双语翻译对齐；提供 **`Flow / Steps / Tilt / Wall`** 四种歌词舞台以及 **`Cover / Vinyl（黑胶） / Cassette（磁带）`** 视觉模式。
-
----
-
-## 全平台能力对齐矩阵
-
-| 平台             | 原生图形与窗口                                                 | 系统媒体控制（锁屏 / 通知栏 / 控制中心）                                      | 外设断开与焦点中断                                             | 插件沙箱与 DeepLink                                                                                     |
-| ---------------- | -------------------------------------------------------------- | ----------------------------------------------------------------------------- | -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| **macOS**        | AppKit + CoreAudio（无边框标题栏、多窗口、系统托盘与原生菜单） | `MPNowPlayingInfoCenter` + `MPRemoteCommandCenter`                            | CoreAudio 默认输出 / 存活 / 插孔监听（蓝牙与有线断开自动暂停） | `PATH` 自装优先 + 内进程虚拟化回退；`mygo-music://` & `nsh-music://`                                    |
-| **Windows**      | Win32 / Direct2D + WASAPI（单实例与系统托盘）                  | WinRT `SystemMediaTransportControls` (`SMTC`)                                 | COM `IMMNotificationClient` 音频端点断开监听                   | `PATH` 自装优先 + 内进程虚拟化回退；`mygo-music://` & `nsh-music://`                                    |
-| **Linux**        | GTK 4 + ALSA / PulseAudio（单实例）                            | 零 `pkg-config` 编译依赖的 `MPRIS2` D-Bus (`org.mpris.MediaPlayer2.nshmusic`) | `cpal` 播放期输出设备移除检测（暂停 0% CPU）                   | `PATH` 自装优先 + 内进程虚拟化回退；`mygo-music://` & `nsh-music://`                                    |
-| **iOS / iPadOS** | UIKit + CoreAudio（`UIBackgroundModes: audio`）                | `MPNowPlayingInfoCenter` + `MPRemoteCommandCenter` + `AVAudioSession`         | `AVAudioSession` 路由变更与来电 / 焦点中断恢复                 | 全内进程沙箱虚拟化（`YouTube.js + yt-dlp/ejs` / `VirtualFfmpegShim`）；`mygo-music://` & `nsh-music://` |
-| **Android**      | Android Views + AAudio / Oboe（媒体播放前台服务权限）          | `MediaSession` + `Notification.MediaStyle`（API 23 / 26 / 33 适配）           | JNI `AudioManager` 外设移除与通话模式中断恢复                  | 全内进程沙箱虚拟化（`YouTube.js + yt-dlp/ejs` / `VirtualFfmpegShim`）；`mygo-music://` & `nsh-music://` |
-| **HarmonyOS**    | ArkUI C-API + `OH_AudioRenderer`                               | `AVSession` + `AUDIO_PLAYBACK` 后台长时任务（封面、歌词、收藏与循环同步）     | `OH_AudioRenderer` 系统打断与蓝牙 / 耳机断开回调               | 全内进程沙箱虚拟化（`YouTube.js + yt-dlp/ejs` / `VirtualFfmpegShim`）；`mygo-music://` & `nsh-music://` |
+- **Decoding & Local Library**: Pure-Rust **Symphonia** decoding (`MP3 / FLAC / WAV / Ogg / Opus / M4A / AAC / ALAC`) plus optional static **FFmpeg** decoding, with automatic embedded artwork and metadata extraction.
+- **Caching & DSP**: Track-keyed LRU disk audio cache with loopback stream persistence and full next-track prefetch, SWR (stale-while-revalidate) catalog / lyrics / artwork caches, ReplayGain loudness normalization, smooth Crossfade, and 16-band real-time FFT spectrum visualization.
+- **Lyrics Stages & Visual Modes**: Line- and word-synced **LRC / YRC / QRC** and structured lyrics (prioritizing local sidecar `.lrc` files over embedded tags) with bilingual translation/romaji alignment; **`Flow / Steps / Tilt / Wall`** lyrics stages and **`Cover / Vinyl / Cassette`** Now Playing visual modes.
 
 ---
 
-## 系统架构与工程目录
+## Platform Matrix
+
+| Platform | Native UI, Icons & Audio | System Media Controls (Lock Screen / Tray / Notifications) | Peripheral Disconnect & Focus Interruption | Plugin Sandbox & Deep Links |
+| --- | --- | --- | --- | --- |
+| **macOS** | AppKit + CoreAudio (frameless titlebar, multi-window, menu-bar live lyric title, template tray & HIG macOS icon) | `MPNowPlayingInfoCenter` + `MPRemoteCommandCenter` + native menu-bar / tray controls | CoreAudio default-output / alive / jack listener (auto-pause on Bluetooth or wired unplug) | `PATH` user binaries first + in-process virtualization fallback; `mygo-music://` & `nsh-music://` |
+| **Windows** | Win32 / Direct2D + WASAPI (single instance, in-memory color system tray & HIG Windows icon) | WinRT `SystemMediaTransportControls` (`SMTC`) + system-tray playback controls | COM `IMMNotificationClient` audio endpoint disconnect monitor | `PATH` user binaries first + in-process virtualization fallback; `mygo-music://` & `nsh-music://` |
+| **Linux** | GTK 4 + ALSA / PulseAudio (single instance, color system tray & HIG Linux icon) | Zero-`pkg-config` `MPRIS2` D-Bus (`org.mpris.MediaPlayer2.nshmusic`) + system-tray controls | `cpal` active-playback output-device removal detection (`0%` CPU while paused) | `PATH` user binaries first + in-process virtualization fallback; `mygo-music://` & `nsh-music://` |
+| **iOS / iPadOS** | UIKit + CoreAudio (`UIBackgroundModes: audio`, 4-edge safe areas & live IME avoidance) | `MPNowPlayingInfoCenter` + `MPRemoteCommandCenter` + `AVAudioSession` | `AVAudioSession` route-change & call / focus interruption recovery | Full in-process sandbox virtualization (`YouTube.js + yt-dlp/ejs` & `VirtualFfmpegShim`); `mygo-music://` & `nsh-music://` |
+| **Android** | Android Views + AAudio / Oboe (`FOREGROUND_SERVICE_MEDIA_PLAYBACK`, Android 13+ `POST_NOTIFICATIONS`, Adaptive & Material You icons) | Build-time compiled `NshMediaBridge.java` -> `MediaSession` + `Notification.MediaStyle` (API 23 / 26 / 33+) | JNI `AudioManager` peripheral removal & call-focus interruption recovery | Full in-process sandbox virtualization (`YouTube.js + yt-dlp/ejs` & `VirtualFfmpegShim`); `mygo-music://` & `nsh-music://` |
+| **HarmonyOS** | ArkUI C-API + `OH_AudioRenderer` (`nsh-platform-harmonyos 0.7`, `KEEP_BACKGROUND_RUNNING`) | `AVSession` + `AUDIO_PLAYBACK` continuous background task (synced artwork, lyrics, favorite & loop state) | `OH_AudioRenderer` system interruption & Bluetooth / headset disconnect callbacks | Full in-process sandbox virtualization (`YouTube.js + yt-dlp/ejs` & `VirtualFfmpegShim`); `mygo-music://` & `nsh-music://` |
+
+---
+
+## Architecture
 
 ```mermaid
 flowchart TB
     UI["nsh-app-music UI Shells (Desktop / Pad / Phone)"]
-    Store["AppStore Reactive State and Navigation"]
+    Store["AppStore Reactive State & Navigation"]
     Platform["nsh-music-platforms (platforms/ 6-OS Media Controls)"]
     Core["nsh-music-core (Models, Lyrics, i18n, Local Library, Settings)"]
     Audio["nsh-music-audio (Symphonia / FFmpeg, DSP, LRU Cache, VirtualFfmpegShim)"]
     Plugin["nsh-music-plugin (QuickJS + oxc, VirtualYtdlpShim: YouTube.js + yt-dlp/ejs)"]
-    SignIn["nsh-web-signin (6-Platform Native WebView and Cookie Capture)"]
+    SignIn["nsh-web-signin (6-OS Native WebView & HttpOnly Cookie Capture)"]
 
     UI --> Store
     Store --> Platform
@@ -86,98 +91,102 @@ flowchart TB
     Audio --> Core
 ```
 
-| 路径                                               | 说明                                                                                                                                                |
-| -------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `src/`                                             | 应用入口、响应式状态管理（`AppStore`）、三形态外壳（`desktop` 含菜单栏 / 托盘播控、`pad`、`phone`）、页面与 Now Playing 舞台                       |
-| `platforms/`                                       | 六端独立原生媒体会话与状态栏集成驱动（`macos` / `ios` / `windows` / `linux` / `android` / `harmonyos`，含构建期 Java 桥接编译）                     |
-| `crates/nsh-music-core`                            | 核心数据模型、`MusicSource` 协议、LRC / YRC / QRC 歌词解析、本地音频扫描、`zh-CN` / `en` 国际化、设置与会话原子持久化                               |
-| `crates/nsh-music-audio`                           | 跨平台音频引擎、Symphonia / FFmpeg 解码、ReplayGain / Crossfade / FFT DSP、渐进式 LRU 缓存、`VirtualFfmpegShim`、远程控制桥接与设备断开监听         |
-| `crates/nsh-music-plugin`                          | QuickJS + `oxc` 插件运行时、`plugin.json` 与权限校验、`requestHeaders` 规则展开、`VirtualYtdlpShim`（内嵌 `YouTube.js` + `yt-dlp/ejs`）             |
-| `crates/nsh-web-signin`                            | 六端原生 WebView 登录与 `HttpOnly` Cookie 采集模块                                                                                                  |
-| [`docs/PLUGIN_COMPAT.md`](./docs/PLUGIN_COMPAT.md) | 38+ 导出函数兼容矩阵、`host.*` 接口参考、内进程虚拟化架构与移动端插件迁移指南                                                                       |
-| [`DESIGN.md`](./DESIGN.md)                         | 跨平台设计系统、三形态布局规范与动效清单                                                                                                            |
+| Path | Description |
+| --- | --- |
+| `src/` | Application entry point, reactive state store (`AppStore`), 3 adaptive shells (`desktop` with menu-bar lyric & tray controls, `pad`, `phone`), pages, and Now Playing stages |
+| `platforms/` | `nsh-music-platforms` workspace crate with 6 dedicated OS directories (`macos`, `ios`, `windows`, `linux`, `android`, `harmonyos`); compiles `platforms/android/java/com/richerfu/nshmusic/NshMediaBridge.java` to DEX via `build.rs` at build time (zero committed `.dex` binaries) |
+| `crates/nsh-music-core` | Core domain models, `MusicSource` trait, LRC / YRC / QRC & structured lyrics parser, local library scanner, `en` / `zh-CN` i18n, atomic settings & session persistence |
+| `crates/nsh-music-audio` | Cross-platform audio engine, Symphonia / optional static FFmpeg decoding, ReplayGain / Crossfade / 16-band FFT DSP, track-keyed LRU disk cache & next-track prefetch, `VirtualFfmpegShim`, remote-control bridge, and output-disconnect listeners |
+| `crates/nsh-music-plugin` | QuickJS + `oxc` JS/TS plugin runtime, `plugin.json` manifest & permission enforcement, `requestHeaders` wildcard expansion, Web Fetch / `TextDecoder` / Web Crypto polyfills, and `VirtualYtdlpShim` (`YouTube.js` + `yt-dlp/ejs`) |
+| `crates/nsh-web-signin` | 6-platform native WebView sign-in and `HttpOnly` cookie capture crate |
+| [`docs/PLUGIN_COMPAT.md`](./docs/PLUGIN_COMPAT.md) | 38+ export compatibility matrix, `host.*` API reference, in-process virtualization architecture, and mobile plugin migration guide |
+| [`DESIGN.md`](./DESIGN.md) | Cross-platform design system, 3-form-factor layout specification, and motion inventory |
 
 ---
 
-## 插件导入与虚拟化兼容策略
+## Plugin Compatibility
 
-### 4 种插件安装方式
+### 4 Installation Methods
 
-1. **网页一键拉起（DeepLink）**：点击插件站点的 `mygo-music://install-plugin?repo=owner/repo`（同时兼容 `mygo-music-dev://` 与 `nsh-music://`）直接拉起应用并弹出权限确认框。
-2. **GitHub 仓库导入**：在「设置 → 插件」输入 `owner/repo` 或 `owner/repo@ref`（亦支持完整 GitHub URL）。
-3. **ZIP 压缩包导入**：导入本地 `.zip` 插件包，内置 Zip-Slip 路径穿越安全防护。
-4. **本地目录导入 / 窗口拖放**：选择本地插件目录，或在桌面端直接将插件目录 / ZIP 拖放到应用窗口。
+1. **One-Click Deep Link**: Open `mygo-music://install-plugin?repo=owner/repo` (also supports `mygo-music-dev://` and `nsh-music://`) from any browser to launch NSH Music and preview requested permissions before installing.
+2. **GitHub Repository**: Enter `owner/repo`, `owner/repo@ref`, or a full GitHub URL under **Settings -> Plugins**.
+3. **ZIP Archive**: Import a local `.zip` plugin bundle with built-in Zip-Slip path-traversal protection.
+4. **Local Folder / Drag & Drop**: Pick a local plugin directory, or drag and drop a plugin folder / `.zip` directly onto the desktop window.
 
-### 「移动端虚拟化兼容」开关策略
+### Mobile Virtualization Compatibility Policy
 
-可在「设置 → 插件 → **移动端虚拟化兼容（Mobile Virtualization Compatibility）**」按需切换执行策略。**NSH Music 绝不静默自动下载任何外部二进制文件。**
+Configure execution routing under **Settings -> Plugins -> Mobile Virtualization Compatibility**. **NSH Music never silently downloads external binaries.**
 
-| 开关状态         | 桌面端（macOS / Windows / Linux）                                                                                                                                         | 移动端（iOS / Android / HarmonyOS）                                                                             |
-| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| **开启（默认）** | 自动优先使用用户在系统 `PATH` 中自行安装的 `yt-dlp` / `ffmpeg`（已授予外部程序权限时）；未安装时无缝回退至内进程 **`YouTube.js + yt-dlp/ejs`** 与 **`VirtualFfmpegShim`** | 直接在应用沙箱内运行内进程 **`YouTube.js + yt-dlp/ejs`** 与 **`VirtualFfmpegShim`**，零 Python / 外部命令行依赖 |
-| **关闭**         | 跳过内进程虚拟化，所有命令直通系统 `PATH` 外部二进制，失败时在对应插件卡片展示错误提示                                                                                    | 跳过内进程虚拟化，直通系统 `PATH` 调用并在受沙箱限制时于插件卡片返回明确错误                                    |
+| Toggle State | Desktop (macOS / Windows / Linux) | Mobile (iOS / Android / HarmonyOS) |
+| --- | --- | --- |
+| **Enabled (Default)** | Prefers user-installed `yt-dlp` / `ffmpeg` on system `PATH` when process permission is granted; seamlessly falls back to in-process **`YouTube.js + yt-dlp/ejs`** and **`VirtualFfmpegShim`** when absent | Runs in-process **`YouTube.js + yt-dlp/ejs`** and **`VirtualFfmpegShim`** directly inside the app sandbox with zero Python or external CLI dependencies |
+| **Disabled** | Bypasses in-process virtualization and invokes system `PATH` binaries directly, surfacing clear error banners on the plugin card if missing or failing | Bypasses in-process virtualization and invokes system `PATH` directly, reporting sandbox/command errors cleanly on the plugin card |
 
-详细兼容细节与迁移指南请参阅 [`docs/PLUGIN_COMPAT.md`](./docs/PLUGIN_COMPAT.md)。
+See [`docs/PLUGIN_COMPAT.md`](./docs/PLUGIN_COMPAT.md) for the complete compatibility matrix and migration guide.
 
 ---
 
-## 快速开始与开发指南
+## Downloads & Build
 
-### 前置条件
+### Prebuilt Releases
 
-- **Rust 工具链**（`edition = "2024"`）
-- 移动端运行与全平台打包需安装 `nsh` CLI 及对应目标平台 SDK（Xcode / Android NDK / DevEco Studio OHOS SDK 等）
+Download prebuilt binaries and `SHA256SUMS.txt` directly from **[GitHub Releases](https://github.com/richerfu/nsh-music/releases)**.
 
-### 常用命令
+| Release Target | Published Artifacts |
+| --- | --- |
+| **macOS (`arm64`)** | `NSH-Music-v<ver>-macos-arm64.dmg` (drag-to-Applications) + `NSH-Music-v<ver>-macos-arm64.app.tar.gz` |
+| **Windows (`x86_64`)** | `NSH-Music-v<ver>-windows-x86_64-setup.exe` (Inno Setup installer) + `NSH-Music-v<ver>-windows-x86_64-portable.zip` |
+| **Windows (`arm64`)** | `NSH-Music-v<ver>-windows-arm64-setup.exe` (Inno Setup installer) + `NSH-Music-v<ver>-windows-arm64-portable.zip` |
+| **Linux (`x86_64`)** | `NSH-Music-v<ver>-linux-x86_64.AppImage` + `NSH-Music-v<ver>-linux-x86_64.tar.gz` |
+| **Linux (`arm64`)** | `NSH-Music-v<ver>-linux-arm64.AppImage` + `NSH-Music-v<ver>-linux-arm64.tar.gz` |
+| **Android** | `NSH-Music-v<ver>-android-arm64-v8a.apk` + `NSH-Music-v<ver>-android-universal.apk` (`arm64-v8a` + `x86_64`) |
+| **HarmonyOS (`arm64`)** | `NSH-Music-v<ver>-harmonyos-arm64.hap` (built via `nsh-platform-harmonyos 0.7` + `ohpm-rs` + `@ohos-rs/arkdown`) |
+
+### CI & Automated Release Pipelines
+
+- **Continuous Integration ([`.github/workflows/ci.yml`](./.github/workflows/ci.yml))**: Runs `cargo fmt --all -- --check`, zero-warning `cargo clippy --workspace --all-targets --locked -- -D warnings` & unit tests on **macOS / Linux / Windows**, and cross-platform `clippy` for **HarmonyOS (`aarch64-unknown-linux-ohos`)**.
+- **Multi-Platform Releases ([`.github/workflows/release.yml`](./.github/workflows/release.yml))**: Pushing a `v*` tag (e.g. `git tag v0.1.0 && git push origin v0.1.0`) builds all 7 targets above and publishes a GitHub Release with `SHA256SUMS.txt`. Also supports manual `workflow_dispatch` for single-target or full-matrix runs.
+- **Zero-Secrets CI**: Public workflows require zero signing secrets — Android signs directly installable `.apk` files with `nsh`'s built-in keystore, macOS uses ad-hoc signing, and HarmonyOS produces an unsigned `.hap` (sign locally with DevEco Studio to install on real HarmonyOS devices).
+- **iOS Note**: Non-jailbroken iOS devices strictly reject unsigned `.ipa` packages (`nsh package --target ios` requires both an Apple Developer signing identity and a provisioning profile), so iOS is omitted from public CI and built locally with your own signing credentials.
+
+### Quick Start (Local Development)
+
+**Prerequisites**: Rust toolchain (`edition = "2024"`), plus `nsh` CLI and target platform SDKs (Xcode, Android SDK/NDK + JDK 17, or DevEco Studio OHOS SDK) when running on mobile or packaging installers.
 
 ```bash
-# 桌面端本地编译并运行（macOS / Windows / Linux）
+# Build and run on desktop (macOS / Windows / Linux)
 cargo run
 
-# 全工作区严格静态检查（零警告）
+# Strict workspace lint check (zero warnings)
 cargo clippy --workspace --all-targets -- -D warnings
 
-# 运行全工作区单元测试与无头流测试（本地回环测试绕过系统代理）
+# Run workspace unit and headless UI flow tests (bypass system proxy for loopback tests)
 NO_PROXY=127.0.0.1,localhost cargo test --workspace
 
-# 使用 NSH CLI 在目标平台运行（macos / windows / linux / ios / android / harmonyos）
+# Run on a target platform via NSH CLI (macos / windows / linux / ios / android / harmonyos)
 nsh run --target <platform>
 
-# 使用 NSH CLI 打包对应平台原生安装包
+# Package native installers / bundles via NSH CLI
 nsh package --target <platform>
 ```
 
-### CI 与多平台自动发布流水线
-
-仓库通过 GitHub Actions 提供完整的持续集成与多平台发布流水线：
-
-- **持续集成（[`.github/workflows/ci.yml`](./.github/workflows/ci.yml)）**：在 `push`（`main`）、`pull_request` 及手动触发时自动运行格式检查（`cargo fmt --all -- --check`），在 **macOS / Linux / Windows** 三端执行零警告 `cargo clippy --workspace --all-targets --locked -- -D warnings` 与单元测试，并在 **HarmonyOS (`aarch64-unknown-linux-ohos`)** 上执行跨平台 `clippy` 静态检查。
-- **多平台自动发布（[`.github/workflows/release.yml`](./.github/workflows/release.yml)）**：推送 `v*` 标签（如 `git tag v0.1.0 && git push origin v0.1.0`）自动构建全平台产物并发布 GitHub Release（含 `SHA256SUMS.txt`）；也可在 Actions 页面通过 **`workflow_dispatch`** 按需选择单平台或全平台构建（留空 `tag` 仅上传工作流产物，填写已有 `tag` 则同步发布至对应 Release）。
-
-| 平台目标                       | 自动构建产物                                                                                                   |
-| ------------------------------ | -------------------------------------------------------------------------------------------------------------- |
-| **macOS (`arm64`)**            | `NSH-Music-v<ver>-macos-arm64.dmg`（拖拽安装）+ `NSH-Music-v<ver>-macos-arm64.app.tar.gz`                      |
-| **Windows (`x86_64`/`arm64`)** | `NSH-Music-v<ver>-windows-<arch>-setup.exe`（Inno Setup 安装器）+ `-portable.zip`                              |
-| **Linux (`x86_64`/`arm64`)**   | `NSH-Music-v<ver>-linux-<arch>.AppImage` + `NSH-Music-v<ver>-linux-<arch>.tar.gz`                              |
-| **Android**                    | `NSH-Music-v<ver>-android-arm64-v8a.apk` + `NSH-Music-v<ver>-android-universal.apk`（`arm64-v8a` + `x86_64`）  |
-| **HarmonyOS (`arm64`)**        | `NSH-Music-v<ver>-harmonyos-arm64.hap`（基于 `nsh-platform-harmonyos 0.7` + `ohpm-rs` + `@ohos-rs/arkdown`）   |
-
-- **零签名密钥要求**：CI 构建无需配置任何签名 Secrets——Android 使用 `nsh` 内置密钥打包可直接安装的 `.apk`，macOS 采用 ad-hoc 签名，HarmonyOS 输出未签名 `.hap`。
-- **iOS 说明**：iOS 非越狱真机无法直接安装未签名 `.ipa`（需要付费 Apple Developer 证书与设备 UDID Ad-Hoc / Enterprise / TestFlight 描述文件），因此默认不包含在公开 GitHub Actions 流水线中，请按需在本地配置签名后构建。
-
 ---
 
-## 开源协议与致谢
+## License & Credits
 
-NSH Music 的界面交互设计、插件清单与 Host / Plugin RPC 兼容规范，以及 `mygo-music://` DeepLink 协议均深受 **[egoist/mygo-music](https://github.com/egoist/mygo-music)**（作者：EGOIST）启发并与之保持生态兼容。
+NSH Music's UI/UX design language, plugin manifest & Host/Plugin RPC specification, and `mygo-music://` deep-link protocol are heavily inspired by and ecosystem-compatible with **[egoist/mygo-music](https://github.com/egoist/mygo-music)** (by EGOIST).
 
-上游项目 `egoist/mygo-music` 采用 **GNU Affero General Public License v3.0 (AGPL-3.0)** 开源（参见其 [`LICENSE`](https://github.com/egoist/mygo-music/blob/main/LICENSE)）。遵循 AGPL-3.0 的传染性开源（Copyleft）条款，**NSH Music 同样以 [GNU Affero General Public License v3.0 (AGPL-3.0)](./LICENSE) 许可协议开源分发**。
+Because upstream `egoist/mygo-music` is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)** (see its [`LICENSE`](https://github.com/egoist/mygo-music/blob/main/LICENSE)), **NSH Music is likewise licensed and distributed under the [GNU Affero General Public License v3.0 (AGPL-3.0)](./LICENSE)** in full compliance with AGPL-3.0 copyleft requirements.
 
-### 第三方内嵌与参考开源组件
+### Open-Source Components & Ecosystem Acknowledgments
 
-| 项目                                                                  | 开源协议 (SPDX)                                                                          | 在 NSH Music 中的用途                                                                                                                |
-| --------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| [egoist/mygo-music](https://github.com/egoist/mygo-music)             | `AGPL-3.0`                                                                               | UI / UX 交互参考、`plugin.json` 与 Host/Plugin RPC 兼容规范、`mygo-music://` DeepLink 协议                                           |
-| [LuanRT/YouTube.js](https://github.com/LuanRT/YouTube.js)             | `MIT`                                                                                    | 内嵌于 `VirtualYtdlpShim`（运行在 `quickjs-jit` 并桥接至 Rust `reqwest`），提供上游维护的 YouTube / YouTube Music InnerTube 解析能力 |
-| [yt-dlp/yt-dlp](https://github.com/yt-dlp/yt-dlp)                     | `The Unlicense`（OSI/FSF 认证公有领域开源协议）                                          | `VirtualYtdlpShim` 的 CLI 参数兼容与格式选择策略参考                                                                                 |
-| [yt-dlp/ejs](https://github.com/yt-dlp/ejs)（PyPI 包名 `yt-dlp-ejs`） | `The Unlicense`（OSI/FSF 认证公有领域开源协议；内含 `MIT` 协议的 `meriyah` / `astring`） | 内嵌于插件兼容层，在无外部 JS 运行时环境下离线求解播放器签名（`sig`）与节流（`n`）挑战                                               |
+| Project | License (SPDX) | Role in NSH Music |
+| --- | --- | --- |
+| [egoist/mygo-music](https://github.com/egoist/mygo-music) | `AGPL-3.0` | UI/UX design inspiration, `plugin.json` & Host/Plugin RPC compatibility contract, `mygo-music://` deep-link protocol |
+| [LuanRT/YouTube.js](https://github.com/LuanRT/YouTube.js) | `MIT` | Embedded inside `VirtualYtdlpShim` (executed in `quickjs-jit` bridged to Rust `reqwest`) for upstream-maintained YouTube / YouTube Music InnerTube resolution |
+| [yt-dlp/yt-dlp](https://github.com/yt-dlp/yt-dlp) | `The Unlicense` | CLI flag compatibility and audio format-selection reference for `VirtualYtdlpShim` |
+| [yt-dlp/ejs](https://github.com/yt-dlp/ejs) (`yt-dlp-ejs`) | `The Unlicense` (bundles `MIT`-licensed `meriyah` / `astring`) | Embedded challenge solver for offline player signature (`sig`) and throttle (`n`) decryption without an external JS runtime |
+| [longbridge/nsh](https://github.com/longbridge/nsh) | `Apache-2.0` | Native Shell (`nsh`) cross-platform native UI framework, runtime, and multi-platform packaging CLI |
+| [nsh-platform-harmonyos](https://crates.io/crates/nsh-platform-harmonyos) | `Apache-2.0` | HarmonyOS ArkUI C-API backend, `AVSession` bridge, and `.hap` project generator for NSH 0.7 |
+| [harmony-contrib/ohpm-rs](https://github.com/harmony-contrib/ohpm-rs) | Upstream CI tool (not linked) | Fast Rust OHPM dependency installer invoked during HarmonyOS CI packaging |
+| [@ohos-rs/arkdown](https://www.npmjs.com/package/@ohos-rs/arkdown) | `MIT OR Apache-2.0` | Rust-based OpenHarmony / HarmonyOS `.hap` packager invoked in CI release builds |
