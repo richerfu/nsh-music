@@ -2683,7 +2683,7 @@ mod tests {
         );
         #[cfg(not(target_os = "macos"))]
         assert!(
-            debug.contains("rgba"),
+            debug.contains("ImageData(64x64 RGBA)"),
             "Windows/Linux tray icon should use in-memory RGBA pixel data to preserve color: {debug}"
         );
     }
@@ -2697,6 +2697,10 @@ mod tests {
         assert!(
             !debug.contains("assets/") && !debug.contains("assets\\"),
             "decoded tray PNG must be in-memory, not a file path: {debug}"
+        );
+        assert!(
+            debug.contains("ImageData(64x64 RGBA)"),
+            "decoded tray PNG should preserve in-memory 64x64 RGBA pixel data: {debug}"
         );
     }
 }
